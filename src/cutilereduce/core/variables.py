@@ -1,0 +1,25 @@
+from sympy import Symbol, Function
+
+__all__ = [
+    "READ",
+    "WRITE",
+    "GROUPS",
+    "PEAK_FLOPS",
+    "BANDWIDTH",
+    "MAX_RESIDENCY",
+    "MIN_PARALLELISM",
+    "MIN_MMA_EFFICIENCY",
+    "FWD_CONTENTION",
+    "BWD_CONTENTION",
+]
+
+READ = Symbol('READ')
+WRITE = Symbol('WRITE')
+GROUPS = Symbol('GROUPS')
+PEAK_FLOPS = Symbol('PEAK_FLOPS')
+BANDWIDTH = Symbol('BANDWIDTH')
+MAX_RESIDENCY = Symbol('MAX_RESIDENCY')
+MIN_PARALLELISM = Symbol('MIN_PARALLELISM')
+MIN_MMA_EFFICIENCY = Symbol('MIN_MMA_EFFICIENCY')
+FWD_CONTENTION = Function('FWD_CONTENTION')
+BWD_CONTENTION = Function('BWD_CONTENTION')

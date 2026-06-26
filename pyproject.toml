@@ -9,3 +9,7 @@ dependencies = [
     "polars>=1.42.0",
     "sympy>=1.14.0",
 ]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
