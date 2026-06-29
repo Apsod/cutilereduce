@@ -13,7 +13,6 @@ class Phase(Enum):
     fwd = 'forward'
     bwd = 'backward'
 
-
 def field_names(x):
     return tuple((f.name for f in fields(x)))
 
@@ -70,6 +69,12 @@ class TupleSet[T]:
 
     def __getitem__(self, ix):
         return self.value[ix]
+
+    def index(self, val: T):
+        return self.value.index(val)
+
+    def get(self, val):
+        return self[self.index(val)]
     
     @promote_type
     def __or__(self, other: Self) -> Self:

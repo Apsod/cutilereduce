@@ -2,17 +2,20 @@
 
 from .buffer import Buffer
 from .grid import Dims
-from .spec import Meta
-from .sweep import Estimator
+from .spec import Spec, ConcreteSpec
+from .sweep import Estimator, Sweep
 from .variables import *
 from .variables import __all__ as _variables_all
 from .work import Work
+from .config import Config
 
 __all__ = [
     "Buffer",
     "Dims",
     "Estimator",
-    "Meta",
+    "Sweep",
+    "Spec",
+    "ConcreteSpec",
     "Work",
 ] + _variables_all
 

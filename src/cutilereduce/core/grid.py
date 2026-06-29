@@ -5,12 +5,15 @@ from math import prod
 
 import sympy
 
+from .config import Config
 from .base import *
+
+D = TypeVar('D')
 
 class Dim(str):
     __slots__ = ('_grid',)
 
-    def __new__(cls, name: str, grid: BoundGrid = None):
+    def __new__(cls, name: str, grid: BoundGrid):
         obj = super().__new__(cls, name)
         obj._grid = grid
         return obj
@@ -20,6 +23,11 @@ class Dim(str):
         assert self._grid is not None
         """Read-only access to the grid."""
         return self._grid
+
+    @property
+    def grid_index(self):
+        assert self.outer
+        return self.grid.outer.index(self)
 
     @property
     def outer(self):
@@ -71,16 +79,41 @@ class Dim(str):
     def __str__(self):
         return f"{super().__str__()}"
 
+    def bind(self, config: Config) -> ConcreteDim:
+        return ConcreteDim(self, self._grid, config)
+
+class ConcreteDim(Dim):
+    __slots__ = ('_grid', '_config')
+
+    def __new__(cls, name: str, grid: BoundGrid, config: Config):
+        obj = super().__new__(cls, name, grid)
+        obj._config = config
+        return obj
+
+    @property
+    def tile_var(self):
+        return self._config.tiling[self]
+
+    @property
+    def total_var(self):
+        return self._config.total[self]
+
+    @property
+    def group_var(self):
+        return self._config.get_grouping(self)
+
 @dataclass(frozen=True)
 class Dims(TupleSet[str]):
     def bind(self, grid: BoundGrid) -> BoundDims:
         return BoundDims(self.tmap(lambda name: Dim(name, grid=grid)))
 
-@dataclass(frozen=True)
-class BoundDims(TupleSet[Dim]):
+    def concretize(self, grid: BoundGrid, config: Config) -> ConcreteDims:
+        return ConcreteDims(self.tmap(lambda name: ConcreteDim(name, grid=grid, config=config)))
 
+@dataclass(frozen=True)
+class BaseDims[D: Dim](TupleSet[D]):
     @property
-    def dims(self) -> tuple[Dim]:
+    def dims(self) -> tuple[D, ...]:
         return self.value
 
     @property
@@ -123,6 +156,15 @@ class BoundDims(TupleSet[Dim]):
         return str(self.tmap(str))
 
 @dataclass(frozen=True)
+class BoundDims(BaseDims[Dim]):
+    def concretize(self, config: Config) -> ConcreteDims:
+        return ConcreteDims(self.tmap(lambda d: d.bind(config)))
+
+@dataclass(frozen=True)
+class ConcreteDims(BaseDims[ConcreteDim]):
+    pass
+
+@dataclass(frozen=True)
 class Grid:
     input: Dims
     output: Dims
@@ -134,40 +176,71 @@ class Grid:
              input: dict[str, Buffer], 
              output: dict[str, Buffer],
              batch: Dims,
-             fold: Dims):
-        input = Dims.union(*(v.spec for v in input.values()))
-        output = Dims.union(*(v.spec for v in output.values()))
-        return BoundGrid(cls(input, output, batch, fold))
+             fold: Dims,
+             config: Config = None,
+             ):
+        if config is None:
+            input = Dims.union(*(v.spec for v in input.values()))
+            output = Dims.union(*(v.spec for v in output.values()))
+            return BoundGrid(grid=cls(input, output, batch, fold))
+        else:
+            input = Dims.union(*(v.spec for v in input.values()))
+            output = Dims.union(*(v.spec for v in output.values()))
+            return ConcreteGrid(grid=cls(input, output, batch, fold), config=config)
 
-@dataclass(frozen=True)
-class BoundGrid:
+
+@dataclass(frozen=True, kw_only=True)
+class BaseGrid[D: Dim]:
     grid: Grid
+    CTYPE: ClassVar = None
 
-    def __getattr__(self, name):
+    def __getattr__(self, name: str) -> BaseDims[D]:
         if name in field_names(self.grid):
-            return getattr(self.grid, name).bind(self)
+            return self.bind_dims(getattr(self.grid, name))
         else:
             raise AttributeError(f'name {name} not in {field_names(self.grid)}')
 
-    def check(self, simple=True):
+    @cached_property
+    def dim_map(self) -> dict[D, D]:
+        return {x: x for x in self.dims}
+
+    @cached_property
+    def outer(self) -> BaseDims[D]:
+        return self.batch | self.fold
+
+    @cached_property
+    def dims(self) -> BaseDims[D]:
+        return self.input | self.output
+
+    @cached_property
+    def inner(self) -> BaseDims[D]:
+        return self.dims - self.outer
+
+    def check(self, simple=True) -> None:
         if simple:
             assert len(self.fold) == 1, f'{self.fold!s}'
         assert self.dims.is_superset(self.batch, self.fold)
         assert self.output.is_superset(self.batch)
         assert self.fold.is_disjoint(self.batch, self.output)
 
-    @cached_property
-    def dim_map(self):
-        return {x: x for x in self.dims}
+    def bind_dims(self, dims : Dims) -> BaseDims[D]:
+        raise NotImplementedError()
 
-    @cached_property
-    def outer(self) -> BoundDims:
-        return self.batch | self.fold
 
-    @cached_property
-    def dims(self) -> BoundDims:
-        return self.input | self.output
+@dataclass(frozen=True, kw_only=True)
+class BoundGrid(BaseGrid[Dim]):
+    CTYPE: ClassVar = BoundDims
 
-    @cached_property
-    def inner(self) -> BoundDims:
-        return self.dims - self.outer
+    def bind_dims(self, dims : Dims) -> BoundDims:
+        return dims.bind(self)
+
+    def concretize(self, config: Config) -> ConcreteGrid:
+        return ConcreteGrid(grid=self.grid, config=config)
+
+@dataclass(frozen=True, kw_only=True)
+class ConcreteGrid(BaseGrid[ConcreteDim]):
+    config: Config
+    CTYPE: ClassVar = ConcreteDims
+
+    def bind_dims(self, dims: Dims) -> ConcreteDims:
+        return dims.concretize(self, self.config)

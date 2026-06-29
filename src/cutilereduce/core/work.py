@@ -4,7 +4,7 @@ from sympy import Min, Max
 from math import prod
 
 from .base import field_names, Phase
-from .grid import BoundGrid, Dims
+from .grid import BaseGrid, Dims, Dim, ConcreteDim, BoundGrid, ConcreteGrid
 
 @dataclass(frozen=True)
 class MatMul:
@@ -17,17 +17,15 @@ class MatMul:
     def make(cls, string: str):
         return cls(*map(Dims.parse, string.split(':')))
 
-    def bind(self, grid) -> BoundMatMul:
-        return BoundMatMul(self, grid)
 
 @dataclass(frozen=True)
-class BoundMatMul:
+class BaseMatMul[D: Dim]:
     spec: MatMul
-    grid: BoundGrid
+    grid: BaseGrid[D]
 
     def __getattr__(self, name):
         if name in field_names(self.spec):
-            return getattr(self.spec, name).bind(self.grid)
+            return self.grid.bind_dims(getattr(self.spec, name))
         else:
             raise AttributeError(f'name {name} not in {field_names(self.spec)}')
 
@@ -60,12 +58,20 @@ class BoundMatMul:
         return 2 * self.all.span_prod
 
     @property
-    def tile_efficiency_prod(self):
+    def tile_efficiency(self):
         return prod([Min(1, getattr(self, n).tile_prod / 16) for n in 'mnk'])
 
+@dataclass(frozen=True)
+class BoundMatMul(BaseMatMul[Dim]):
+    pass
+
+@dataclass(frozen=True)
+class ConcreteMatMul(BaseMatMul[ConcreteDim]):
     @property
-    def tile_efficiency_bottleneck(self):
-        return Min(*[Min(1, getattr(self, n).tile_prod / 16) for n in 'mnk'])
+    def tile_efficiency(self):
+        return prod([min(1, getattr(self, n).tile_prod / 16) for n in 'mnk'])
+
+
         
 @dataclass(frozen=True)
 class Work:
@@ -79,23 +85,37 @@ class Work:
                 recompute = [MatMul.make(m) for m in recompute],
         )
 
-    def bind(self, grid: BoundGrid) -> BoundWork:
-        return BoundWork(self, grid)
-
-
+def bind_work(grid, work):
+    if isinstance(grid, ConcreteGrid):
+        return ConcreteWork(work, grid)
+    elif isinstance(grid, BoundGrid):
+        return BoundWork(work, grid)
 
 @dataclass(frozen=True)
-class BoundWork:
+class BaseWork[D: Dim]:
     spec: Work
-    grid: BoundGrid
-
-    def __getattr__(self, name):
-        if name in field_names(self.spec):
-            return [x.bind(self.grid) for x in getattr(self.spec, name)]
-        else:
-            raise AttributeError(f'name {name} not in {field_names(self.spec)}')
+    grid: BaseGrid[D]
 
     def mmas(self, phase):
         match phase:
             case Phase.fwd: return self.forward
             case Phase.bwd: return self.forward + self.forward + self.recompute
+            case _: assert False
+
+
+@dataclass(frozen=True)
+class BoundWork(BaseWork[Dim]):
+    def __getattr__(self, name):
+        if name in field_names(self.spec):
+            return [BoundMatMul(x, self.grid) for x in getattr(self.spec, name)]
+        else:
+            raise AttributeError(f'name {name} not in {field_names(self.spec)}')
+
+@dataclass(frozen=True)
+class ConcreteWork(BaseWork[ConcreteDim]):
+    def __getattr__(self, name):
+        if name in field_names(self.spec):
+            return [ConcreteMatMul(x, self.grid) for x in getattr(self.spec, name)]
+        else:
+            raise AttributeError(f'name {name} not in {field_names(self.spec)}')
+
