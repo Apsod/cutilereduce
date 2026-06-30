@@ -10,7 +10,16 @@ a100 = {
         MIN_MMA_EFFICIENCY: 0.5,
         SM_COUNT: 108,
         MAX_PROGRAMS_PER_SM: 32,
-        SMEM_PER_SM: 64*1024,
+        SMEM_PER_SM: 164*1024,
+        }
+
+l40s = {
+        PEAK_FLOPS: 362e12,
+        BANDWIDTH: 864e9,
+        MIN_MMA_EFFICIENCY: 0.5,
+        SM_COUNT: 142,
+        MAX_PROGRAMS_PER_SM: 32,
+        SMEM_PER_SM: 100*1024,
         }
 
 
@@ -52,27 +61,27 @@ a100 = {
 
 spec=dict(
         input = dict(
-            ctx = Buffer.make('b d', ct.bfloat16, req_grad=True),
-            trg = Buffer.make('v d', ct.bfloat16, req_grad=True),
+            ctx = Buffer.make('b h d', ct.bfloat16, req_grad=True),
+            trg = Buffer.make('v h d', ct.bfloat16, req_grad=True),
             targets = Buffer.make('b', ct.int32),
         ),
         output = dict(
-            m = Buffer.make('b', ct.float32),
-            e = Buffer.make('b', ct.float32),
-            u = Buffer.make('b', ct.float32),
+            m = Buffer.make('b h', ct.float32),
+            e = Buffer.make('b h', ct.float32),
+            u = Buffer.make('b h', ct.float32),
         ),
         intermediate = [
-            Buffer.make('b v', ct.float32),
+            Buffer.make('b h v', ct.float32),
             ],
         work = Work.make(
             forward=[
-                ': b : v : d',
+                'h : b : v : d',
                 ],
             recompute=[
-                ': b : v : d',
+                'h : b : v : d',
                 ],
             ),
-        batch = Dims.parse('b'),
+        batch = Dims.parse('b h'),
         fold = Dims.parse('v'),
     )
 
@@ -83,9 +92,9 @@ xentropy = Spec.make(
 sizes = dict(
         b = 1024*256,
         v = 1024*256,
+        h = 8,
         d = 128,
         )
-
 
 e = Estimator.make(
         xentropy,
@@ -93,24 +102,24 @@ e = Estimator.make(
         symbols=a100,
         )
 
-
 sweeper = Sweep(
         attributes = [
             'estimated_time', 'effective_traffic', 'effective_total_work', 'mma_efficiency', 'traffic',
             'contention', 'resident_programs_per_sm', 'group_size', 'effective_intensity_ratio',
-            'residency_bytes', 'arithmetic_intensity',
+            'residency_bytes', 'arithmetic_intensity', 'smem_utilization',
             ],
         filters = [
             pl.col('resident_programs_per_sm') >= 1,
             pl.col('group_size') >= 1,
-            pl.col('mma_efficiency') >= 0.5
+            pl.col('mma_efficiency') == 1
             ],
         paretos = [
-            'estimated_time' * pl.col('resident_programs_per_sm') / pl.col('resident_programs_per_sm').floor(),
+            'effective_total_work', 'effective_traffic'
             ]
         )
 
-cols = 'estimated_time', 'contention', 'traffic'
+cols = 'estimated_time',
 
 res = sweeper.run_all(e).select(pl.selectors.starts_with('cfg:'), *cols)
-print(res)
+for phase, df in res.group_by('cfg:phase'):
+    print(df.sort('estimated_time'))

@@ -1,7 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, field, fields
 from functools import cached_property
-from math import prod
+from math import prod, ceil
+from fractions import Fraction
 
 import sympy
 
@@ -68,6 +69,14 @@ class Dim(str):
         match self.outer:
             case True: return self.tile_var * self.group_var
             case False: return self.total_var
+
+    @property
+    def num_tiles_relaxed(self):
+        return self.total_var / self.tile_var
+
+    @property
+    def num_tiles(self):
+        return ceil(Fraction(self.total_var, self.tile_var))
 
     @property
     def tile_exp(self):

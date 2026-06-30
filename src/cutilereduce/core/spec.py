@@ -3,7 +3,10 @@ from enum import Enum
 from copy import replace
 from math import prod
 
-from sympy import Rational, Max, Min, floor
+import math
+import sympy
+from sympy import Rational, Max, Min
+from fractions import Fraction
 import sympy
 
 from .grid import BaseGrid, Dims, Grid, Dim, ConcreteDim
@@ -39,6 +42,7 @@ class BaseSpec[D: Dim]:
                 work=work,
                 intermediate=intermediate
                 )
+
 
     @property
     def output_buffers(self):
@@ -86,8 +90,32 @@ class BaseSpec[D: Dim]:
     ################# QUANTITIES #################
 
     @property
+    def C(self):
+        match self.phase:
+            case Phase.fwd: return self.FWD_CONTENTION
+            case Phase.bwd: return self.BWD_CONTENTION
+
+
+    def buffer_contention(self, b):
+        if not b.is_write(self.phase):
+            return 0
+        R = b.residual_multiplicity
+        P = self.program_count
+        A = self.active_programs
+        active_multiplicity = Min(R, 1 + (A - 1) * (R - 1) / Max(1, P-1))
+        return b.accessed_bytes * self.C(active_multiplicity)
+
+    def buffer_traffic(self, b):
+        kind = 0
+        if b.is_write(self.phase):
+            kind += self.WRITE
+        if b.is_read(self.phase):
+            kind += self.READ
+        return kind * b.accessed_bytes
+
+    @property
     def traffic(self):
-        return sum(v.traffic(self.phase) for v in self.io_buffers)
+        return sum(self.buffer_traffic(v) for v in self.io_buffers)
 
     @property
     def effective_traffic(self):
@@ -103,11 +131,20 @@ class BaseSpec[D: Dim]:
 
     @property
     def contention(self):
-        return sum(v.contention(self.phase) for v in self.io_buffers)
+        return sum(self.buffer_contention(v) for v in self.io_buffers)
+
+    @property
+    def expected_group_active_programs(self):
+        return 1 + (self.active_programs - 1) / self.groups
 
     @property
     def total_work(self):
         return sum(x.total_work for x in self.mmas)
+
+    @property
+    def smem_utilization(self):
+        resident_smem_per_sm = self.resident_programs_per_sm * self.residency_bytes
+        return resident_smem_per_sm / self.SMEM_PER_SM
 
     @property
     def effective_total_work(self):
@@ -146,24 +183,20 @@ class BaseSpec[D: Dim]:
         return self.grid.outer.total_prod / self.grid.outer.span_prod
 
     @property
-    def residency_penalty(self):
-        return self.resident_programs_per_sm / floor(self.resident_programs_per_sm)
-
-    @property
     def estimated_time(self):
-        return Max(self.effective_total_work / PEAK_FLOPS, self.effective_traffic / BANDWIDTH)
+        return Max(self.effective_total_work / self.PEAK_FLOPS, self.effective_traffic / self.BANDWIDTH)
 
     @property
     def ridge(self):
-        return PEAK_FLOPS / BANDWIDTH
+        return self.PEAK_FLOPS / self.BANDWIDTH
     
     @property
     def resident_programs(self):
-        return SM_COUNT * self.resident_programs_per_sm
+        return self.SM_COUNT * self.resident_programs_per_sm
 
     @property
     def resident_programs_per_sm(self):
-        return Min(MAX_PROGRAMS_PER_SM, SMEM_PER_SM / self.residency_bytes)
+        return Min(self.MAX_PROGRAMS_PER_SM, sympy.floor(self.SMEM_PER_SM / self.residency_bytes))
 
     @property
     def active_programs(self):
@@ -171,11 +204,54 @@ class BaseSpec[D: Dim]:
 
     @property
     def groups(self):
-        return GROUPS
+        return self.GROUPS
 
     @property
     def group_size(self):
         return self.group_dim.group_var
+
+    #########################
+
+    @property
+    def PEAK_FLOPS(self):
+        return PEAK_FLOPS
+
+    @property
+    def BANDWIDTH(self):
+        return BANDWIDTH
+
+    @property
+    def SM_COUNT(self):
+        return SM_COUNT
+
+    @property
+    def MAX_PROGRAMS_PER_SM(self):
+        return MAX_PROGRAMS_PER_SM
+
+    @property
+    def SMEM_PER_SM(self):
+        return SMEM_PER_SM
+
+    @property
+    def READ(self):
+        return READ
+
+    @property
+    def WRITE(self):
+        return WRITE
+
+    @property
+    def GROUPS(self):
+        return GROUPS
+
+    @property
+    def FWD_CONTENTION(self):
+        return FWD_CONTENTION
+
+    @property
+    def BWD_CONTENTION(self):
+        return BWD_CONTENTION
+
 
 @dataclass(frozen=True, kw_only=True)
 class Spec(BaseSpec[Dim]):
@@ -288,6 +364,46 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
         return self.config._eval(expr)
 
     @property
+    def PEAK_FLOPS(self):
+        return self.config.symbols[PEAK_FLOPS]
+
+    @property
+    def BANDWIDTH(self):
+        return self.config.symbols[BANDWIDTH]
+
+    @property
+    def SM_COUNT(self):
+        return self.config.symbols[SM_COUNT]
+
+    @property
+    def MAX_PROGRAMS_PER_SM(self):
+        return self.config.symbols[MAX_PROGRAMS_PER_SM]
+
+    @property
+    def SMEM_PER_SM(self):
+        return self.config.symbols[SMEM_PER_SM]
+
+    @property
+    def READ(self):
+        return self.config.symbols[READ]
+
+    @property
+    def WRITE(self):
+        return self.config.symbols[WRITE]
+
+    @property
+    def GROUPS(self):
+        return self.config.symbols[GROUPS]
+
+    @property
+    def FWD_CONTENTION(self):
+        return self.config.functions[FWD_CONTENTION]
+
+    @property
+    def BWD_CONTENTION(self):
+        return self.config.functions[BWD_CONTENTION]
+
+    @property
     def config(self):
         return self.grid.config
 
@@ -297,25 +413,12 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
 
     @property
     def estimated_time(self):
-        return self._eval(Max(self.effective_total_work / PEAK_FLOPS, self.effective_traffic / BANDWIDTH))
-
-    @property
-    def ridge(self):
-        return self._eval(PEAK_FLOPS / BANDWIDTH)
-    
-    @property
-    def resident_programs(self):
-        return self._eval(SM_COUNT * self.resident_programs_per_sm)
+        return max(self.effective_total_work / self.PEAK_FLOPS, self.effective_traffic / self.BANDWIDTH)
 
     @property
     def resident_programs_per_sm(self):
-        return self._eval(Min(MAX_PROGRAMS_PER_SM, SMEM_PER_SM / self.residency_bytes))
+        return min(self.MAX_PROGRAMS_PER_SM, floor(self.SMEM_PER_SM / self.residency_bytes))
 
     @property
     def active_programs(self):
-        return self._eval(Min(self.program_count, self.resident_programs))
-
-    @property
-    def groups(self):
-        return self._eval(GROUPS)
-
+        return min(self.program_count, self.resident_programs)

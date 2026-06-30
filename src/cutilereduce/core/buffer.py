@@ -128,23 +128,6 @@ class BaseBuffer[D: Dim]:
             case Phase.fwd: return self.is_input
             case Phase.bwd: return self.is_input | self.is_output
 
-    def traffic(self, phase):
-        kind = 0
-        if self.is_write(phase):
-            kind = kind + WRITE
-        if self.is_read(phase):
-            kind = kind + READ
-        return kind * self.accessed_bytes
-
-    def contention(self, phase):
-        match phase:
-            case Phase.fwd: C = FWD_CONTENTION
-            case Phase.bwd: C = BWD_CONTENTION
-        if self.is_write(phase):
-            return self.accessed_bytes * C(self.residual_multiplicity)
-        else:
-            return 0
-
     @property
     def numel(self):
         return self.spec.total_prod
@@ -171,19 +154,5 @@ class BoundBuffer(BaseBuffer[Dim]):
 
 @dataclass(frozen=True)
 class ConcreteBuffer(BaseBuffer[ConcreteDim]):
-    def traffic(self, phase):
-        kind = 0
-        if self.is_write(phase):
-            kind = kind + WRITE
-        if self.is_read(phase):
-            kind = kind + READ
-        return self.grid.config._eval(kind * self.accessed_bytes)
+    pass
 
-    def contention(self, phase):
-        match phase:
-            case Phase.fwd: C = FWD_CONTENTION
-            case Phase.bwd: C = BWD_CONTENTION
-        if self.is_write(phase):
-            return self.grid.config._eval(self.accessed_bytes * C(self.residual_multiplicity))
-        else:
-            return 0
