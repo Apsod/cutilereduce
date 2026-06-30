@@ -8,6 +8,8 @@ import sympy
 from .config import Config
 from .base import *
 
+import cuda.tile as ct
+
 D = TypeVar('D')
 
 class Dim(str):
@@ -101,6 +103,11 @@ class ConcreteDim(Dim):
     @property
     def group_var(self):
         return self._config.get_grouping(self)
+
+    @property
+    def grouped(self):
+        return self.group_var > 1
+
 
 @dataclass(frozen=True)
 class Dims(TupleSet[str]):

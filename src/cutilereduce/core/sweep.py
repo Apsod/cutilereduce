@@ -141,8 +141,8 @@ class Estimator:
         for row in configs.iter_rows():
             cfg = {k: v for k, v in zip(names, row)}
             yield Config(
-                    phase = Phase.fwd if cfg['phase'] == 'forward' else Phase.bwd,
-                    group = str(cfg['group']),
+                    phase = Phase(cfg['phase']),
+                    group_dim = str(cfg['group']),
                     num_groups = cfg['num_groups'],
                     total = {str(k): v for k, v in self.sizes.items()},
                     tiling = {str(k): cfg[k] for k in self.meta.grid.outer},

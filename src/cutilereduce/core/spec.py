@@ -78,6 +78,10 @@ class BaseSpec[D: Dim]:
             b.check()
         for b in self.io_buffers:
             b.check()
+
+    @property
+    def grouped_buffers(self):
+        return tuple(b for b in self.write_buffers if self.group_dim in b.absent)
     
     ################# QUANTITIES #################
 
@@ -228,10 +232,6 @@ class Spec(BaseSpec[Dim]):
         return self.traffic.subs(self.full_span)
 
     @property
-    def grouped_buffers(self):
-        return tuple(b for b in self.write_buffers if self.group_dim in b.absent)
-
-    @property
     def grouping(self):
         grouping = {}
         for d in self.grid.outer:
@@ -293,7 +293,7 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
 
     @property
     def group_dim(self):
-        return self.config.group_dim
+        return self.grid.dim.get(self.config.group_dim)
 
     @property
     def estimated_time(self):
@@ -318,8 +318,4 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
     @property
     def groups(self):
         return self._eval(GROUPS)
-
-    @property
-    def group_size(self):
-        return self.group_dim.group_var
 

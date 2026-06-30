@@ -96,7 +96,7 @@ e = Estimator.make(
 
 sweeper = Sweep(
         attributes = [
-            'estimated_time', 'effective_traffic', 'effective_total_work', 'mma_efficiency',
+            'estimated_time', 'effective_traffic', 'effective_total_work', 'mma_efficiency', 'traffic',
             'contention', 'resident_programs_per_sm', 'group_size', 'effective_intensity_ratio',
             'residency_bytes', 'arithmetic_intensity',
             ],
@@ -110,11 +110,7 @@ sweeper = Sweep(
             ]
         )
 
-cols = 'residency_bytes', 'estimated_time'
+cols = 'estimated_time', 'contention', 'traffic'
 
 res = sweeper.run_all(e).select(pl.selectors.starts_with('cfg:'), *cols)
-for cfg in e.result2cfg(res):
-    s = ConcreteSpec.make(
-            **spec,
-            config=cfg)
-    print(s.estimated_time)
+print(res)

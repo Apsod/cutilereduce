@@ -9,7 +9,7 @@ from .base import Phase
 @dataclass(frozen=True)
 class Config:
     phase: Phase
-    group: str
+    group_dim: str
     num_groups: int
     total: dict[str, int]
     tiling: dict[str, int]
@@ -24,7 +24,7 @@ class Config:
         return expr.evalf()
 
     def get_grouping(self, d: str):
-        if d == self.group:
+        if d == self.group_dim:
             return Fraction(self.total[d], self.tiling[d] * self.num_groups)
         else:
             return 1
