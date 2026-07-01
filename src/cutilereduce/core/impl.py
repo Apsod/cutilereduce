@@ -1,8 +1,10 @@
 from __future__ import annotations
 from dataclasses import dataclass
+import linecache
+import math
+import uuid
 
 import cuda.tile as ct
-import math
 
 from .base import Phase
 from .buffer import BufferDep, BufferRole, ConcreteBuffer
@@ -22,7 +24,7 @@ class TileCtx:
         return self.tile.shape[i] * self.index[i]
 
     def stop_along(self, i):
-        return (self.tile.shape[i] + 1) * self.index[i]
+        return self.tile.shape[i] * (self.index[i] + 1)
 
 @ct.function
 def retile(original, index):
@@ -32,6 +34,7 @@ def retile(original, index):
     return ret
 
 def mk_fwd(spec, map_reduce, combine):
+
     grid = spec.grid
     group_dim = grid.group_dim
 
@@ -152,17 +155,32 @@ def mk_fwd(spec, map_reduce, combine):
 
         acc = map_reduce(*tiles)
 
-        for _ in range(size):
+        for _ in range(1, size):
             tid = increment_group(tid)
             gtiles = group_loads(input, tid)
             tiles = retile(btiles + gtiles, load_order)
             acc = combine(acc, map_reduce(*tiles))
         store(output, tid, acc)
 
+    
+    nargs = len(spec.input) + len(spec.output)
+    csv_args = ','.join(f'arg_{i}' for i in range(nargs))
+    ns = {'ct': ct, 'fwd': fwd}
 
-    @ct.kernel
-    def kernel(ctx, trg, targets, m, e, v):
-        buffers = (ctx, trg, targets, m, e, v)
-        fwd(buffers)
+    source = (
+            "@ct.kernel\n"
+            f"def kernel({csv_args}):\n"
+            f"  fwd(({csv_args},))\n"
+            )
 
-    return kernel
+    filename = f"<cutilereduce_kernel_{uuid.uuid4().hex}>"
+    linecache.cache[filename] = (
+            len(source),
+            None,
+            source.splitlines(keepends=True),
+            filename,
+    )
+
+    code = compile(source, filename, "exec")
+    exec(code, ns)
+    return ns['kernel']
