@@ -32,14 +32,27 @@ class BaseSpec[D: Dim]:
             output: dict[str, Buffer], 
             work: Work, 
             intermediate: list[Buffer] = None):
-        input = {k: v.generic_bind(k, grid, BufferRole.Input) for k, v in input.items()}
-        output = {k: v.generic_bind(k, grid, BufferRole.Output) for k, v in output.items()}
-        work = bind_work(grid, work)
-        intermediate=tuple(v.generic_bind(f'intermediate_{i}', grid, BufferRole.Intermediate) for i, v in enumerate(intermediate))
+        index = 0
+        input = {k: v.generic_bind(k, i, grid, BufferRole.Input) for (i, (k, v)) in enumerate(input.items())}
+        output = {k: v.generic_bind(k, i, grid, BufferRole.Output) for (i, (k, v)) in enumerate(output.items())}
+        intermediate = tuple(v.generic_bind(f'intermediate:{i}', i, grid, BufferRole.Intermediate) for i, v in enumerate(intermediate))
+        #_input = {}
+        #for k, v in input.items():
+        #    _input[k] = v.generic_bind(k, index, grid, BufferRole.Input)
+        #    index += 1
+        #_output = {}
+        #for k, v in output.items():
+        #    _output[k] = v.generic_bind(k, index, grid, BufferRole.Output)
+        #    index += 1
+        #_intermediate = []
+        #for i, v in enumerate(intermediate):
+        #    _intermediate.append(v.generic_bind(f'intermediate:{i}', index, grid, BufferRole.Intermediate))
+        #    index += 1
+
         return dict(
                 input=input,
                 output=output,
-                work=work,
+                work=bind_work(grid, work),
                 intermediate=intermediate
                 )
 
@@ -151,6 +164,14 @@ class BaseSpec[D: Dim]:
         return sum(x.total_work / x.tile_efficiency for x in self.mmas)
 
     @property
+    def compute_time(self):
+        return self.effective_total_work / self.effective_peak_flops
+
+    @property
+    def traffic_time(self):
+        return self.effective_traffic / self.effective_bandwidth
+
+    @property
     def mma_efficiency(self):
         return self.total_work / self.effective_total_work
 
@@ -184,7 +205,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def estimated_time(self):
-        return Max(self.effective_total_work / self.effective_peak_flops, self.effective_traffic / self.effective_bandwidth)
+        return Max(self.compute_time, self.traffic_time)
 
     @property
     def ridge(self):
@@ -208,11 +229,11 @@ class BaseSpec[D: Dim]:
 
     @property
     def effective_peak_flops(self):
-        return self.PEAK_FLOPS / self.SM_utilization
+        return self.PEAK_FLOPS * self.SM_utilization
 
     @property
     def effective_bandwidth(self):
-        return self.BANDWIDTH / self.SM_utilization
+        return self.BANDWIDTH * self.SM_utilization
 
 
     @property
@@ -393,6 +414,8 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 **kwargs,
                 )
 
+
+
     @property
     def config(self):
         return self.grid.config
@@ -403,6 +426,10 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
     @property
     def group_dim(self):
         return self.grid.group_dim
+
+    @property
+    def groups(self):
+        return self.config.num_groups
 
     def eval(self, name):
         value = getattr(self, name)

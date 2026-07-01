@@ -40,16 +40,17 @@ class Buffer:
                 default=default,
                 )
 
-    def generic_bind(self, name: str, grid: BoundGrid | ConcreteGrid, role: BufferRole):
+    def generic_bind(self, name: str, index: int, grid: BoundGrid | ConcreteGrid, role: BufferRole):
         if isinstance(grid, BoundGrid):
-            return self.bind(name, grid, role)
+            return self.bind(name, index, grid, role)
         elif isinstance(grid, ConcreteGrid):
-            return self.concretize(name, grid, role)
+            return self.concretize(name, index, grid, role)
 
 
-    def bind(self, name: str, grid: BoundGrid, role: BufferRole) -> BoundBuffer:
+    def bind(self, name: str, index: int, grid: BoundGrid, role: BufferRole) -> BoundBuffer:
         return BoundBuffer(
                 name=name,
+                program_index=index,
                 spec=grid.bind_dims(self.spec),
                 role=role,
                 dtype=self.dtype,
@@ -57,9 +58,10 @@ class Buffer:
                 default=self.default,
                 )
 
-    def concretize(self, name: str, grid: ConcreteGrid, role: BufferRole) -> ConcreteBuffer:
+    def concretize(self, name: str, index: int, grid: ConcreteGrid, role: BufferRole) -> ConcreteBuffer:
         return ConcreteBuffer(
                 name=name,
+                program_index=index,
                 spec=grid.bind_dims(self.spec),
                 role=role,
                 dtype=self.dtype,
@@ -71,11 +73,16 @@ class Buffer:
 @dataclass(frozen=True, kw_only=True)
 class BaseBuffer[D: Dim]:
     name: str
+    program_index: int
     spec: BaseDims[D]
     role: BufferRole
     dtype: DType
     default: None
     req_grad: bool
+
+    @property
+    def dims(self):
+        return self.spec
 
     @property
     def torch_dtype(self):
@@ -188,3 +195,8 @@ class ConcreteBuffer(BaseBuffer[ConcreteDim]):
             return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
         else:
             return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+
+    @property
+    def is_grouped(self):
+        return any(d.grouped for d in self.dims)
+

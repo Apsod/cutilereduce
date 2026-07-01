@@ -76,11 +76,15 @@ class Dim(str):
 
     @property
     def num_tiles_relaxed(self):
-        return self.total_var / self.tile_var
+        return self.total_var / self.tile_exp
 
     @property
     def num_tiles(self):
-        return ceil(Fraction(self.total_var, self.tile_var))
+        return ceil(Fraction(self.total_var, self.tile_exp))
+
+    @property
+    def num_programs(self):
+        return ceil(Fraction(self.total_var, self.span_exp))
 
     @property
     def tile_exp(self):
@@ -121,6 +125,13 @@ class ConcreteDim(Dim):
     def grouped(self):
         return self == self._config.group_dim
 
+    @property
+    def num_programs(self):
+        if self.grouped:
+            return self._config.num_groups
+        else:
+            return ceil(Fraction(self.total_var, self.tile_exp))
+
 
 @dataclass(frozen=True)
 class Dims(TupleSet[str]):
@@ -135,6 +146,10 @@ class BaseDims[D: Dim](TupleSet[D]):
     @property
     def dims(self) -> tuple[D, ...]:
         return self.value
+
+    @property
+    def grid_index(self) -> tuple[int, ...]:
+        return tuple(d.grid_index for d in self.dims)
 
     @property
     def dimset(self):
@@ -175,6 +190,10 @@ class BaseDims[D: Dim](TupleSet[D]):
     @property
     def base(self) -> Dims:
         return Dims(self.tmap(str))
+
+    @property
+    def tile_shape(self):
+        return tuple(d.tile_exp for d in self.dims)
 
     def __str__(self):
         return str(self.tmap(str))
@@ -275,3 +294,7 @@ class ConcreteGrid(BaseGrid[ConcreteDim]):
     @property
     def group_dim(self) -> ConcreteDim:
         return self.dims.get(self.config.group_dim)
+
+    @property
+    def tasks(self) -> int:
+        return prod(d.num_programs for d in self.dims)

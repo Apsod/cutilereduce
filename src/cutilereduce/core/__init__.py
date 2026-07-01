@@ -9,7 +9,7 @@ from .variables import *
 from .variables import __all__ as _variables_all
 from .work import Work
 from .config import Config
-from .impl import BufferView, GridView, ProgramView
+from .impl import TileCtx, mk_fwd
 from .typestuff import to_torch_dtype
 
 __all__ = [
@@ -21,9 +21,8 @@ __all__ = [
     "ConcreteSpec",
     "Work",
     "Config",
-    "BufferView",
-    "GridView",
-    "ProgramView",
+    "TileCtx",
+    "mk_fwd",
     "to_torch_dtype",
     "Phase",
 ] + _variables_all

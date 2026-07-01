@@ -18,9 +18,9 @@ l40s = {
 
 spec=dict(
         input = dict(
-            ctx = Buffer.make('b d', ct.bfloat16, req_grad=True),
-            trg = Buffer.make('v d', ct.bfloat16, req_grad=True),
-            targets = Buffer.make('b', ct.int32),
+            ctx = Buffer.make('b d', ct.bfloat16, req_grad=True, default=0),
+            trg = Buffer.make('v d', ct.bfloat16, req_grad=True, default=0),
+            targets = Buffer.make('b', ct.int32, default=-100),
         ),
         output = dict(
             m = Buffer.make('b', ct.float32, default=float('-inf')),
@@ -47,7 +47,7 @@ xentropy = Spec.make(
         )
 
 sizes = dict(
-        b = 1024,
+        b = 1024*32,
         v = 1024*32,
         d = 128,
         )
@@ -62,13 +62,13 @@ import pathlib
 
 cached = pathlib.Path('spec.parquet')
 
-if False:#cached.exists():
+if False:# cached.exists():
     res = pl.read_parquet(cached)
 else:
     res = Sweep.default.run_all(e)
     res.write_parquet('spec.parquet')
 
-print(res)
+print(res.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time'))
 
 for (phase,), df in res.group_by('cfg:phase'):
     if phase == 'forward':
@@ -78,23 +78,24 @@ for (phase,), df in res.group_by('cfg:phase'):
 
 spec = xentropy.concretize(config)
 
-print(spec.eval('estimated_time'))
-
-for k, v in spec.input.items():
-    print(k, v.base)
-
-meta = ProgramView.from_spec(spec)
-
 @ct.function
-def map_reduce(tiles):
-    ctx, trg, targets = tiles
+def map_reduce(ctx, trg, targets):
+    ixs = trg.indices_along(0)
+    ctx = ctx.tile
+    trg = trg.tile
+    targets = targets.tile
+
     B = ctx.shape[0]
     V = trg.shape[0]
+
     logits = ct.zeros((B, V), ct.float32)
     logits = ct.mma(ctx, trg.transpose(), logits)
+
     m = ct.max(logits, 1)
     e = ct.sum(ct.exp(logits - m[:, None]), 1)
-    v = ct.zeros((B,), ct.float32)
+    
+    hits = targets[:, None] == ixs[None, :]
+    v = ct.sum(hits * logits, 1)
     return m, e, v
 
 @ct.function
@@ -106,165 +107,43 @@ def combine(a, b):
     
     hi_m = ct.where(key, am, bm)
     hi_e = ct.where(key, ae, be)
-    hi_v = ct.where(key, av, bv)
-
-    skip = hi_m == float('-inf')
-
     lo_m = ct.where(key, bm, am)
     lo_e = ct.where(key, be, ae)
-    lo_v = ct.where(key, bv, av)
+
+    skip = hi_m == float('-inf')
 
     scaling = ct.exp(lo_m - hi_m)
 
     m = hi_m
     e = ct.where(skip, hi_e, hi_e + lo_e * scaling)
-    v = ct.where(skip, hi_v, hi_v + lo_v * scaling)
+    v = av + bv
 
     return m, e, v
 
 def test(spec):
-
-    meta = ProgramView.from_spec(spec)
-
-    grid = meta.grid
-
     ctx, trg, targets = [b.init_buffer('cuda') for b in spec.input.values()]
-    m, e, v = [b.init_buffer('cuda') for b in spec.output.values()]
-
+    fwd = mk_fwd(spec, map_reduce, combine)
     with torch.no_grad():
         ctx.normal_()
         trg.normal_()
+        targets.random_(0, trg.shape[0])
 
-    @ct.function
-    def init_tid():
-        pid = ct.bid(0)
-        quot, rem = ct.static_eval(grid.grouping_info)
-        tid = ()
-
-        for s in ct.static_iter(grid.shape[:grid.group_dim]):
-            lid = pid % s
-            tid += (lid,)
-            pid = pid // s
-
-        s = ct.static_eval(grid.shape[grid.group_dim])
-        lid = pid % s
-        pid = pid // s
-        tid += (lid * quot + ct.minimum(lid, rem),)
-        size = quot + (lid < rem)
-
-        for s in ct.static_iter(grid.shape[grid.group_dim+1:]):
-            lid = pid % s
-            tid += (lid,)
-            pid = pid // s
-        return tid, size
-
-    @ct.function
-    def increment_group(original):
-        ret = ()
-        for i, d in ct.static_iter(
-                (i, 1 if i == grid.group_dim else 0)
-                for i
-                in range(len(grid.shape))
-                ):
-            ret += (original[i]+d,)
-        return ret
-
-    @ct.function
-    def retile(original, index):
-        ret = ()
-        for i in ct.static_iter(index):
-            ret += (original[i],)
-        return ret
-
-    @ct.function
-    def mk_views(buffers):
-        views = ()
-        for i, shape in ct.static_iter(
-            (i, bv.tile_shape(grid)) 
-            for i, bv 
-            in enumerate(meta.buffers)
-            ):
-            view = buffers[i].tiled_view(shape)
-            views += (view,)
-        return views
-
-    @ct.function
-    def batch_loads(views, tid):
-        tiles = ()
-        for i, index in ct.static_iter(
-                (i, v.buffer_dims)
-                for i, v
-                in enumerate(meta.reads)
-                if not v.is_grouped(grid)
-                ):
-            tiles += (views[i].load(retile(tid, index)),)
-        return tiles
-
-    @ct.function
-    def group_loads(views, tid):
-        tiles = ()
-        for i, index in ct.static_iter(
-                (i, v.buffer_dims)
-                for i, v
-                in enumerate(meta.reads)
-                if v.is_grouped(grid)
-                ):
-            tiles += (views[i].load(retile(tid, index)),)
-        return tiles
-
-    @ct.function
-    def store(views, tid, tiles):
-        for i, index in ct.static_iter(
-                (i, v.buffer_dims)
-                for i, v
-                in enumerate(meta.writes)
-                if v.is_write(spec.phase)
-                ):
-            views[i].store(retile(tid, index), tiles[i])
-
-    @ct.function
-    def init(buffers):
-        tid, size = init_tid()
-        views = mk_views(buffers)
-
-        inputs = retile(views, ct.static_eval(meta.reads_index))
-        outputs = retile(views, ct.static_eval(meta.writes_index))
-        load_order = ct.static_eval(meta.load_order)
-
-        return tid, size, views, load_order, inputs, outputs
-
-    @ct.function
-    def fwd(buffers):
-        tid, size, views, load_order, inputs, outputs = init(buffers)
-
-        btiles = batch_loads(inputs, tid)
-        gtiles = group_loads(inputs, tid)
-
-        tiles = retile(btiles + gtiles, load_order)
-        acc = map_reduce(tiles)
-
-        for _ in range(size):
-            tid = increment_group(tid)
-            gtiles = group_loads(views, tid)
-            tiles = retile(btiles + gtiles, load_order)
-            acc = combine(acc, map_reduce(tiles))
-
-        store(outputs, tid, acc)
-
-
-    @ct.kernel
-    def kernel(ctx, trg, targets, m, e, v):
-        buffers = (ctx, trg, targets, m, e, v)
-        fwd(buffers)
-
-    print(spec.grid.dims)
-    launch_grid = (meta.tasks, 1, 1)
-    args = (ctx, trg, targets, m, e, v)
-    ct.launch(torch.cuda.current_stream(), launch_grid, kernel, args)
-    print(m, e, v)
-
-    print((ctx @ trg.t()).logsumexp(1))
-    print((ctx.to(torch.float32) @ trg.t().to(torch.float32)).logsumexp(1))
-    print(m + e.log())
+    def f(ctx, trg, targets):
+        m, e, v = [b.init_buffer('cuda') for b in spec.output.values()]
+        args = (ctx, trg, targets, m, e, v)
+        launch_grid = (spec.grid.tasks, 1, 1)
+        ct.launch(torch.cuda.current_stream(), launch_grid, fwd, args)
+        return m + e.log() - v
+    
+    print(f(ctx, trg, targets))
+    print(f(ctx, trg, targets))
+    print(f(ctx, trg, targets))
+    print(f(ctx, trg, targets))
+    print(f(ctx, trg, targets))
+    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
+    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
+    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
+    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
+    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
 
 test(spec)

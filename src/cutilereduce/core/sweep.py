@@ -97,9 +97,9 @@ class Sweep:
 
 Sweep.default = Sweep(
             attributes = [
-                'estimated_time', 'effective_traffic', 'effective_total_work', 
+                'estimated_time', 'compute_time', 'traffic_time', 
                 'mma_efficiency', 'resident_programs_per_sm', 'group_size', 
-                'residency_bytes', 'effective_intensity_ratio', 'groups',
+                'residency_bytes', 'groups',
                 'SM_utilization',
                 ],
             filters = [
@@ -109,7 +109,7 @@ Sweep.default = Sweep(
                 pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1)
                 ],
             paretos = [
-                'estimated_time', 'effective_total_work', 'effective_traffic', 'residency_bytes'
+                'compute_time', 'traffic_time',
                 ],
             sort = ['estimated_time', pl.col('SM_utilization').neg(), 'residency_bytes']
             )

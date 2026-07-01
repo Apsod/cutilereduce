@@ -7,228 +7,162 @@ import math
 from .base import Phase
 from .buffer import BufferDep, BufferRole, ConcreteBuffer
 from .grid import ConcreteGrid
-
-
-@dataclass(frozen=True)
-class BufferView:
-    buffer_dims: tuple[int, ...]           # Internal index space -> grid index space mapping (injective)
-    req_grad: bool
-    role: BufferRole
-
-    @staticmethod
-    def from_buffer(buffer: ConcreteBuffer) -> BufferView:
-        return BufferView(
-                buffer_dims = tuple(d.grid_index for d in buffer.spec),
-                req_grad = buffer.req_grad,
-                role = buffer.role
-        )
-
-    ###### STATIC ######
-
-    @property
-    def buffer2outer(self, grid):
-        return tuple(grid.axis_to_outer(d) for d in self.buffer_dims)
-    
-    @property
-    def is_output(self):
-        return self.role == BufferRole.Output
-
-    @property
-    def is_input(self):
-        return self.role == BufferRole.Input
-    
-    def is_write(self, phase):
-        match phase:
-            case Phase.fwd: return self.is_output
-            case Phase.bwd: return self.req_grad
-
-    def is_read(self, phase):
-        match phase:
-            case Phase.fwd: return self.is_input
-            case Phase.bwd: return self.is_input | self.is_output
-
-    def is_grouped(self, grid):
-        return grid.group_dim in self.buffer_dims
-
-    @property
-    def rank(self):
-        return len(self.buffer_dims)
-
-    def tile_shape(self, grid):
-        return tuple(grid.dim_tiling[d] for d in self.buffer_dims)
-
-def tuple_replace_at(original, replace_val, replace_ix):
-    replaced = ()
-    for i, v in enumerate(original):
-        if i == replace_ix:
-            replaced += (replace_val,)
-        else:
-            replaced += (v,)
-    return replaced
+from .spec import ConcreteSpec
 
 @dataclass(frozen=True)
-class GridView:
-    dim_tiling: tuple[int, ...] # Tiling of all dims
-    dim_total: tuple[int, ...]  # Total sizes of all dims 
+class TileCtx:
+    tile: ct.Tile
+    index: tuple[int,...]
 
-    outer_dims: tuple[int, ...] # Index into dim_* corresponding to outer dims
+    def indices_along(self, i):
+        s = self.tile.shape[i]
+        return ct.arange(s, dtype=ct.int32) + self.index[i] * s
 
-    group_dim: int              # Index into dim_* corresponding to grouped dim
-    num_groups: int             # Number of programs along group_dim
+    def start_along(self, i):
+        return self.tile.shape[i] * self.index[i]
 
-    @staticmethod
-    def from_grid(grid : ConcreteGrid) -> GridView:
-        return GridView(
-                dim_tiling = tuple(d.tile_exp for d in grid.dims),
-                dim_total = tuple(d.total_var for d in grid.dims),
-                outer_dims = tuple(d.grid_index for d in grid.outer),
-                group_dim = grid.group_dim.grid_index,
-                num_groups = grid.config.num_groups
-        )
+    def stop_along(self, i):
+        return (self.tile.shape[i] + 1) * self.index[i]
 
+@ct.function
+def retile(original, index):
+    ret = ()
+    for i in ct.static_iter(index):
+        ret += (original[i],)
+    return ret
+
+def mk_fwd(spec, map_reduce, combine):
+    grid = spec.grid
+    group_dim = grid.group_dim
+
+    group_tiles = group_dim.num_tiles
+    group_size_base = group_tiles // spec.groups
+    group_remainder = group_tiles % spec.groups
+
+    batch_buffers = tuple(b for b in spec.read_buffers if not b.is_grouped)
+    group_buffers = tuple(b for b in spec.read_buffers if b.is_grouped)
+    load_order = tuple(b.program_index for b in batch_buffers + group_buffers)
+
+    @ct.function
+    def batch_loads(views, tid):
+        tiles = ()
+        for i, index in ct.static_iter(
+                (b.program_index, b.dims.grid_index)
+                for b
+                in batch_buffers
+                ):
+            tile_index = retile(tid, index)
+            tile = views[i].load(tile_index)
+            tiles += (TileCtx(tile,tile_index),)
+        return tiles
+
+    @ct.function
+    def group_loads(views, tid):
+        tiles = ()
+        for pix, gixs in ct.static_iter(
+                (b.program_index, b.dims.grid_index)
+                for b
+                in group_buffers
+                ):
+            tixs = retile(tid, gixs)
+            tile = views[pix].load(tixs)
+            tiles += (TileCtx(tile,tixs),)
+        return tiles
     
-    ###### STATIC ######
+    shape_prefix = tuple(d.num_programs for d in grid.dims[:group_dim.grid_index])
+    shape_suffix = tuple(d.num_programs for d in grid.dims[group_dim.grid_index+1:])
 
-    def axis_to_outer(self, i):
-        if i in self.outer_dims:
-            return self.outer_dims.index(i)
-        else:
-            return None
+    @ct.function
+    def mk_tid():
+        pid = ct.bid(0)
+        tid = ()
 
-    @property
-    def group_outer_dim(self):
-        return self.axis_to_outer(self.group_dim)
+        for s in ct.static_iter(shape_prefix):
+            lid = pid % s
+            tid += (lid,)
+            pid = pid // s
+        
+        s = ct.static_eval(spec.groups)
+        lid = pid % s
+        pid = pid // s
+        tid += (lid * group_size_base + ct.minimum(lid, group_remainder),)
+        size = group_size_base + (lid < group_remainder)
 
-    def programs_along(self, i):
-        if i == self.group_dim:
-            return self.num_groups
-        else:
-            return ct.cdiv(self.dim_total[i], self.dim_tiling[i])
+        for s in ct.static_iter(shape_suffix):
+            lid = pid % s
+            tid += (lid,)
+            pid = pid // s
 
-    def tiles_along(self, i):
-        return ct.cdiv(self.dim_total[i], self.dim_tiling[i])
-    
-    @property
-    def outer_shape(self):
-        return tuple(self.programs_along(i) for i in self.outer_dims)
+        return tid, size
 
-    @property
-    def shape(self):
-        return tuple(self.programs_along(i) for i in range(len(self.dim_tiling)))
-    
-    @property
-    def tasks(self):
-        return math.prod(self.shape)
-
-    @property
-    def grouping_info(self):
-        tiles = self.tiles_along(self.group_dim)
-        quot = tiles // self.num_groups
-        rem = tiles % self.num_groups
-        return quot, rem
+    @ct.function
+    def increment_group(original):
+        ret = ()
+        for i, d in ct.static_iter(
+                (d.grid_index, 1 if d.grouped else 0)
+                for d
+                in grid.dims
+                ):
+            ret += (original[i]+d,)
+        return ret
 
 
-def permutation_inverse(perm):
-    inverse = [None] * len(perm)
-    for i, val in enumerate(perm):
-        inverse[val] = i
-    return tuple(inverse)
+    @ct.function
+    def store(views, tid, tiles):
+        for pix, gixs in ct.static_iter(
+                (b.program_index, b.dims.grid_index)
+                for b
+                in spec.write_buffers
+                ):
+            views[pix].store(retile(tid, gixs), tiles[pix])
 
-@dataclass(frozen=True)
-class ProgramView:
-    buffers: tuple[BufferView]
-    grid: GridView
-    phase: Phase
+    @ct.function
+    def mk_views(buffers):
+        i = ct.static_eval(len(spec.input))
+        inbuffs = buffers[:i]
+        inviews = ()
+        for pix, shape in ct.static_iter(
+            (b.program_index, b.dims.tile_shape)
+            for b 
+            in spec.input_buffers
+            ):
+            view = inbuffs[pix].tiled_view(shape)
+            inviews += (view,)
 
-    @staticmethod
-    def from_spec(spec : ConcreteSpec) -> ProgramView:
-        return ProgramView(
-                buffers = tuple(BufferView.from_buffer(b) for b in (*spec.input.values(), *spec.output.values())),
-                grid = GridView.from_grid(spec.grid),
-                phase = spec.phase,
+        outbuffs = buffers[i:]
+        outviews = ()
+        for pix, shape in ct.static_iter(
+            (b.program_index, b.dims.tile_shape)
+            for b 
+            in spec.output_buffers
+            ):
+            view = outbuffs[pix].tiled_view(shape)
+            outviews += (view,)
 
-        )
+        return inviews, outviews
 
-    ###### STATIC ######
+    @ct.function
+    def fwd(buffers):
+        input, output = mk_views(buffers)
+        tid, size = mk_tid()
 
-    @property
-    def load_order(self):
-        load2original = tuple(
-                i
-                for i, b 
-                in enumerate(self.reads)
-                if not b.is_grouped(self.grid)
-                ) 
-        load2original += tuple(
-                i
-                for i, b 
-                in enumerate(self.reads)
-                if b.is_read(self.phase) and b.is_grouped(self.grid)
-                )
-        return load2original
+        btiles = batch_loads(input, tid)
+        gtiles = group_loads(input, tid)
+        tiles = retile(btiles + gtiles, load_order)
 
-    @property
-    def reads_index(self):
-        return tuple(i for i, b in enumerate(self.buffers) if b.is_read(self.phase))
+        acc = map_reduce(*tiles)
 
-    @property
-    def writes_index(self):
-        return tuple(i for i, b in enumerate(self.buffers) if b.is_write(self.phase))
+        for _ in range(size):
+            tid = increment_group(tid)
+            gtiles = group_loads(input, tid)
+            tiles = retile(btiles + gtiles, load_order)
+            acc = combine(acc, map_reduce(*tiles))
+        store(output, tid, acc)
 
-    @property
-    def tasks(self):
-        return self.grid.tasks
 
-    @property
-    def shape(self):
-        return self.grid.program_shape
+    @ct.kernel
+    def kernel(ctx, trg, targets, m, e, v):
+        buffers = (ctx, trg, targets, m, e, v)
+        fwd(buffers)
 
-    @property
-    def inputs(self):
-        return tuple(b for b in self.buffers if b.is_input)
-
-    @property
-    def output(self):
-        return tuple(b for b in self.buffers if b.is_output)
-
-    @property
-    def reads(self):
-        return tuple(b for b in self.buffers if b.is_read(self.phase))
-
-    @property
-    def writes(self):
-        return tuple(b for b in self.buffers if b.is_write(self.phase))
-    
-    ###### DYNAMIC ######
-
-#def make(spec, map_reduce, combine):
-#    grid = GridView.from_spec(spec)
-#    inputs, outputs = BufferView.from_spec(spec)
-#    meta = Meta.from_spec(spec)
-#    
-#    @ct.function()
-#    def fwd(input_arrays, output_arrays):
-#        pid = grid.pid
-#        gsize, gstart = grid.group_info
-#        
-#        tid = ct.static_eval(grid.mk_tid(pid, gstart))
-#        batch_loads = io.batch_load(tid, inputs, input_arrays)
-#        fold_loads = io.fold_loads(tid, inputs, input_arrays)
-#
-#        acc = map_reduce(*io.pack(batch_loads, fold_loads))
-#
-#        for off in ct.range(1, gsize):
-#            tid = ct.static_eval(grid.mk_tid(pid, gstart+off))
-#            fold_loads = io.fold_loads(tid, inputs, input_arrays)
-#            tmp = map_reduce(*io.pack(batch_loads, fold_loads))
-#            acc = combine(acc, tmp)
-#        
-#        # This assumes num_groups=1 ... 
-#        io.store_outputs(tid, outputs, output_arrays, acc)
-#    
-#    src = f"""
-#ct.kernel(...)
-#def kernel({argstuff}):
-#    fwd({input_tuple}, {output_tuple})
-#"""
-#    compile blablabla
+    return kernel
