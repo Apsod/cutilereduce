@@ -147,7 +147,9 @@ def mk_fwd(spec, map_reduce, combine):
     @ct.function
     def fwd(buffers):
         input, output = mk_views(buffers)
-        tid, size = mk_tid()
+        tid0, size = mk_tid()
+
+        tid = tid0
 
         btiles = batch_loads(input, tid)
         gtiles = group_loads(input, tid)
@@ -160,7 +162,7 @@ def mk_fwd(spec, map_reduce, combine):
             gtiles = group_loads(input, tid)
             tiles = retile(btiles + gtiles, load_order)
             acc = combine(acc, map_reduce(*tiles))
-        store(output, tid, acc)
+        store(output, tid0, acc)
 
     
     nargs = len(spec.input) + len(spec.output)
