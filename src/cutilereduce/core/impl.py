@@ -1,8 +1,12 @@
+from __future__ import annotations
 from dataclasses import dataclass
 
 import cuda.tile as ct
+import math
 
-from .buffer import BufferDep, BufferRole
+from .base import Phase
+from .buffer import BufferDep, BufferRole, ConcreteBuffer
+from .grid import ConcreteGrid
 
 
 @dataclass(frozen=True)
@@ -10,6 +14,14 @@ class BufferView:
     buffer_dims: tuple[int, ...]           # Internal index space -> grid index space mapping (injective)
     req_grad: bool
     role: BufferRole
+
+    @staticmethod
+    def from_buffer(buffer: ConcreteBuffer) -> BufferView:
+        return BufferView(
+                buffer_dims = tuple(d.grid_index for d in buffer.spec),
+                req_grad = buffer.req_grad,
+                role = buffer.role
+        )
 
     ###### STATIC ######
 
@@ -45,26 +57,6 @@ class BufferView:
     def tile_shape(self, grid):
         return tuple(grid.dim_tiling[d] for d in self.buffer_dims)
 
-    ###### DYNAMIC ######
-
-    def grid_tid2buffer_tid(self, grid_tid):
-        buffer_tid = ()
-        for d in ct.static_iter(self.buffer2outer):
-            buffer_tid += (grid_tid[d] if d is not None else 0,)
-        return bid
-
-    def tiled(self, grid, array):
-        return array.tiled_view(self.tile_shape(grid))
-
-    def load(self, view, tid):
-        return view.load(self.tid2bid(tid))
-
-    def store(self, view, arr, tid):
-        return view.store(self.tid2bid(tid), arr)
-
-    def atomic_add(self, view, arr, tid):
-        return view.atomic_add(self.tid2bid(tid), arr)
-
 def tuple_replace_at(original, replace_val, replace_ix):
     replaced = ()
     for i, v in enumerate(original):
@@ -83,6 +75,17 @@ class GridView:
 
     group_dim: int              # Index into dim_* corresponding to grouped dim
     num_groups: int             # Number of programs along group_dim
+
+    @staticmethod
+    def from_grid(grid : ConcreteGrid) -> GridView:
+        return GridView(
+                dim_tiling = tuple(d.tile_exp for d in grid.dims),
+                dim_total = tuple(d.total_var for d in grid.dims),
+                outer_dims = tuple(d.grid_index for d in grid.outer),
+                group_dim = grid.group_dim.grid_index,
+                num_groups = grid.config.num_groups
+        )
+
     
     ###### STATIC ######
 
@@ -94,7 +97,7 @@ class GridView:
 
     @property
     def group_outer_dim(self):
-        return self.axis2outer(self.group_dim)
+        return self.axis_to_outer(self.group_dim)
 
     def programs_along(self, i):
         if i == self.group_dim:
@@ -106,64 +109,79 @@ class GridView:
         return ct.cdiv(self.dim_total[i], self.dim_tiling[i])
     
     @property
-    def program_shape(self):
+    def outer_shape(self):
         return tuple(self.programs_along(i) for i in self.outer_dims)
+
+    @property
+    def shape(self):
+        return tuple(self.programs_along(i) for i in range(len(self.dim_tiling)))
     
     @property
     def tasks(self):
-        return ct.prod(self.program_shape)
-
-    ###### DYNAMIC ######
+        return math.prod(self.shape)
 
     @property
-    def pid(self):
-        i = ct.bid(0)
-        gids = ()
-        for t in ct.static_iter(self.program_shape):
-            gids += (i % t,)
-            i = i // t
-        return gids
-
-    @property
-    def tid_info(self):
-        pid = self.pid
-        gid = pid[self.group_outer_dim]
+    def grouping_info(self):
         tiles = self.tiles_along(self.group_dim)
         quot = tiles // self.num_groups
         rem = tiles % self.num_groups
-        size = quot + (gid < rem)
-        start = gid * quot + ct.minimum(gid, rem)
-        tid = ()
+        return quot, rem
 
 
-
-    @property
-    def gid(self):
-        return self.pid[self.group_outer_dim]
-
-    @property
-    def group_info(self):
-        tiles = ct.cdiv(self.dim_total[self.group_dim], self.dim_tiling[self.group_dim])
-        quot = tiles // self.num_groups
-        rem = tiles % self.num_groups
-        gid = self.gid
-        size = quot + (gid < rem)
-        start = gid * quot + ct.minimum(gid, rem)
-        return size, start
-
-    def mk_tid(self, pid, gix):
-        out = ()
-        for i, tid in enumerate(pid):
-            out += (gix if i == self.group_outer_dim else tid,)
-        return out
+def permutation_inverse(perm):
+    inverse = [None] * len(perm)
+    for i, val in enumerate(perm):
+        inverse[val] = i
+    return tuple(inverse)
 
 @dataclass(frozen=True)
 class ProgramView:
-    buffers: list[BufferView]
+    buffers: tuple[BufferView]
     grid: GridView
     phase: Phase
 
+    @staticmethod
+    def from_spec(spec : ConcreteSpec) -> ProgramView:
+        return ProgramView(
+                buffers = tuple(BufferView.from_buffer(b) for b in (*spec.input.values(), *spec.output.values())),
+                grid = GridView.from_grid(spec.grid),
+                phase = spec.phase,
+
+        )
+
     ###### STATIC ######
+
+    @property
+    def load_order(self):
+        load2original = tuple(
+                i
+                for i, b 
+                in enumerate(self.reads)
+                if not b.is_grouped(self.grid)
+                ) 
+        load2original += tuple(
+                i
+                for i, b 
+                in enumerate(self.reads)
+                if b.is_read(self.phase) and b.is_grouped(self.grid)
+                )
+        return load2original
+
+    @property
+    def reads_index(self):
+        return tuple(i for i, b in enumerate(self.buffers) if b.is_read(self.phase))
+
+    @property
+    def writes_index(self):
+        return tuple(i for i, b in enumerate(self.buffers) if b.is_write(self.phase))
+
+    @property
+    def tasks(self):
+        return self.grid.tasks
+
+    @property
+    def shape(self):
+        return self.grid.program_shape
 
     @property
     def inputs(self):

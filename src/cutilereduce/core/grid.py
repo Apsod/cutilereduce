@@ -28,9 +28,13 @@ class Dim(str):
         return self._grid
 
     @property
-    def grid_index(self):
+    def grid_outer_index(self):
         assert self.outer
         return self.grid.outer.index(self)
+
+    @property
+    def grid_index(self):
+        return self.grid.dims.index(self)
 
     @property
     def outer(self):
@@ -115,7 +119,7 @@ class ConcreteDim(Dim):
 
     @property
     def grouped(self):
-        return self.group_var > 1
+        return self == self._config.group_dim
 
 
 @dataclass(frozen=True)
@@ -167,6 +171,10 @@ class BaseDims[D: Dim](TupleSet[D]):
     @property
     def span_prod(self):
         return prod(x.span_exp for x in self)
+    
+    @property
+    def base(self) -> Dims:
+        return Dims(self.tmap(str))
 
     def __str__(self):
         return str(self.tmap(str))
@@ -187,9 +195,8 @@ class Grid:
     batch: Dims
     fold: Dims
 
-    @classmethod
-    def make(cls, 
-             input: dict[str, Buffer], 
+    @staticmethod
+    def make(input: dict[str, Buffer], 
              output: dict[str, Buffer],
              batch: Dims,
              fold: Dims,
@@ -198,11 +205,11 @@ class Grid:
         if config is None:
             input = Dims.union(*(v.spec for v in input.values()))
             output = Dims.union(*(v.spec for v in output.values()))
-            return BoundGrid(grid=cls(input, output, batch, fold))
+            return BoundGrid(grid=Grid(input, output, batch, fold))
         else:
             input = Dims.union(*(v.spec for v in input.values()))
             output = Dims.union(*(v.spec for v in output.values()))
-            return ConcreteGrid(grid=cls(input, output, batch, fold), config=config)
+            return ConcreteGrid(grid=Grid(input, output, batch, fold), config=config)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -242,6 +249,10 @@ class BaseGrid[D: Dim]:
     def bind_dims(self, dims : Dims) -> BaseDims[D]:
         raise NotImplementedError()
 
+    @property
+    def base(self) -> Grid:
+        return self.grid
+
 
 @dataclass(frozen=True, kw_only=True)
 class BoundGrid(BaseGrid[Dim]):
@@ -260,3 +271,7 @@ class ConcreteGrid(BaseGrid[ConcreteDim]):
 
     def bind_dims(self, dims: Dims) -> ConcreteDims:
         return dims.concretize(self, self.config)
+    
+    @property
+    def group_dim(self) -> ConcreteDim:
+        return self.dims.get(self.config.group_dim)

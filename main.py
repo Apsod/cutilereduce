@@ -61,27 +61,27 @@ l40s = {
 
 spec=dict(
         input = dict(
-            ctx = Buffer.make('b h d', ct.bfloat16, req_grad=True),
-            trg = Buffer.make('v h d', ct.bfloat16, req_grad=True),
+            ctx = Buffer.make('b d', ct.bfloat16, req_grad=True),
+            trg = Buffer.make('v d', ct.bfloat16, req_grad=True),
             targets = Buffer.make('b', ct.int32),
         ),
         output = dict(
-            m = Buffer.make('b h', ct.float32),
-            e = Buffer.make('b h', ct.float32),
-            u = Buffer.make('b h', ct.float32),
+            m = Buffer.make('b', ct.float32),
+            e = Buffer.make('b', ct.float32),
+            u = Buffer.make('b', ct.float32),
         ),
         intermediate = [
-            Buffer.make('b h v', ct.float32),
+            Buffer.make('b v', ct.float32),
             ],
         work = Work.make(
             forward=[
-                'h : b : v : d',
+                ': b : v : d',
                 ],
             recompute=[
-                'h : b : v : d',
+                ': b : v : d',
                 ],
             ),
-        batch = Dims.parse('b h'),
+        batch = Dims.parse('b'),
         fold = Dims.parse('v'),
     )
 
@@ -92,7 +92,6 @@ xentropy = Spec.make(
 sizes = dict(
         b = 1024*256,
         v = 1024*256,
-        h = 8,
         d = 128,
         )
 

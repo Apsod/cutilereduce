@@ -184,7 +184,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def estimated_time(self):
-        return Max(self.effective_total_work / self.PEAK_FLOPS, self.effective_traffic / self.BANDWIDTH)
+        return Max(self.effective_total_work / self.effective_peak_flops, self.effective_traffic / self.effective_bandwidth)
 
     @property
     def ridge(self):
@@ -196,11 +196,24 @@ class BaseSpec[D: Dim]:
 
     @property
     def resident_programs_per_sm(self):
-        return Min(self.MAX_PROGRAMS_PER_SM, sympy.floor(self.SMEM_PER_SM / self.residency_bytes))
+        return Min(self.MAX_PROGRAMS_PER_SM, self.SMEM_PER_SM // self.residency_bytes)
 
     @property
     def active_programs(self):
         return Min(self.program_count, self.resident_programs)
+
+    @property
+    def SM_utilization(self):
+        return Min(1, self.active_programs / self.SM_COUNT) 
+
+    @property
+    def effective_peak_flops(self):
+        return self.PEAK_FLOPS / self.SM_utilization
+
+    @property
+    def effective_bandwidth(self):
+        return self.BANDWIDTH / self.SM_utilization
+
 
     @property
     def groups(self):
@@ -288,6 +301,24 @@ class Spec(BaseSpec[Dim]):
         ret.check()
         return ret
 
+    def concretize(self, config: Config):
+        input = {k: v.base for k, v in self.input.items()}
+        output = {k: v.base for k, v in self.output.items()}
+        batch = self.grid.base.batch
+        fold = self.grid.base.fold
+        work = self.work.base
+        intermediate = [b.base for b in self.intermediate]
+        return ConcreteSpec.make(
+                input,
+                output,
+                batch,
+                fold,
+                work,
+                config,
+                intermediate,
+                )
+
+
     def group(self, dim: str | None = None):
         if dim is None:
             dim = self.contention_dims[0]
@@ -329,6 +360,7 @@ class Spec(BaseSpec[Dim]):
         }
 
 
+
 @dataclass(frozen=True, kw_only=True)
 class ConcreteSpec(BaseSpec[ConcreteDim]):
     @classmethod
@@ -350,7 +382,8 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 output = output,
                 batch = batch,
                 fold = fold,
-                ).concretize(config)
+                config = config,
+                )
 
         kwargs = cls._mkhelp(grid=grid, input=input, output=output, intermediate=intermediate, work=work)
 
@@ -359,66 +392,78 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 phase=config.phase,
                 **kwargs,
                 )
+
+    @property
+    def config(self):
+        return self.grid.config
     
     def _eval(self, expr):
         return self.config._eval(expr)
 
     @property
-    def PEAK_FLOPS(self):
-        return self.config.symbols[PEAK_FLOPS]
-
-    @property
-    def BANDWIDTH(self):
-        return self.config.symbols[BANDWIDTH]
-
-    @property
-    def SM_COUNT(self):
-        return self.config.symbols[SM_COUNT]
-
-    @property
-    def MAX_PROGRAMS_PER_SM(self):
-        return self.config.symbols[MAX_PROGRAMS_PER_SM]
-
-    @property
-    def SMEM_PER_SM(self):
-        return self.config.symbols[SMEM_PER_SM]
-
-    @property
-    def READ(self):
-        return self.config.symbols[READ]
-
-    @property
-    def WRITE(self):
-        return self.config.symbols[WRITE]
-
-    @property
-    def GROUPS(self):
-        return self.config.symbols[GROUPS]
-
-    @property
-    def FWD_CONTENTION(self):
-        return self.config.functions[FWD_CONTENTION]
-
-    @property
-    def BWD_CONTENTION(self):
-        return self.config.functions[BWD_CONTENTION]
-
-    @property
-    def config(self):
-        return self.grid.config
-
-    @property
     def group_dim(self):
-        return self.grid.dim.get(self.config.group_dim)
+        return self.grid.group_dim
 
-    @property
-    def estimated_time(self):
-        return max(self.effective_total_work / self.PEAK_FLOPS, self.effective_traffic / self.BANDWIDTH)
+    def eval(self, name):
+        value = getattr(self, name)
+        if isinstance(value, sympy.Expr):
+            return self._eval(value)
+        else:
+            return value
 
-    @property
-    def resident_programs_per_sm(self):
-        return min(self.MAX_PROGRAMS_PER_SM, floor(self.SMEM_PER_SM / self.residency_bytes))
+    #@property
+    #def PEAK_FLOPS(self):
+    #    return self.config.symbols[PEAK_FLOPS]
 
-    @property
-    def active_programs(self):
-        return min(self.program_count, self.resident_programs)
+    #@property
+    #def BANDWIDTH(self):
+    #    return self.config.symbols[BANDWIDTH]
+
+    #@property
+    #def SM_COUNT(self):
+    #    return self.config.symbols[SM_COUNT]
+
+    #@property
+    #def MAX_PROGRAMS_PER_SM(self):
+    #    return self.config.symbols[MAX_PROGRAMS_PER_SM]
+
+    #@property
+    #def SMEM_PER_SM(self):
+    #    return self.config.symbols[SMEM_PER_SM]
+
+    #@property
+    #def READ(self):
+    #    return self.config.symbols[READ]
+
+    #@property
+    #def WRITE(self):
+    #    return self.config.symbols[WRITE]
+
+    #@property
+    #def GROUPS(self):
+    #    return self.config.symbols[GROUPS]
+
+    #@property
+    #def FWD_CONTENTION(self):
+    #    return self.config.functions[FWD_CONTENTION]
+
+    #@property
+    #def BWD_CONTENTION(self):
+    #    return self.config.functions[BWD_CONTENTION]
+
+    #@property
+    #def config(self):
+    #    return self.grid.config
+
+
+    #@property
+    #def estimated_time(self):
+    #    return max(self.effective_total_work / self.effective_peak_flops, self.effective_traffic / self.effective_bandwidth)
+
+    #@property
+    #def resident_programs_per_sm(self):
+    #    return min(self.MAX_PROGRAMS_PER_SM, self.SMEM_PER_SM // self.residency_bytes)
+
+    #@property
+    #def active_programs(self):
+    #    return min(self.program_count, self.resident_programs)

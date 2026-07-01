@@ -4,12 +4,12 @@ from enum import Enum
 from fractions import Fraction
 
 import sympy
-
+import torch
 
 from .base import *
 from .grid import BaseGrid, BaseDims, Dims, D, Dim, ConcreteDim, BoundGrid, ConcreteDim, ConcreteGrid
 from .variables import * 
-from .typestuff import DType
+from .typestuff import DType, to_torch_dtype
 from .config import Config
 
 class BufferDep(Enum):
@@ -23,18 +23,21 @@ class BufferRole(Enum):
     Output = 'output'
     Intermediate = 'intermediate'
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Buffer:
     spec: Dims
     dtype: DType
     req_grad: bool
+    default: Any = None
+
 
     @classmethod
-    def make(cls, string: str, dtype: DType, req_grad=False) -> Self:
+    def make(cls, string: str, dtype: DType, req_grad=False, default=None) -> Self:
         return cls(
                 spec=Dims.parse(string), 
                 dtype=dtype, 
                 req_grad=req_grad,
+                default=default,
                 )
 
     def generic_bind(self, name: str, grid: BoundGrid | ConcreteGrid, role: BufferRole):
@@ -47,32 +50,49 @@ class Buffer:
     def bind(self, name: str, grid: BoundGrid, role: BufferRole) -> BoundBuffer:
         return BoundBuffer(
                 name=name,
-                grid=grid,
                 spec=grid.bind_dims(self.spec),
                 role=role,
                 dtype=self.dtype,
                 req_grad=self.req_grad,
+                default=self.default,
                 )
 
     def concretize(self, name: str, grid: ConcreteGrid, role: BufferRole) -> ConcreteBuffer:
         return ConcreteBuffer(
                 name=name,
-                grid=grid,
                 spec=grid.bind_dims(self.spec),
                 role=role,
                 dtype=self.dtype,
                 req_grad=self.req_grad,
+                default=self.default,
                 )
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class BaseBuffer[D: Dim]:
     name: str
-    grid: BaseGrid[D]
     spec: BaseDims[D]
     role: BufferRole
     dtype: DType
+    default: None
     req_grad: bool
+
+    @property
+    def torch_dtype(self):
+        return to_torch_dtype(self.dtype)
+
+    @property
+    def base(self):
+        return Buffer(
+                spec=self.spec.base, 
+                dtype=self.dtype, 
+                req_grad=self.req_grad,
+                default=self.default,
+                )
+
+    @property
+    def grid(self):
+        return self.spec[0].grid
     
     @property
     def is_output(self):
@@ -142,6 +162,14 @@ class BaseBuffer[D: Dim]:
         full = self.spec.inner.total_prod
         return self.bsize * tile * full
 
+    @property
+    def buffer_shape(self):
+        return tuple(d.total_var for d in self.spec)
+
+    @property
+    def tile_shape(self):
+        return tuple(d.tile_var for d in self.spec)
+
     def check(self):
         assert self.grid.dims.is_superset(self.spec)
         if self.is_output:
@@ -154,5 +182,9 @@ class BoundBuffer(BaseBuffer[Dim]):
 
 @dataclass(frozen=True)
 class ConcreteBuffer(BaseBuffer[ConcreteDim]):
-    pass
 
+    def init_buffer(self, device=None):
+        if self.default:
+            return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+        else:
+            return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)

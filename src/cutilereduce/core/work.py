@@ -96,6 +96,10 @@ class BaseWork[D: Dim]:
     spec: Work
     grid: BaseGrid[D]
 
+    @property
+    def base(self):
+        return self.spec
+
     def mmas(self, phase):
         match phase:
             case Phase.fwd: return self.forward

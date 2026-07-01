@@ -1,6 +1,6 @@
 from __future__ import annotations 
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, ClassVar
 import itertools
 
 from copy import replace
@@ -56,6 +56,9 @@ class Sweep:
     attributes: list[str]
     filters: list[pl.Expr]
     paretos: list[pl.Expr]
+    sort: list[pl.Expr]
+
+    default: ClassVar[Sweep]
 
     def filter(self, df):
         if self.filters:
@@ -82,6 +85,8 @@ class Sweep:
             df = self.filter(df)
             df = self.pareto(df)
             frontier = self.pareto_combine(df, frontier)
+        if self.sort:
+            frontier = frontier.sort(self.sort)
         return frontier
 
     def run_all(self, estimator: Estimator):
@@ -89,6 +94,26 @@ class Sweep:
             self.apply(estimator.fwd),
             self.apply(estimator.bwd),
             ))
+
+Sweep.default = Sweep(
+            attributes = [
+                'estimated_time', 'effective_traffic', 'effective_total_work', 
+                'mma_efficiency', 'resident_programs_per_sm', 'group_size', 
+                'residency_bytes', 'effective_intensity_ratio', 'groups',
+                'SM_utilization',
+                ],
+            filters = [
+                pl.col('resident_programs_per_sm') >= 1,
+                pl.col('group_size') >= 1,
+                pl.col('mma_efficiency') == 1,
+                pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1)
+                ],
+            paretos = [
+                'estimated_time', 'effective_total_work', 'effective_traffic', 'residency_bytes'
+                ],
+            sort = ['estimated_time', pl.col('SM_utilization').neg(), 'residency_bytes']
+            )
+
 
 @dataclass(frozen=True)
 class Estimator:
@@ -167,8 +192,8 @@ class Estimator:
             while chunk := list(itertools.islice(it, 1024)):
                 cols = list(zip(*chunk))
                 configs = pl.DataFrame({'cfg:phase': self.meta.phase, 'cfg:group': g, **{f'cfg:{k}': v for k,v in zip(params, cols)}})
-                metrics = f(*(numpy.array(col, dtype=numpy.float64) for col in cols))
-                metrics = pl.DataFrame({n: v for n, v in zip(attributes, metrics)})
+                metrics = f(*(numpy.array(col, dtype=numpy.float128) for col in cols))
+                metrics = pl.DataFrame({n: v.astype(numpy.float64) for n, v in zip(attributes, metrics)})
                 yield pl.concat((configs, metrics), how='horizontal')
 
         for g in i2g:
