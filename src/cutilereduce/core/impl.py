@@ -277,7 +277,7 @@ def mk_fwd_kernel(spec, map_reduce, combine):
     def csv(*args):
         return ','.join(args)
     def tuplify(*args):
-        return ('(' + ','.join(args) + ')')
+        return ('(' + ','.join(args) + ',)')
     ns = {'ct': ct, 'fwd': fwd}
 
     source = (

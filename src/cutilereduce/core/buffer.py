@@ -194,7 +194,7 @@ class ConcreteBuffer(BaseBuffer[ConcreteDim]):
         shape = self.buffer_shape
         if extra:
             shape = (extra, *shape)
-        if self.default:
+        if self.default is not None:
             return torch.full(shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
         else:
             return torch.empty(shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
