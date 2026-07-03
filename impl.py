@@ -3,6 +3,7 @@ from dataclasses import dataclass
 import cuda.tile as ct
 import polars as pl
 import torch
+import sympy
 
 from cutilereduce.core import *
 
@@ -47,8 +48,8 @@ xentropy = Spec.make(
         )
 
 sizes = dict(
-        b = 1024*32,
-        v = 1024*32,
+        b = 1024,
+        v = 1024*64,
         d = 128,
         )
 
@@ -62,13 +63,13 @@ import pathlib
 
 cached = pathlib.Path('spec.parquet')
 
-if False:# cached.exists():
+if False:#cached.exists():
     res = pl.read_parquet(cached)
 else:
     res = Sweep.default.run_all(e)
     res.write_parquet('spec.parquet')
 
-print(res.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time'))
+print(res.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time', 'excess_storage_ratio'))
 
 for (phase,), df in res.group_by('cfg:phase'):
     if phase == 'forward':
@@ -79,8 +80,13 @@ for (phase,), df in res.group_by('cfg:phase'):
 spec = xentropy.concretize(config)
 
 @ct.function
-def map_reduce(ctx, trg, targets):
+def embed(z, mu, g_z, g_mu):
+    return z, gz - mu * g, g
+
+@ct.function
+def map(ctx, trg, targets):
     ixs = trg.indices_along(0)
+    vmask = trg.mask_along(0)
     ctx = ctx.tile
     trg = trg.tile
     targets = targets.tile
@@ -90,19 +96,39 @@ def map_reduce(ctx, trg, targets):
 
     logits = ct.zeros((B, V), ct.float32)
     logits = ct.mma(ctx, trg.transpose(), logits)
+    logits = ct.where(vmask[None,:], logits, float('-inf'))
+    hits = (targets[:, None] == ixs[None, :]) & vmask[None, :]
+    return logits, hits
+
+
+@ct.function
+def map_finalize(ctx, trg, targets, z, w, s):
+    logits, hits = map(ctx, trg, targets)
+
+    scale = ct.exp(logits - z[:, None])
+
+    g_l = scale * (w[:, None]  + s[:, None] * logits - hits)
+
+    g_ctx = ct.zeros((B, D), ct.float32)
+    g_ctx = torch.mma(g_l, trg, g_ctx)
+
+    g_trg = ct.zeros((V, D), ct.float32)
+    g_trg = torch.mma(g_l.transpose(), ctx, g_trg)
+
+    return g_ctx, g_trg
+
+@ct.function
+def map_reduce(ctx, trg, targets):
+    logits, hits = map(ctx, trg, targets)
 
     m = ct.max(logits, 1)
     e = ct.sum(ct.exp(logits - m[:, None]), 1)
-    
-    hits = targets[:, None] == ixs[None, :]
     v = ct.sum(hits * logits, 1)
+
     return m, e, v
 
 @ct.function
-def combine(a, b):
-    am, ae, av = a
-    bm, be, bv = b
-    
+def combine(am, ae, av, bm, be, bv):
     key = am > bm
     
     hi_m = ct.where(key, am, bm)
@@ -120,30 +146,42 @@ def combine(a, b):
 
     return m, e, v
 
+def to_semantic(m, e, v):
+    return m + e.log(), v
+
+def to_output(z, v):
+    return z - v
+
 def test(spec):
     ctx, trg, targets = [b.init_buffer('cuda') for b in spec.input.values()]
-    fwd = mk_fwd(spec, map_reduce, combine)
+    f = mk_fwd(spec, map_reduce, combine, to_semantic, to_output)
     with torch.no_grad():
         ctx.normal_()
         trg.normal_()
         targets.random_(0, trg.shape[0])
-
-    def f(ctx, trg, targets):
-        m, e, v = [b.init_buffer('cuda') for b in spec.output.values()]
-        args = (ctx, trg, targets, m, e, v)
-        launch_grid = (spec.grid.tasks, 1, 1)
-        ct.launch(torch.cuda.current_stream(), launch_grid, fwd, args)
-        return m + e.log() - v
     
-    print(f(ctx, trg, targets))
-    print(f(ctx, trg, targets))
-    print(f(ctx, trg, targets))
-    print(f(ctx, trg, targets))
-    print(f(ctx, trg, targets))
-    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
-    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
-    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
-    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
-    print(torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none'))
+    import time
+
+    dur = -time.perf_counter()
+    for _ in range(2):
+        f(ctx, trg, targets)
+    dur += time.perf_counter()
+    print('compile:', dur)
+    dur = -time.perf_counter()
+    for _ in range(20):
+        a = f(ctx, trg, targets)
+    dur += time.perf_counter()
+    print(dur)
+    for _ in range(2):
+        torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none')
+    dur = -time.perf_counter()
+    for _ in range(20):
+        b = torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none')
+    dur += time.perf_counter()
+    print(dur)
+
+    print(a)
+    print(b)
+    
 
 test(spec)

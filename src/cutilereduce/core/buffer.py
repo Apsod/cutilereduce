@@ -190,11 +190,14 @@ class BoundBuffer(BaseBuffer[Dim]):
 @dataclass(frozen=True)
 class ConcreteBuffer(BaseBuffer[ConcreteDim]):
 
-    def init_buffer(self, device=None):
+    def init_buffer(self, device=None, extra=None):
+        shape = self.buffer_shape
+        if extra:
+            shape = (extra, *shape)
         if self.default:
-            return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+            return torch.full(shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
         else:
-            return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+            return torch.empty(shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
 
     @property
     def is_grouped(self):

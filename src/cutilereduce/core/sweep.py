@@ -24,13 +24,16 @@ def atomic_add_penalty(contention):
 def spinlock_penalty(contention):
     return contention_penalty(alpha=2, cap=64, contention=contention)
 
+def group_penalty(contention):
+    return 0
+
 DEFAULT_SYMBOLS = {
         READ: 1, 
         WRITE: 1,
         }
 
 DEFAULT_FUNCTIONS = {
-        FWD_CONTENTION: spinlock_penalty,
+        FWD_CONTENTION: group_penalty,
         BWD_CONTENTION: atomic_add_penalty,
         }
 
@@ -98,15 +101,17 @@ class Sweep:
 Sweep.default = Sweep(
             attributes = [
                 'estimated_time', 'compute_time', 'traffic_time', 
+                'excess_storage_ratio',
                 'mma_efficiency', 'resident_programs_per_sm', 'group_size', 
-                'residency_bytes', 'groups',
+                'residency_bytes', 'groups', 
                 'SM_utilization',
                 ],
             filters = [
                 pl.col('resident_programs_per_sm') >= 1,
                 pl.col('group_size') >= 1,
                 pl.col('mma_efficiency') == 1,
-                pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1)
+                #pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1),
+                pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('excess_storage_ratio') <= 1).otherwise(True)
                 ],
             paretos = [
                 'compute_time', 'traffic_time',
@@ -121,7 +126,6 @@ class Estimator:
     sizes: dict[Dim, int]
     symbols: dict[Symbol, int]
     functions: dict[Function, Any]
-    grouping: dict[Dim, int] | None = None
 
     @classmethod
     def make(
@@ -199,7 +203,7 @@ class Estimator:
         for g in i2g:
             yield from chunk_inner(g)
 
-    def generate_configs(self, max_tile=1024, max_groups=16):
+    def generate_configs(self, max_tile=1024, max_groups=1024):
         groups = {}
         for k in self.meta.contention_dims:
             groups[k] = list(range(1, max_groups + 1))

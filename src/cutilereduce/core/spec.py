@@ -66,6 +66,24 @@ class BaseSpec[D: Dim]:
         return (*self.input.values(),)
 
     @property
+    def output_storage(self):
+        return sum(b.total_bytes for b in self.output_buffers)
+
+    @property
+    def checkpoint_storage(self):
+        return sum((self.groups - 1) * b.total_bytes for b in self.output_buffers)
+
+    @property
+    def input_storage(self):
+        return sum(b.total_bytes for b in self.input_buffers)
+
+    @property
+    def excess_storage_ratio(self):
+        base = self.input_storage + self.output_storage
+        extra = self.checkpoint_storage
+        return extra / base
+
+    @property
     def grad_buffers(self):
         return tuple(b for b in self.input_buffers if b.req_grad)
 
@@ -141,6 +159,10 @@ class BaseSpec[D: Dim]:
     @property
     def residency_bytes(self):
         return sum(v.tile_bytes for v in self.grouped_buffers + self.intermediate)
+
+    @property
+    def output_bytes(self):
+        return sum(v.tile_bytes for v in self.grouped_buffers)
 
     @property
     def contention(self):
@@ -413,8 +435,6 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 phase=config.phase,
                 **kwargs,
                 )
-
-
 
     @property
     def config(self):

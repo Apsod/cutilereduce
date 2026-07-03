@@ -195,6 +195,10 @@ class BaseDims[D: Dim](TupleSet[D]):
     def tile_shape(self):
         return tuple(d.tile_exp for d in self.dims)
 
+    @property
+    def shape(self):
+        return tuple(d.total_var for d in self.dims)
+
     def __str__(self):
         return str(self.tmap(str))
 
@@ -296,5 +300,9 @@ class ConcreteGrid(BaseGrid[ConcreteDim]):
         return self.dims.get(self.config.group_dim)
 
     @property
+    def task_grid(self):
+        return tuple(d.num_programs for d in self.dims)
+
+    @property
     def tasks(self) -> int:
-        return prod(d.num_programs for d in self.dims)
+        return prod(self.task_grid)
