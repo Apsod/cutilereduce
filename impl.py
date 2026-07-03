@@ -48,8 +48,8 @@ xentropy = Spec.make(
         )
 
 sizes = dict(
-        b = 1024,
-        v = 1024*64,
+        b = 1024*32,
+        v = 1024*32,
         d = 128,
         )
 
@@ -63,7 +63,7 @@ import pathlib
 
 cached = pathlib.Path('spec.parquet')
 
-if False:#cached.exists():
+if cached.exists():
     res = pl.read_parquet(cached)
 else:
     res = Sweep.default.run_all(e)
@@ -153,7 +153,7 @@ def to_output(z, v):
     return z - v
 
 def test(spec):
-    ctx, trg, targets = [b.init_buffer('cuda') for b in spec.input.values()]
+    ctx, trg, targets = [b.empty('cuda') for b in spec.input.values()]
     f = mk_fwd(spec, map_reduce, combine, to_semantic, to_output)
     with torch.no_grad():
         ctx.normal_()

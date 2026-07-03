@@ -170,12 +170,16 @@ class BaseBuffer[D: Dim]:
         return self.bsize * tile * full
 
     @property
+    def grid_index(self):
+        return self.spec.grid_index
+
+    @property
     def buffer_shape(self):
-        return tuple(d.total_var for d in self.spec)
+        return self.spec.shape
 
     @property
     def tile_shape(self):
-        return tuple(d.tile_var for d in self.spec)
+        return self.spec.tile_shape
 
     def check(self):
         assert self.grid.dims.is_superset(self.spec)
@@ -190,16 +194,53 @@ class BoundBuffer(BaseBuffer[Dim]):
 @dataclass(frozen=True)
 class ConcreteBuffer(BaseBuffer[ConcreteDim]):
 
-    def init_buffer(self, device=None, extra=None):
-        shape = self.buffer_shape
-        if extra:
-            shape = (extra, *shape)
-        if self.default is not None:
-            return torch.full(shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
-        else:
-            return torch.empty(shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+    def empty(self, device=None):
+        return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+
+    def default(self, device=None):
+        return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
 
     @property
     def is_grouped(self):
         return any(d.grouped for d in self.dims)
+
+    def make_derived(self, grid_index, extent, tile):
+        return GroupedBuffer(self, grid_index, extent, tile)
+
+@dataclass(frozen=True)
+class GroupedBuffer:
+    base: ConcreteBuffer
+    index: int
+    extent: int
+    tile: int
+
+    def empty(self, device=None):
+        return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+
+    def default(self, device=None):
+        return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
+
+    @property
+    def default(self):
+        return self.base.default
+
+    @property
+    def torch_dtype(self):
+        return self.base.torch_dtype
+
+    @property
+    def req_grad(self):
+        return self.base.req_grad
+    
+    @property
+    def grid_index(self):
+        return (self.index, *self.base.grid_index)
+
+    @property
+    def buffer_shape(self):
+        return (self.extent, *self.base.buffer_shape)
+
+    @property
+    def tile_shape(self):
+        return (self.tile, *self.base.tile_shape)
 
