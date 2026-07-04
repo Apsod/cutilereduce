@@ -30,6 +30,7 @@ def group_penalty(contention):
 DEFAULT_SYMBOLS = {
         READ: 1, 
         WRITE: 1,
+        MIN_MMA_EFFICIENCY: 1,
         }
 
 DEFAULT_FUNCTIONS = {
@@ -101,7 +102,7 @@ class Sweep:
 Sweep.default = Sweep(
             attributes = [
                 'estimated_time', 'compute_time', 'traffic_time', 
-                'excess_storage_ratio',
+                'excess_storage_ratio', 'effective_tile_work',
                 'mma_efficiency', 'resident_programs_per_sm', 'group_size', 
                 'residency_bytes', 'groups', 
                 'SM_utilization',
@@ -110,13 +111,13 @@ Sweep.default = Sweep(
                 pl.col('resident_programs_per_sm') >= 1,
                 pl.col('group_size') >= 1,
                 pl.col('mma_efficiency') == 1,
-                #pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1),
-                pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('excess_storage_ratio') <= 1).otherwise(True)
+                pl.col('groups') == 1,
+                #pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('excess_storage_ratio') <= 1).otherwise(True)
                 ],
             paretos = [
                 'compute_time', 'traffic_time',
                 ],
-            sort = ['estimated_time', pl.col('SM_utilization').neg(), 'residency_bytes']
+            sort = ['estimated_time', pl.col('SM_utilization').neg(), 'residency_bytes', pl.col('effective_tile_work').neg()]
             )
 
 
@@ -203,7 +204,7 @@ class Estimator:
         for g in i2g:
             yield from chunk_inner(g)
 
-    def generate_configs(self, max_tile=1024, max_groups=1024):
+    def generate_configs(self, max_tile=1024, max_groups=1):
         groups = {}
         for k in self.meta.contention_dims:
             groups[k] = list(range(1, max_groups + 1))

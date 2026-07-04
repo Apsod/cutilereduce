@@ -1,0 +1,50 @@
+from cutilereduce.core.variables import *
+
+l40s = {
+    PEAK_FLOPS: 362e12,
+    BANDWIDTH: 864e9,
+    SM_COUNT: 142,
+    MAX_PROGRAMS_PER_SM: 32,
+    SMEM_PER_SM: 100*1024,
+}
+
+a100 = {
+    PEAK_FLOPS: 312e12,
+    BANDWIDTH: 2039e9,
+    SM_COUNT: 108,
+    MAX_PROGRAMS_PER_SM: 32,
+    SMEM_PER_SM: 164 * 1024,
+}
+
+h200 = {
+    PEAK_FLOPS: 989.5e12,
+    BANDWIDTH: 4800e9,
+    SM_COUNT: 132,
+    MAX_PROGRAMS_PER_SM: 32,
+    SMEM_PER_SM: 228 * 1024,
+}
+
+rtx5090 = {
+    PEAK_FLOPS: 419.2e12,
+    BANDWIDTH: 1792e9,
+    SM_COUNT: 170,
+    MAX_PROGRAMS_PER_SM: 32,
+    SMEM_PER_SM: 128 * 1024,
+}
+
+rtx5080 = {
+    PEAK_FLOPS: 225.1e12,
+    BANDWIDTH: 960e9,
+    SM_COUNT: 84,
+    MAX_PROGRAMS_PER_SM: 32,
+    SMEM_PER_SM: 128 * 1024,
+}
+
+rtx5070 = {
+    PEAK_FLOPS: 123.5e12,
+    BANDWIDTH: 672e9,
+    SM_COUNT: 48,
+    MAX_PROGRAMS_PER_SM: 32,
+    SMEM_PER_SM: 128 * 1024,
+}
+

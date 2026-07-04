@@ -3,21 +3,15 @@ from dataclasses import dataclass
 import cuda.tile as ct
 import polars as pl
 import torch
+import torch.utils.benchmark as benchmark
 import sympy
 
 from cutilereduce.core import *
+from cutilereduce.util.spec import l40s
 
+import pathlib
 
-l40s = {
-        PEAK_FLOPS: 362e12,
-        BANDWIDTH: 864e9,
-        MIN_MMA_EFFICIENCY: 0.5,
-        SM_COUNT: 142,
-        MAX_PROGRAMS_PER_SM: 32,
-        SMEM_PER_SM: 100*1024,
-        }
-
-spec=dict(
+xentropy = Spec.make(
         input = dict(
             ctx = Buffer.make('b d', ct.bfloat16, req_grad=True, default=0),
             trg = Buffer.make('v d', ct.bfloat16, req_grad=True, default=0),
@@ -41,10 +35,6 @@ spec=dict(
             ),
         batch = Dims.parse('b'),
         fold = Dims.parse('v'),
-    )
-
-xentropy = Spec.make(
-        **spec,
         )
 
 sizes = dict(
@@ -59,29 +49,19 @@ e = Estimator.make(
         symbols=l40s,
         )
 
-import pathlib
+sweep = Sweep.default.run_all(e)
+print(sweep.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time', 'excess_storage_ratio'))
 
-cached = pathlib.Path('spec.parquet')
-
-if cached.exists():
-    res = pl.read_parquet(cached)
-else:
-    res = Sweep.default.run_all(e)
-    res.write_parquet('spec.parquet')
-
-print(res.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time', 'excess_storage_ratio'))
-
-for (phase,), df in res.group_by('cfg:phase'):
+for (phase,), df in sweep.group_by('cfg:phase'):
     if phase == 'forward':
         config = next(e.result2cfg(df))
         break
-
 
 spec = xentropy.concretize(config)
 
 @ct.function
 def embed(z, mu, g_z, g_mu):
-    return z, gz - mu * g, g
+    return z, gz - mu * g_mu, g_mu
 
 @ct.function
 def map(ctx, trg, targets):
@@ -99,7 +79,6 @@ def map(ctx, trg, targets):
     logits = ct.where(vmask[None,:], logits, float('-inf'))
     hits = (targets[:, None] == ixs[None, :]) & vmask[None, :]
     return logits, hits
-
 
 @ct.function
 def map_finalize(ctx, trg, targets, z, w, s):
@@ -154,7 +133,7 @@ def to_output(z, v):
 
 def test(spec):
     ctx, trg, targets = [b.empty('cuda') for b in spec.input.values()]
-    f = mk_fwd(spec, map_reduce, combine, to_semantic, to_output)
+    f = mk_fwd_no_group(spec, map_reduce, combine, to_semantic, to_output)
     with torch.no_grad():
         ctx.normal_()
         trg.normal_()
@@ -162,26 +141,29 @@ def test(spec):
     
     import time
 
-    dur = -time.perf_counter()
-    for _ in range(2):
-        f(ctx, trg, targets)
-    dur += time.perf_counter()
-    print('compile:', dur)
-    dur = -time.perf_counter()
-    for _ in range(20):
-        a = f(ctx, trg, targets)
-    dur += time.perf_counter()
-    print(dur)
-    for _ in range(2):
-        torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none')
-    dur = -time.perf_counter()
-    for _ in range(20):
-        b = torch.nn.functional.cross_entropy(ctx.to(torch.float32) @ trg.to(torch.float32).t(), targets.to(torch.long), reduction='none')
-    dur += time.perf_counter()
-    print(dur)
+    print(f(ctx, trg, targets))
+    print(torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none"))
 
-    print(a)
-    print(b)
-    
+    pytorch = benchmark.Timer(
+            stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
+            setup='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
+            globals = {'ctx': ctx, 'trg': trg, 'targets': targets},
+            label = 'xentropy', sub_label='pytorch', description='',
+            num_threads=1
+            )
+
+    cutile = benchmark.Timer(
+            stmt='f(ctx, trg, targets)',
+            setup='f(ctx, trg, targets)',
+            globals = {'f': f, 'ctx': ctx, 'trg': trg, 'targets': targets},
+            label = 'xentropy', sub_label='cutile', description='',
+            num_threads=1
+    )
+
+    results = []
+    results.append(cutile.blocked_autorange(min_run_time=5))
+    results.append(pytorch.blocked_autorange(min_run_time=5))
+    comparison = benchmark.Compare(results)
+    comparison.print()
 
 test(spec)

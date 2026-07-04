@@ -18,6 +18,11 @@ def ceil_pow2(x: int):
 def floor_pow2(x: int):
     return 1 << (x.bit_length() - 1)
 
+def csv(*args):
+    return ','.join(args)
+def tuplify(*args):
+    return ('(' + ','.join(args) + ',)')
+
 @dataclass(frozen=True)
 class TileCtx:
     tile: ct.Tile
@@ -43,12 +48,12 @@ class View:
     buffer_shape: tuple[int,...]
     grid_index: tuple[int,...]
 
-    def load_tilectx(self, tid):
-        ixs = retile(tid, self.grid_index)
-        return TileCtx(self.view.load(ixs), self.buffer_shape, ixs)
-
     def tid2vid(self, tid):
         return retile(tid, self.grid_index)
+
+    def load_tilectx(self, tid):
+        vid = self.tid2vid(tid)
+        return TileCtx(self.view.load(vid), self.buffer_shape, vid)
 
     def load(self, tid):
         return self.view.load(self.tid2vid(tid))
@@ -74,7 +79,46 @@ def add_at(original, index, value):
 def set_at(original, index, value):
     return (*original[:index], value, original[index+1:])
 
-def make_loads(num, *, tilectx=False):
+#@ct.function
+#def set_at(original, index, value):
+#    ret = ()
+#    for i in ct.static_iter(range(index)):
+#        ret += (original[i],)
+#    ret += (value,)
+#    for i in ct.static_iter(range(index+1),:)
+
+
+def make_set_gix(grid):
+    @ct.function
+    def _set_gix(original, value):
+        ret = ()
+        for i in ct.static_iter(range(grid.group_dim.grid_index)):
+            ret += (original[i],)
+        ret += (value,)
+        for i in ct.static_iter(range(grid.group_dim.grid_index+1, len(grid.task_grid))):
+            ret += (original[i],)
+        return ret
+    return _set_gix
+
+
+def make_views(buffer_specs):
+    @ct.function
+    def _views(buffers):
+        views = ()
+        for i, grid_index, tile_shape in ct.static_iter(
+                (i, b.grid_index, b.tile_shape)
+                for i, b
+                in enumerate(buffer_specs)
+                ):
+            buffer = buffers[i]
+            view = buffer.tiled_view(tile_shape)
+            views += (View(view, buffer.shape, grid_index),)
+        return views
+    return _views
+
+def make_loads(buffer_specs, *, tilectx=False):
+    num = len(buffer_specs)
+
     if tilectx:
         @ct.function
         def _loads(tid, views):
@@ -91,15 +135,60 @@ def make_loads(num, *, tilectx=False):
             return tiles
     return _loads
 
+def make_fused_loads(buffer_specs, *, tilectx=False):
+    if tilectx:
+        @ct.function
+        def _fused_loads(tid, buffers):
+            tiles = ()
+            for i, grid_index, tile_shape in ct.static_iter(
+                    (i, b.grid_index, b.tile_shape)
+                    for i, b
+                    in enumerate(buffer_specs)
+                    ):
+                buffer = buffers[i]
+                view = buffer.tiled_view(tile_shape)
+                tiles += (View(view, buffer.shape, grid_index).load_tilectx(tid),)
+            return tiles
+    else:
+        @ct.function
+        def _fused_loads(tid, buffers):
+            tiles = ()
+            for i, grid_index, tile_shape in ct.static_iter(
+                    (i, b.grid_index, b.tile_shape)
+                    for i, b
+                    in enumerate(buffer_specs)
+                    ):
+                buffer = buffers[i]
+                view = buffer.tiled_view(tile_shape)
+                tiles += (View(view, buffer.shape, grid_index).load(tid),)
+            return tiles
+    return _fused_loads
 
-def make_stores(num):
+def make_stores(buffer_specs):
+    num = len(buffer_specs)
+
     @ct.function
     def _stores(tid, views, tiles):
         for i in ct.static_iter(range(num)):
             views[i].store(tid, tiles[i])
     return _stores
 
-def make_pads(num):
+def make_fused_stores(buffer_specs):
+    @ct.function
+    def _fused_stores(tid, buffers, tiles):
+        for i, grid_index, tile_shape in ct.static_iter(
+                (i, b.grid_index, b.tile_shape)
+                for i, b
+                in enumerate(buffer_specs)
+                ):
+            buffer = buffers[i]
+            view = buffer.tiled_view(tile_shape)
+            View(view, buffer.shape, grid_index).store(tid, tiles[i])
+    return _fused_stores
+
+def make_pads(buffer_specs):
+    num = len(buffer_specs)
+
     @ct.function
     def _pads(tiles):
         ret = ()
@@ -108,20 +197,26 @@ def make_pads(num):
         return ret
     return _pads
 
-def make_views(buffer_specs):
-    @ct.function
-    def _views(buffers):
-        views = ()
-        for i, grid_index, tile_shape in ct.static_iter(
-                (i, b.grid_index, b.tile_shape)
-                for i, b
-                in enumerate(buffer_specs)
-                ):
-            buffer = buffers[i]
-            view = buffer.tiled_view(tile_shape)
-            views += (View(view, buffer.shape, grid_index),)
-        return views
-    return _views
+
+class Bundle:
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            return tuple(getattr(self, k) for k in key)
+        else:
+            return getattr(self, key)
+
+def make_helper(buffer_specs, *, tilectx=False):
+    loads = make_loads(buffer_specs, tilectx=tilectx)
+    stores = make_stores(buffer_specs)
+    views = make_views(buffer_specs)
+    pads = make_pads(buffer_specs)
+    fused_loads = make_fused_loads(buffer_specs, tilectx=tilectx)
+    fused_stores = make_fused_stores(buffer_specs)
+    return Bundle(load=loads, store=stores, view=views, pad=pads, fused_load=fused_loads, fused_store=fused_stores)
 
 def mk_bwd_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
@@ -139,6 +234,110 @@ def mk_bwd_kernel(spec, map_finalize, embed):
     grad_buffers = tuple(b for b in spec.grad_buffers)
 
     load_order = tuple(b.program_index for b in batch_buffers + group_buffers)
+
+def mk_fwd_no_group_kernel(spec, map_reduce, combine):
+    assert spec.phase == Phase.fwd
+    assert spec.groups == 1
+    batch_buffer_index, batch_buffer_specs = zip(*(
+        (i,b) 
+        for (i,b) 
+        in enumerate(spec.input_buffers) 
+        if not b.is_grouped))
+
+    group_buffer_index, group_buffer_specs = zip(*(
+        (i,b) 
+        for (i,b) 
+        in enumerate(spec.input_buffers) 
+        if b.is_grouped))
+
+    for b in spec.input_buffers:
+        print(b.grid_index)
+
+    print(spec.grid.task_grid)
+
+    load_order = batch_buffer_index + group_buffer_index
+    print(load_order)
+
+    set_gix = make_set_gix(spec.grid)
+
+    load_batch = make_helper(batch_buffer_specs, tilectx=True)['fused_load']
+    load_group, view_group = make_helper(group_buffer_specs, tilectx=True)['load', 'view']
+    store_output = make_helper(spec.output_buffers)['fused_store']
+    gsize = spec.grid.group_dim.num_tiles
+    gix = spec.grid.group_dim.grid_index
+
+    @ct.function
+    def load_map_reduce(tid, btiles, group):
+        gtiles = load_group(tid, group)
+        return map_reduce(*retile(btiles + gtiles, load_order))
+
+    @ct.function
+    def init():
+        pid = ct.bid(0)
+        tid = ()
+        for s in ct.static_iter(spec.grid.task_grid):
+            lid = pid % s
+            tid += (lid,)
+            pid = pid // s
+        return tid
+
+    print(gsize, gix, spec.grid.task_grid, spec.grid.tasks)
+
+    @ct.function
+    def fwd(batch_buffers, group_buffers, output_buffers):
+        tid = init()
+        
+        batch = load_batch(tid, batch_buffers)
+        group_view = view_group(group_buffers)
+        
+        acc = load_map_reduce(tid, batch, group_view)
+        
+        for i in range(1, gsize):
+            acc = combine(
+                *acc, 
+                *load_map_reduce(set_gix(tid, i), batch, group_view)
+                )
+
+        store_output(tid, output_buffers, acc)
+
+    ns = {'ct': ct, 'fwd': fwd}
+
+    input_args = tuple(f'in_{i}' for i in range(len(spec.input)))
+    batch_args = tuple(f'in_{i}' for i in batch_buffer_index)
+    group_args = tuple(f'in_{i}' for i in group_buffer_index)
+    output_args = tuple(f'out_{i}' for i in range(len(spec.output)))
+
+    source = (
+            "@ct.kernel\n"
+            f"def kernel({csv(*input_args, *output_args)}):\n"
+            f"  fwd({tuplify(*batch_args)}, {tuplify(*group_args)}, {tuplify(*output_args)})\n"
+            )
+
+    filename = f"<cutilereduce_kernel_{uuid.uuid4().hex}>"
+    linecache.cache[filename] = (
+            len(source),
+            None,
+            source.splitlines(keepends=True),
+            filename,
+    )
+
+    code = compile(source, filename, "exec")
+    exec(code, ns)
+    return ns['kernel']
+
+def mk_fwd_no_group(spec, map_reduce, combine, to_semantic=None, to_output=None):
+    kernel = mk_fwd_no_group_kernel(spec, map_reduce, combine)
+    def fwd(*inputs):
+        outputs = tuple(b.empty('cuda') for b in spec.output_buffers)
+        args = (*inputs, *outputs)
+        launch_grid = (spec.grid.tasks, 1, 1)
+        ct.launch(torch.cuda.current_stream(), launch_grid, kernel, args)
+        if to_semantic is not None:
+            outputs = to_semantic(*outputs)
+        if to_output is not None:
+            outputs = to_output(*outputs)
+        return outputs
+    return fwd
 
 def mk_fwd_kernel(spec, map_reduce, combine):
     assert spec.phase == Phase.fwd
@@ -170,28 +369,21 @@ def mk_fwd_kernel(spec, map_reduce, combine):
         for (i,b) 
         in enumerate(spec.input_buffers) 
         if b.is_grouped))
-    
+
+    output_specs = spec.output_buffers    
     intermediate_specs = tuple(b.make_derived(gix, groups, 1) for b in spec.output_buffers)
     combine_specs = tuple(b.make_derived(gix, groups, combine_tile) for b in spec.output_buffers)
-    
-    num_output_buffers = len(spec.output)
-    num_batch_buffers = len(batch_buffer_specs)
-    num_group_buffers = len(group_buffer_specs)
 
     load_order = batch_buffer_index + group_buffer_index
 
-    load_batch = make_loads(num_batch_buffers, tilectx=True)
-    view_batch = make_views(batch_buffer_specs)
+    load_batch, view_batch = make_helper(batch_buffer_specs, tilectx=True)['load', 'view']
+    load_group, view_group = make_helper(group_buffer_specs, tilectx=True)['load', 'view']
+    store_output = make_helper(output_specs)['store']
 
-    load_group = make_loads(num_group_buffers, tilectx=True)
-    view_group = make_views(group_buffer_specs)
+    load_output, store_output, pad_output = make_helper(output_specs)['load', 'store', 'pad']
 
-    load_output = make_loads(num_output_buffers)
-    store_output = make_stores(num_output_buffers)
-    pad_output = make_pads(num_output_buffers)
-
-    view_intermediate = make_views(intermediate_specs)
-    view_combine = make_views(combine_specs)
+    view_intermediate = make_helper(intermediate_specs)['view']
+    view_combine = make_helper(combine_specs)['view']
     
     @ct.function
     def get_last(tiles):
@@ -276,11 +468,6 @@ def mk_fwd_kernel(spec, map_reduce, combine):
     batch_args = tuple(f'in_{i}' for i in batch_buffer_index)
     group_args = tuple(f'in_{i}' for i in group_buffer_index)
     output_args = tuple(f'out_{i}' for i in range(len(spec.output)))
-
-    def csv(*args):
-        return ','.join(args)
-    def tuplify(*args):
-        return ('(' + ','.join(args) + ',)')
     ns = {'ct': ct, 'fwd': fwd}
 
     source = (

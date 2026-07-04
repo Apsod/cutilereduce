@@ -186,6 +186,10 @@ class BaseSpec[D: Dim]:
         return sum(x.total_work / x.tile_efficiency for x in self.mmas)
 
     @property
+    def effective_tile_work(self):
+        return sum(x.tile_work / x.tile_efficiency for x in self.mmas)
+
+    @property
     def compute_time(self):
         return self.effective_total_work / self.effective_peak_flops
 
