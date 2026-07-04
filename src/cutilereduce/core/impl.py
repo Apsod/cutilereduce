@@ -63,13 +63,13 @@ def make_views(buffer_specs):
     @ct.function
     def _views(buffers):
         views = ()
-        for i, grid_index, tile_shape in ct.static_iter(
-                (i, b.grid_index, b.tile_shape)
+        for i, grid_index, tile_shape, padding_mode in ct.static_iter(
+                (i, b.grid_index, b.tile_shape, b.padding_mode)
                 for i, b
                 in enumerate(buffer_specs)
                 ):
             buffer = buffers[i]
-            view = buffer.tiled_view(tile_shape)
+            view = buffer.tiled_view(tile_shape, padding_mode=padding_mode)
             views += (View(view, grid_index),)
         return views
     return _views
@@ -90,13 +90,13 @@ def make_fused_loads(buffer_specs):
     @ct.function
     def _fused_loads(tid, buffers):
         tiles = ()
-        for i, grid_index, tile_shape in ct.static_iter(
-                (i, b.grid_index, b.tile_shape)
+        for i, grid_index, tile_shape, padding_mode in ct.static_iter(
+                (i, b.grid_index, b.tile_shape, b.padding_mode)
                 for i, b
                 in enumerate(buffer_specs)
                 ):
             buffer = buffers[i]
-            view = buffer.tiled_view(tile_shape)
+            view = buffer.tiled_view(tile_shape, padding_mode=padding_mode)
             tiles += (View(view, grid_index).load(tid),)
         return tiles
     return _fused_loads

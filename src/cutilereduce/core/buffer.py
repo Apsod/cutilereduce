@@ -11,6 +11,7 @@ from .grid import BaseGrid, BaseDims, Dims, D, Dim, ConcreteDim, BoundGrid, Conc
 from .variables import * 
 from .typestuff import DType, to_torch_dtype
 from .config import Config
+import cuda.tile as ct
 
 class BufferDep(Enum):
     Batch = 'batch'
@@ -79,6 +80,15 @@ class BaseBuffer[D: Dim]:
     dtype: DType
     default: None
     req_grad: bool
+
+    @property
+    def padding_mode(self):
+        match self.default:
+            case 0: return ct.PaddingMode.ZERO
+            case -0: return ct.PaddingMode.NEG_ZERO
+            case float('inf'): return ct.PaddingMode.POS_INF
+            case float('-inf'): return ct.PaddingMode.NEG_INF
+            case _: return ct.PaddingMode.UNDETERMINED
 
     @property
     def dims(self):
