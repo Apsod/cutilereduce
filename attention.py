@@ -1,4 +1,6 @@
 from dataclasses import dataclass
+import math
+import pathlib
 
 import cuda.tile as ct
 import polars as pl
@@ -9,7 +11,6 @@ import sympy
 from cutilereduce.core import *
 from cutilereduce.util.spec import l40s
 
-import pathlib
 
 attention = Spec.make(
         input = dict(
@@ -38,12 +39,12 @@ attention = Spec.make(
         )
 
 sizes = dict(
-        l = 2,
-        r = 1024,
+        l = 1024*4,
+        r = 1024*4,
         h = 4,
         g = 8,
-        dqk = 32,
-        dv = 16,
+        dqk = 128,
+        dv = 128,
         )
 
 e = Estimator.make(
@@ -66,6 +67,9 @@ spec = attention.concretize(config)
 def embed(z, mu, g_z, g_mu):
     return z, gz - mu * g_mu, g_mu
 
+LOG2E = math.log2(math.e)
+LN2 = math.log(2)
+
 @ct.function
 def map_reduce(tile, query, key, value):
     """
@@ -81,12 +85,12 @@ def map_reduce(tile, query, key, value):
     logits = ct.zeros((H, L*G, R), ct.float32)
     logits = ct.mma(query, key, logits)
     logits = ct.where(rmask[None,None,:], logits, float('-inf'))
+    logits = logits * LOG2E
 
     value = value.transpose(0, 1)
-    value = ct.where(rmask[None, :, None], value, 0.0) # H R DV
 
     m = ct.max(logits, 2) # H LG 
-    logits = ct.exp(logits - m[:, :, None]) # H LG R
+    logits = ct.exp2(logits - m[:, :, None]) # H LG R
     e = ct.sum(logits, 2) # H LG
     u = ct.zeros((H, L*G, DV), ct.float32) # H LG DV
     u = ct.mma(logits.astype(ct.bfloat16), value, u)
@@ -110,16 +114,16 @@ def combine(am, ae, av, bm, be, bv):
 
     skip = hi_m == float('-inf')
 
-    scaling = ct.exp(lo_m - hi_m)
+    scaling = ct.exp2(lo_m - hi_m)
 
     m = hi_m
     e = ct.where(skip, hi_e, hi_e + lo_e * scaling)
-    v = ct.where(skip[:, :, None], hi_v, hi_v + lo_v * scaling[:, :, None])
+    v = ct.where(skip[:, :, :, None], hi_v, hi_v + lo_v * scaling[:, :, :, None])
 
     return m, e, v
 
 def to_semantic(m, e, v):
-    return m + e.log(), v / e.log()[:, :, :, None]
+    return (m + e.log2()) * LN2, v / e[:, :, :, None]
 
 def to_output(z, v):
     return v
@@ -134,21 +138,55 @@ def test(spec):
     
     import time
 
-    print(f(query, key, value))
+    a = f(query, key, value)
 
     def naive(query, key, value):
+        query, key, value = (x.to(torch.float32) for x in (query, key, value))
         att = torch.einsum('lghd,rhd->lghr', query, key)
         att = att.softmax(dim=3)
         return torch.einsum('lghr,rhd->lghd', att, value)
 
-    print(naive(query, key, value))
-    return True
+    h = sizes['h']
+    g = sizes['g']
+    l = sizes['l']
+    r = sizes['r']
+    dqk = sizes['dqk']
+    dv = sizes['dv']
+    
+    def sdpa(query, key, value):
+        q_sdpa = query.permute(2, 1, 0, 3).reshape(1, h * g, l, dqk)
+        k_sdpa = key.permute(1, 0, 2).reshape(1, h, r, dqk)
+        v_sdpa = value.permute(1, 0, 2).reshape(1, h, r, dv)
 
-    pytorch = benchmark.Timer(
+        out_sdpa = torch.nn.functional.scaled_dot_product_attention(
+            q_sdpa, k_sdpa, v_sdpa,
+            enable_gqa=True,
+            scale=1.0,
+            dropout_p=0.0,
+        )
+
+        # SDPA layout -> kernel layout
+        return out_sdpa.reshape(1, h, g, l, dv)[0].permute(2, 1, 0, 3)
+    b = naive(query, key, value)
+    c = sdpa(query, key, value)
+
+    print((a - c).abs().mean())
+    print((a - b).abs().mean())
+    print((b - c).abs().mean())
+
+    pytorch_naive = benchmark.Timer(
             stmt='naive(query, key, value)',
             setup='naive(query, key, value)',
             globals = {'naive': naive, 'query': query, 'key': key, 'value': value},
-            label = 'attention', sub_label='pytorch', description='',
+            label = 'attention', sub_label='pytorch naive', description='',
+            num_threads=1
+            )
+
+    pytorch_sdpa = benchmark.Timer(
+            stmt='sdpa(query, key, value)',
+            setup='sdpa(query, key, value)',
+            globals = {'sdpa': sdpa, 'query': query, 'key': key, 'value': value},
+            label = 'attention', sub_label='pytorch sdpa', description='',
             num_threads=1
             )
 
@@ -162,7 +200,8 @@ def test(spec):
 
     results = []
     results.append(cutile.blocked_autorange(min_run_time=5))
-    results.append(pytorch.blocked_autorange(min_run_time=5))
+    results.append(pytorch_naive.blocked_autorange(min_run_time=5))
+    results.append(pytorch_sdpa.blocked_autorange(min_run_time=5))
     comparison = benchmark.Compare(results)
     comparison.print()
 
