@@ -64,24 +64,21 @@ def embed(z, mu, g_z, g_mu):
     return z, gz - mu * g_mu, g_mu
 
 @ct.function
-def map(ctx, trg, targets):
-    ixs = trg.indices_along(0)
-    vmask = trg.mask_along(0)
-    ctx = ctx.tile
-    trg = trg.tile
-    targets = targets.tile
+def map(tile, ctx, trg, targets):
+    ixs = tile.indices('v')
+    mask = tile.mask('v')
 
     B = ctx.shape[0]
     V = trg.shape[0]
 
     logits = ct.zeros((B, V), ct.float32)
     logits = ct.mma(ctx, trg.transpose(), logits)
-    logits = ct.where(vmask[None,:], logits, float('-inf'))
-    hits = (targets[:, None] == ixs[None, :]) & vmask[None, :]
+    logits = ct.where(mask[None,:], logits, float('-inf'))
+    hits = (targets[:, None] == ixs[None, :]) & mask[None, :]
     return logits, hits
 
 @ct.function
-def map_finalize(ctx, trg, targets, z, w, s):
+def map_finalize(tile, ctx, trg, targets, z, w, s):
     logits, hits = map(ctx, trg, targets)
 
     scale = ct.exp(logits - z[:, None])
@@ -97,8 +94,8 @@ def map_finalize(ctx, trg, targets, z, w, s):
     return g_ctx, g_trg
 
 @ct.function
-def map_reduce(ctx, trg, targets):
-    logits, hits = map(ctx, trg, targets)
+def map_reduce(tile, ctx, trg, targets):
+    logits, hits = map(tile, ctx, trg, targets)
 
     m = ct.max(logits, 1)
     e = ct.sum(ct.exp(logits - m[:, None]), 1)

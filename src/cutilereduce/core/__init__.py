@@ -9,7 +9,7 @@ from .variables import *
 from .variables import __all__ as _variables_all
 from .work import Work
 from .config import Config
-from .impl import TileCtx, mk_fwd, mk_fwd_no_group
+from .impl import mk_fwd, mk_fwd_no_group
 from .typestuff import to_torch_dtype
 
 __all__ = [
@@ -21,7 +21,6 @@ __all__ = [
     "ConcreteSpec",
     "Work",
     "Config",
-    "TileCtx",
     "mk_fwd",
     "mk_fwd_no_group",
     "to_torch_dtype",

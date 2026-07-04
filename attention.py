@@ -38,12 +38,12 @@ attention = Spec.make(
         )
 
 sizes = dict(
-        l = 1024,
+        l = 2,
         r = 1024,
-        h = 8,
-        g = 4,
-        dqk = 128,
-        dv = 128,
+        h = 4,
+        g = 8,
+        dqk = 32,
+        dv = 16,
         )
 
 e = Estimator.make(
@@ -53,7 +53,7 @@ e = Estimator.make(
         )
 
 sweep = Sweep.default.run_all(e)
-print(sweep.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time', 'excess_storage_ratio'))
+print(sweep.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', '')))
 
 for (phase,), df in sweep.group_by('cfg:phase'):
     if phase == 'forward':
@@ -67,29 +67,29 @@ def embed(z, mu, g_z, g_mu):
     return z, gz - mu * g_mu, g_mu
 
 @ct.function
-def map_reduce(query, key, value):
-    rmask = key.mask_along(0)
-    q = query.tile # l g h dqk
-    k = key.tile   # r h dqk
-    v = value.tile # r h dv
+def map_reduce(tile, query, key, value):
+    """
+    query: l g h dqk
+    key: r h dqk
+    value: r h dv
+    """
+    L, G, H, R, DV = tile.shape('l', 'g', 'h', 'r', 'dv')
+    rmask = tile.mask('r')
 
-    (L, G, H, _) = q.shape
-    (R, _, DV) = v.shape
-
-    k = k.permute((1, 2, 0))
-    q = q.reshape((L*G, H, -1)).transpose(0, 1)
+    key = key.permute((1, 2, 0))
+    query = query.reshape((L*G, H, -1)).transpose(0, 1)
     logits = ct.zeros((H, L*G, R), ct.float32)
-    logits = ct.mma(q, k, logits)
+    logits = ct.mma(query, key, logits)
     logits = ct.where(rmask[None,None,:], logits, float('-inf'))
 
-    v = v.transpose(0, 1)
-    v = ct.where(rmask[None, :, None], v, 0.0)
+    value = value.transpose(0, 1)
+    value = ct.where(rmask[None, :, None], value, 0.0) # H R DV
 
     m = ct.max(logits, 2) # H LG 
-    logits = ct.exp(logits - m[:, :, None])
-    e = ct.sum(logits, 2)
-    u = ct.zeros((H, L*G, DV), ct.float32)
-    u = ct.mma(logits.astype(ct.bfloat16), v, u)
+    logits = ct.exp(logits - m[:, :, None]) # H LG R
+    e = ct.sum(logits, 2) # H LG
+    u = ct.zeros((H, L*G, DV), ct.float32) # H LG DV
+    u = ct.mma(logits.astype(ct.bfloat16), value, u)
     return (
             m.transpose(0, 1).reshape((L, G, H)), 
             e.transpose(0, 1).reshape((L, G, H)),
@@ -103,6 +103,7 @@ def combine(am, ae, av, bm, be, bv):
     hi_m = ct.where(key, am, bm)
     hi_e = ct.where(key, ae, be)
     hi_v = ct.where(key[:, :, None], av, bv)
+
     lo_m = ct.where(key, bm, am)
     lo_e = ct.where(key, be, ae)
     lo_v = ct.where(key[:, :, None], bv, av)
@@ -141,6 +142,7 @@ def test(spec):
         return torch.einsum('lghr,rhd->lghd', att, value)
 
     print(naive(query, key, value))
+    return True
 
     pytorch = benchmark.Timer(
             stmt='naive(query, key, value)',
