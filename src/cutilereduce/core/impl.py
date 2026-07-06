@@ -369,7 +369,7 @@ def mk_autograd_no_group(
 
     class CutileReduceFn(torch.autograd.Function):
         @staticmethod
-        def forward(ctx, *inputs):
+        def forward(*inputs):
             outputs = tuple(b.empty('cuda') for b in fwd_spec.output_buffers)
             
             stream = torch.cuda.current_stream()
@@ -377,8 +377,11 @@ def mk_autograd_no_group(
             args = (*inputs, *outputs)
 
             ct.launch(stream, grid, fwd_kernel, args)
-            ctx.save_for_backward(*inputs, *outputs)
             return outputs
+
+        @staticmethod
+        def setup_context(ctx, inputs, outputs):
+            ctx.save_for_backward(*inputs, *outputs)
 
         @staticmethod
         def backward(ctx, *grad_outputs):

@@ -52,9 +52,10 @@ e = Estimator.make(
         )
 
 sweep = Sweep.default.run_all(e)
-print(sweep.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), 'estimated_time', 'excess_storage_ratio'))
 
 for (phase,), df in sweep.group_by('cfg:phase'):
+    print(phase)
+    print(df)
     if phase == 'forward':
         fwd_conf = next(e.result2cfg(df))
     elif phase == 'backward':
@@ -151,15 +152,43 @@ f = mk_autograd_no_group(
 with torch.no_grad():
     ctx.normal_()
     trg.normal_()
-    targets.random_(0, trg.shape[0])
+
+targets.random_(0, trg.shape[0])
 
 
-print(f(ctx, trg, targets))
-print(torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none"))
 
-print('...')
-torch.autograd.gradcheck(f, (ctx, trg, targets), nondet_tol=1e-1)
-print('!')
+out = f(ctx, trg, targets)
+
+def f2(ctx, trg):
+    return f(ctx, trg, targets)
+
+def g(ctx, trg):
+    return torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")
+
+out_cutile, grad_cutile = torch.func.vjp(f2, ctx, trg)
+out_pytorch, grad_pytorch = torch.func.vjp(g, ctx, trg)
+
+print(out_cutile)
+print(out_pytorch)
+print((out_cutile - out_pytorch).abs().mean())
+
+mock = out_cutile.new_zeros(out_cutile.shape)
+mock.normal_()
+
+
+print(mock)
+
+for a in grad_pytorch(mock):
+    print(a)
+
+#for b in grad_cutile(mock):
+#    print(b)
+
+(f(ctx, trg, targets) * mock).sum().backward()
+
+print(ctx.grad)
+print(trg.grad)
+
 pytorch = benchmark.Timer(
         stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
         setup='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
