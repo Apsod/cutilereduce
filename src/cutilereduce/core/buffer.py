@@ -3,14 +3,12 @@ from dataclasses import dataclass
 from enum import Enum
 from fractions import Fraction
 
-import sympy
 import torch
 
 from .base import *
-from .grid import BaseGrid, BaseDims, Dims, D, Dim, ConcreteDim, BoundGrid, ConcreteDim, ConcreteGrid
+from .grid import BaseDims, Dims, D, Dim, BoundGrid, ConcreteDim, ConcreteGrid
 from .variables import * 
 from .typestuff import DType, to_torch_dtype
-from .config import Config
 import cuda.tile as ct
 
 class BufferDep(Enum):

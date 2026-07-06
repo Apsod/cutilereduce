@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass, fields
 from enum import Enum
-from typing import TypeVar, Self, Any, Callable
+from typing import TypeVar, Self, Callable
 from functools import reduce, wraps
 
 T = TypeVar('T')

@@ -1,5 +1,13 @@
 from cutilereduce.core.variables import *
 
+l4 = {
+    PEAK_FLOPS: 121e12,              
+    BANDWIDTH: 300e9,                
+    SM_COUNT: 60,                    
+    MAX_PROGRAMS_PER_SM: 32,        
+    SMEM_PER_SM: 100 * 1024,        
+}
+
 l40s = {
     PEAK_FLOPS: 362e12,
     BANDWIDTH: 864e9,

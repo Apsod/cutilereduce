@@ -1,5 +1,5 @@
 from __future__ import annotations
-from dataclasses import dataclass, field, fields
+from dataclasses import dataclass
 from functools import cached_property
 from math import prod, ceil
 from fractions import Fraction
@@ -9,7 +9,6 @@ import sympy
 from .config import Config
 from .base import *
 
-import cuda.tile as ct
 
 D = TypeVar('D')
 

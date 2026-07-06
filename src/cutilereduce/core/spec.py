@@ -1,13 +1,8 @@
 from dataclasses import dataclass
-from enum import Enum
 from copy import replace
-from math import prod
 
-import math
 import sympy
-from sympy import Rational, Max, Min
-from fractions import Fraction
-import sympy
+from sympy import Max, Min
 
 from .grid import BaseGrid, Dims, Grid, Dim, ConcreteDim
 from .buffer import BaseBuffer, Buffer, BufferRole, Phase
@@ -117,6 +112,14 @@ class BaseSpec[D: Dim]:
     @property
     def grouped_buffers(self):
         return tuple(b for b in self.write_buffers if self.group_dim in b.absent)
+
+    @property
+    def batch_buffers(self):
+        return tuple(b for b in self.read_buffers if self.group_dim in b.absent)
+
+    @property
+    def fold_buffers(self):
+        return tuple(b for b in self.read_buffers if self.group_dim in b.dims)
     
     ################# QUANTITIES #################
 
@@ -158,7 +161,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def residency_bytes(self):
-        return sum(v.tile_bytes for v in self.grouped_buffers + self.intermediate)
+        return sum(v.tile_bytes for v in self.grouped_buffers + self.intermediate + self.batch_buffers)
 
     @property
     def output_bytes(self):

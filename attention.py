@@ -1,15 +1,12 @@
-from dataclasses import dataclass
 import math
-import pathlib
 
 import cuda.tile as ct
 import polars as pl
 import torch
 import torch.utils.benchmark as benchmark
-import sympy
 
 from cutilereduce.core import *
-from cutilereduce.util.spec import l40s
+from cutilereduce.util.spec import *
 
 
 attention = Spec.make(
@@ -50,7 +47,7 @@ sizes = dict(
 e = Estimator.make(
         attention,
         sizes=sizes,
-        symbols=l40s,
+        symbols=l4,
         )
 
 sweep = Sweep.default.run_all(e)
@@ -136,7 +133,6 @@ def test(spec):
         key.normal_()
         value.normal_()
     
-    import time
 
     a = f(query, key, value)
 

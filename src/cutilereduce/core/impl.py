@@ -1,16 +1,12 @@
 from __future__ import annotations
 from dataclasses import dataclass
 import linecache
-import math
 import uuid
 
 import cuda.tile as ct
 import torch
 
 from .base import Phase
-from .buffer import BufferDep, BufferRole, ConcreteBuffer
-from .grid import ConcreteGrid
-from .spec import ConcreteSpec
 
 def ceil_pow2(x: int):
     return 1 << (x-1).bit_length()
@@ -123,6 +119,27 @@ def make_fused_stores(buffer_specs):
             View(view, grid_index).store(tid, tiles[i])
     return _fused_stores
 
+def make_atomic_adds(buffer_specs):
+    num = len(buffer_specs)
+
+    @ct.function
+    def _atomic_adds(tid, views, tiles):
+        for i in ct.static_iter(range(num)):
+            views[i].atomic_add(tid, tiles[i])
+
+    return _atomic_adds
+
+def make_adds(buffer_specs):
+    num = len(buffer_specs)
+    @ct.function
+    def _adds(tiles_x, tiles_y):
+        tiles_out = ()
+        for i in ct.static_iter(range(num)):
+            tiles_out += (tiles_[x] + tiles_y,)
+        return tiles_out
+    return _adds
+
+
 def make_pads(buffer_specs):
     num = len(buffer_specs)
 
@@ -146,12 +163,21 @@ class Bundle:
         else:
             return getattr(self, key)
 
+def make_buffer_helper(buffer_specs):
+    return Bundle(
+        load = make_loads(buffer_specs),
+        store = make_stores(buffer_specs),
+        view = make_views(buffer_specs),
+        pad = make_pads(buffer_specs),
+        fused_load = make_fused_loads(buffer_specs),
+        fused_store = make_fused_stores(buffer_specs),
+        add = make_adds(buffer_specs),
+        atomic_add = make_atomic_adds(buffer_specs),
+    )
 
 def make_tid_info(grid):
     
     dims = grid.dims
-
-    print(dims)
 
     @dataclass(frozen=True)
     class TidInfo:
@@ -188,14 +214,18 @@ def make_tid_info(grid):
 
     return TidInfo
 
-def make_buffer_helper(buffer_specs):
-    loads = make_loads(buffer_specs)
-    stores = make_stores(buffer_specs)
-    views = make_views(buffer_specs)
-    pads = make_pads(buffer_specs)
-    fused_loads = make_fused_loads(buffer_specs)
-    fused_stores = make_fused_stores(buffer_specs)
-    return Bundle(load=loads, store=stores, view=views, pad=pads, fused_load=fused_loads, fused_store=fused_stores)
+def make_init(grid):
+    @ct.function
+    def _init():
+        pid = ct.bid(0)
+        tid = ()
+        for s in ct.static_iter(grid.task_grid):
+            lid = pid % s
+            tid += (lid,)
+            pid = pid // s
+        return tid
+    return _init
+
 
 def mk_bwd_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
@@ -214,6 +244,81 @@ def mk_bwd_kernel(spec, map_finalize, embed):
 
     load_order = tuple(b.program_index for b in batch_buffers + group_buffers)
 
+def mk_bwd_no_group_kernel(spec, map_finalize, embed):
+    assert spec.phase == Phase.bwd
+    assert spec.groups == 1
+
+    batch_buffer_index, batch_buffer_specs = zip(*(
+        (i,b) 
+        for (i,b) 
+        in enumerate(spec.input_buffers) 
+        if not b.is_grouped))
+
+    group_buffer_index, group_buffer_specs = zip(*(
+        (i,b) 
+        for (i,b) 
+        in enumerate(spec.input_buffers) 
+        if b.is_grouped))
+
+    grad_batch_buffer_index, grad_batch_buffer_specs = zip(*(
+        (i,b)
+        for (i,b)
+        in enumerate(spec.grad_buffers)
+        if not b.is_grouped))
+
+    grad_group_buffer_index, grad_group_buffer_specs = zip(*(
+        (i,b)
+        for (i,b)
+        in enumerate(spec.grad_buffers)
+        if b.is_grouped))
+
+    load_order = batch_buffer_index + group_buffer_index
+
+    load_batch = make_buffer_helper(batch_buffer_specs)['fused_load', 'fused_store', 'add']
+    store_batch_grad, add_batch_grad  = make_buffer_helper(grad_batch_buffer_specs)['fused_store', 'add']
+    load_output = make_buffer_helper(spec.output_buffers)['fused_load']
+    load_group, view_group = make_buffer_helper(group_buffer_specs)['load', 'view']
+    add_group_grad = make_buffer_helper(grad_group_buffer_specs)['atomic_add']
+
+    def split_grad(tiles):
+        return retile(tiles, grad_batch_buffer_index), retile(tiles, grad_group_buffer_index)
+
+    @ct.function
+    def load_map_finalize_acc(tid, g_embedded, batch_tiles, group_view):
+        group_tiles = load_group(tid, group_view)
+        grads = map_finalize(tid_info(tid), g_embedded, *retile(batch_tiles, group_tiles, load_order))
+        return split_grad(grads)
+
+    @ct.function
+    def load_embed(output_buffers, grad_buffers):
+        out_tile = load_output(output_buffers)
+        grad_tile = load_output(grad_buffers)
+        return embed(out_tile, grad_tile)
+
+    @ct.function
+    def bwd(batch_buffers, group_buffers, output_buffers, grad_buffers, batch_grad_buffers, group_grad_buffers):
+        tid = init()
+        
+        batch_tiles = load_batch(tid, batch_buffers)
+        
+        g_embedded = load_embed(output_buffers, grad_buffers)
+
+        group_view = view_group(group_buffers)
+        group_grad_view = view_group(group_grad_buffers)
+
+        batch_grads, group_grads = load_map_finalize(tid, g_embedded, batch_tiles, group_view)
+
+        add_group_grad(tid, group_grad_view, group_grads)
+
+        for i in range(1, gsize):
+            i_tid = set_gix(tid, i)
+            batch_grads_i, group_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, gropu_view)
+            batch_grads = add_batch_grad(batch_grads, batch_grads_i)
+            add_group(i_tid, group_grad_view, group_grads)
+        store_batch(tid, batch_grads)
+
+
+
 def mk_fwd_no_group_kernel(spec, map_reduce, combine):
     assert spec.phase == Phase.fwd
     assert spec.groups == 1
@@ -229,9 +334,9 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine):
         in enumerate(spec.input_buffers) 
         if b.is_grouped))
 
-
     load_order = batch_buffer_index + group_buffer_index
-
+    
+    init = make_init(spec.grid)
     set_gix = make_set_gix(spec.grid)
     tid_info = make_tid_info(spec.grid)
 
@@ -245,16 +350,6 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine):
     def load_map_reduce(tid, batch_tiles, group_view):
         group_tiles = load_group(tid, group_view)
         return map_reduce(tid_info(tid), *retile(batch_tiles + group_tiles, load_order))
-
-    @ct.function
-    def init():
-        pid = ct.bid(0)
-        tid = ()
-        for s in ct.static_iter(spec.grid.task_grid):
-            lid = pid % s
-            tid += (lid,)
-            pid = pid // s
-        return tid
 
     @ct.function
     def fwd(batch_buffers, group_buffers, output_buffers):

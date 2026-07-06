@@ -1,15 +1,13 @@
-from dataclasses import dataclass
 
 import cuda.tile as ct
 import polars as pl
 import torch
 import torch.utils.benchmark as benchmark
-import sympy
+import math
 
 from cutilereduce.core import *
-from cutilereduce.util.spec import l40s
+from cutilereduce.util.spec import *
 
-import pathlib
 
 xentropy = Spec.make(
         input = dict(
@@ -46,7 +44,7 @@ sizes = dict(
 e = Estimator.make(
         xentropy,
         sizes=sizes,
-        symbols=l40s,
+        symbols=l4,
         )
 
 sweep = Sweep.default.run_all(e)
@@ -63,6 +61,9 @@ spec = xentropy.concretize(config)
 def embed(z, mu, g_z, g_mu):
     return z, gz - mu * g_mu, g_mu
 
+LOG2E = math.log2(math.e)
+LN2 = math.log(2)
+
 @ct.function
 def map(tile, ctx, trg, targets):
     ixs = tile.indices('v')
@@ -73,22 +74,29 @@ def map(tile, ctx, trg, targets):
 
     logits = ct.zeros((B, V), ct.float32)
     logits = ct.mma(ctx, trg.transpose(), logits)
+    logits = logits * LOG2E
     logits = ct.where(mask[None,:], logits, float('-inf'))
     hits = (targets[:, None] == ixs[None, :]) & mask[None, :]
     return logits, hits
 
 @ct.function
+def embed(output, gradients):
+    z, mu = output
+    g_z, g_mu =  gradients
+    return z, gz - mu * g_mu, g_mu
+
+@ct.function
 def map_finalize(tile, ctx, trg, targets, z, w, s):
     logits, hits = map(ctx, trg, targets)
 
-    scale = ct.exp(logits - z[:, None])
+    scale = ct.exp2(logits - z[:, None])
 
     g_l = scale * (w[:, None]  + s[:, None] * logits - hits)
 
-    g_ctx = ct.zeros((B, D), ct.float32)
+    g_ctx = ct.zeros(ctx.shape, ct.float32)
     g_ctx = torch.mma(g_l, trg, g_ctx)
 
-    g_trg = ct.zeros((V, D), ct.float32)
+    g_trg = ct.zeros(trg.shape, ct.float32)
     g_trg = torch.mma(g_l.transpose(), ctx, g_trg)
 
     return g_ctx, g_trg
@@ -98,8 +106,8 @@ def map_reduce(tile, ctx, trg, targets):
     logits, hits = map(tile, ctx, trg, targets)
 
     m = ct.max(logits, 1)
-    e = ct.sum(ct.exp(logits - m[:, None]), 1)
-    v = ct.sum(hits * logits, 1)
+    e = ct.sum(ct.exp2(logits - m[:, None]), 1)
+    v = ct.sum(ct.where(hits, logits, 0.0), 1)
 
     return m, e, v
 
@@ -114,7 +122,7 @@ def combine(am, ae, av, bm, be, bv):
 
     skip = hi_m == float('-inf')
 
-    scaling = ct.exp(lo_m - hi_m)
+    scaling = ct.exp2(lo_m - hi_m)
 
     m = hi_m
     e = ct.where(skip, hi_e, hi_e + lo_e * scaling)
@@ -122,8 +130,12 @@ def combine(am, ae, av, bm, be, bv):
 
     return m, e, v
 
+@ct.function
 def to_semantic(m, e, v):
-    return m + e.log(), v
+    return (m + e.log2()) * LN2, v * LN2
+
+def to_semantic(m, e, v):
+    return (m + e.log2()) * LN2, v * LN2
 
 def to_output(z, v):
     return z - v
@@ -136,7 +148,6 @@ def test(spec):
         trg.normal_()
         targets.random_(0, trg.shape[0])
     
-    import time
 
     print(f(ctx, trg, targets))
     print(torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none"))

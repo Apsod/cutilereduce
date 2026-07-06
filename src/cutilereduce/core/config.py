@@ -1,7 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from fractions import Fraction
-from enum import Enum
 import sympy
 
 from .base import Phase

@@ -112,7 +112,6 @@ Sweep.default = Sweep(
                 pl.col('group_size') >= 1,
                 pl.col('mma_efficiency') == 1,
                 pl.col('groups') == 1,
-                #pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('excess_storage_ratio') <= 1).otherwise(True)
                 ],
             paretos = [
                 'compute_time', 'traffic_time',

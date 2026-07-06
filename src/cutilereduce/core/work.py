@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from sympy import Min, Max
+from sympy import Min
 from math import prod
 
 from .base import field_names, Phase
