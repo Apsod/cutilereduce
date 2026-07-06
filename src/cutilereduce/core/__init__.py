@@ -9,7 +9,7 @@ from .variables import *
 from .variables import __all__ as _variables_all
 from .work import Work
 from .config import Config
-from .impl import mk_fwd, mk_fwd_no_group
+from .impl import mk_fwd, mk_fwd_no_group, mk_autograd_no_group
 from .typestuff import to_torch_dtype
 
 __all__ = [
@@ -24,6 +24,7 @@ __all__ = [
     "mk_fwd",
     "mk_fwd_no_group",
     "to_torch_dtype",
+    "mk_autograd_no_group",
     "Phase",
 ] + _variables_all
 

@@ -135,7 +135,7 @@ def make_adds(buffer_specs):
     def _adds(tiles_x, tiles_y):
         tiles_out = ()
         for i in ct.static_iter(range(num)):
-            tiles_out += (tiles_[x] + tiles_y,)
+            tiles_out += (tiles_x[i] + tiles_y[i],)
         return tiles_out
     return _adds
 
@@ -227,26 +227,14 @@ def make_init(grid):
     return _init
 
 
-def mk_bwd_kernel(spec, map_finalize, embed):
-    assert spec.phase == Phase.bwd
-    grid = spec.grid
-    group_dim = grid.group_dim
-    gix = group_dim.grid_index
-
-    group_tiles = group_dim.num_tiles
-    group_size_base = group_tiles // spec.groups
-    group_remainder = group_tiles % spec.groups
-
-    batch_buffers = tuple(b for b in spec.read_buffers if not b.is_grouped)
-    group_buffers = tuple(b for b in spec.read_buffers if b.is_grouped)
-
-    grad_buffers = tuple(b for b in spec.grad_buffers)
-
-    load_order = tuple(b.program_index for b in batch_buffers + group_buffers)
-
 def mk_bwd_no_group_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
     assert spec.groups == 1
+
+    gsize = spec.grid.group_dim.num_tiles
+    init = make_init(spec.grid)
+    set_gix = make_set_gix(spec.grid)
+    tid_info = make_tid_info(spec.grid)
 
     batch_buffer_index, batch_buffer_specs = zip(*(
         (i,b) 
@@ -274,8 +262,8 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
 
     load_order = batch_buffer_index + group_buffer_index
 
-    load_batch = make_buffer_helper(batch_buffer_specs)['fused_load', 'fused_store', 'add']
-    store_batch_grad, add_batch_grad  = make_buffer_helper(grad_batch_buffer_specs)['fused_store', 'add']
+    load_batch = make_buffer_helper(batch_buffer_specs)['fused_load']
+    store_batch_grad, add_batch_grad = make_buffer_helper(grad_batch_buffer_specs)['fused_store', 'add']
     load_output = make_buffer_helper(spec.output_buffers)['fused_load']
     load_group, view_group = make_buffer_helper(group_buffer_specs)['load', 'view']
     add_group_grad = make_buffer_helper(grad_group_buffer_specs)['atomic_add']
@@ -284,24 +272,25 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
         return retile(tiles, grad_batch_buffer_index), retile(tiles, grad_group_buffer_index)
 
     @ct.function
-    def load_map_finalize_acc(tid, g_embedded, batch_tiles, group_view):
+    def load_map_finalize(tid, g_embedded, batch_tiles, group_view):
         group_tiles = load_group(tid, group_view)
-        grads = map_finalize(tid_info(tid), g_embedded, *retile(batch_tiles, group_tiles, load_order))
-        return split_grad(grads)
+        grads = map_finalize(tid_info(tid), *retile(batch_tiles + group_tiles, load_order), *g_embedded)
+        batch, group = split_grad(grads)
+        return batch, group
 
     @ct.function
-    def load_embed(output_buffers, grad_buffers):
-        out_tile = load_output(output_buffers)
-        grad_tile = load_output(grad_buffers)
-        return embed(out_tile, grad_tile)
+    def load_embed(tid, output_buffers, grad_buffers):
+        out_tile = load_output(tid, output_buffers)
+        grad_tile = load_output(tid, grad_buffers)
+        return embed(*out_tile, *grad_tile)
 
     @ct.function
-    def bwd(batch_buffers, group_buffers, output_buffers, grad_buffers, batch_grad_buffers, group_grad_buffers):
+    def bwd(batch_buffers, group_buffers, batch_grad_buffers, group_grad_buffers, output_buffers, grad_buffers):
         tid = init()
         
         batch_tiles = load_batch(tid, batch_buffers)
         
-        g_embedded = load_embed(output_buffers, grad_buffers)
+        g_embedded = load_embed(tid, output_buffers, grad_buffers)
 
         group_view = view_group(group_buffers)
         group_grad_view = view_group(group_grad_buffers)
@@ -312,14 +301,108 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
 
         for i in range(1, gsize):
             i_tid = set_gix(tid, i)
-            batch_grads_i, group_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, gropu_view)
+            batch_grads_i, group_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, group_view)
+            add_group_grad(i_tid, group_grad_view, group_grads)
             batch_grads = add_batch_grad(batch_grads, batch_grads_i)
-            add_group(i_tid, group_grad_view, group_grads)
-        store_batch(tid, batch_grads)
+
+        store_batch_grad(tid, batch_grad_buffers, batch_grads)
+
+    ns = {'ct': ct, 'bwd': bwd}
+
+    input_args = tuple(f'in_{i}' for i in range(len(
+        batch_buffer_specs + 
+        group_buffer_specs
+        )))
+    in_grad_args = tuple(f'grad_in_{i}' for i in range(len(grad_batch_buffer_index + grad_group_buffer_index)))
+    output_args = tuple(f'out_{i}' for i in range(len(spec.output_buffers)))
+    out_grad_args = tuple(f'grad_out_{i}' for i in range(len(spec.output_buffers)))
+
+    batch_args = tuple(f'in_{i}' for i in batch_buffer_index)
+    group_args = tuple(f'in_{i}' for i in group_buffer_index)
+    grad_batch_args = tuple(f'grad_in_{i}' for i in grad_batch_buffer_index)
+    grad_group_args = tuple(f'grad_in_{i}' for i in grad_group_buffer_index)
 
 
 
-def mk_fwd_no_group_kernel(spec, map_reduce, combine):
+    source = (
+            "@ct.kernel\n"
+            f"def kernel({csv(*input_args, *in_grad_args, *output_args, *out_grad_args)}):\n"
+            f"  bwd({tuplify(*batch_args)}, {tuplify(*group_args)}, {tuplify(*grad_batch_args)}, {tuplify(*grad_group_args)}, {tuplify(*output_args)}, {tuplify(*out_grad_args)})\n"
+            )
+
+    filename = f"<cutilereduce_kernel_{uuid.uuid4().hex}>"
+    linecache.cache[filename] = (
+            len(source),
+            None,
+            source.splitlines(keepends=True),
+            filename,
+    )
+
+    code = compile(source, filename, "exec")
+    exec(code, ns)
+    return ns['kernel']
+
+def mk_autograd_no_group(
+        fwd_spec,
+        bwd_spec,
+        map_reduce,
+        combine,
+        to_semantic,
+        to_output,
+        map_finalize,
+        embed,):
+
+    fwd_kernel = mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
+    bwd_kernel = mk_bwd_no_group_kernel(bwd_spec, map_finalize, embed)
+    num_inputs = len(fwd_spec.input_buffers)
+    index = 0
+    pmut = []
+    for b in fwd_spec.input_buffers:
+        if b.req_grad:
+            pmut.append(index)
+            index += 1
+        else:
+            pmut.append(None)
+    pmut = tuple(pmut)
+            
+
+
+    class CutileReduceFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, *inputs):
+            outputs = tuple(b.empty('cuda') for b in fwd_spec.output_buffers)
+            
+            stream = torch.cuda.current_stream()
+            grid = (fwd_spec.grid.tasks, 1, 1)
+            args = (*inputs, *outputs)
+
+            ct.launch(stream, grid, fwd_kernel, args)
+            ctx.save_for_backward(*inputs, *outputs)
+            return outputs
+
+        @staticmethod
+        def backward(ctx, *grad_outputs):
+            saved = ctx.saved_tensors
+            inputs = saved[:num_inputs]
+            outputs = saved[num_inputs:]
+            grad_storage = tuple(b.grad_buffer('cuda') for b in bwd_spec.grad_buffers)
+
+            stream = torch.cuda.current_stream()
+            launch_grid = (bwd_spec.grid.tasks, 1, 1)
+            args = (*inputs, *grad_storage, *outputs, *grad_outputs)
+
+            ct.launch(stream, launch_grid, bwd_kernel, args)
+            return tuple(grad_storage[i] if i is not None else None for i in pmut)
+
+    def fwd(*inputs):
+        outputs = CutileReduceFn.apply(*inputs)
+        return to_output(*outputs)
+
+    return fwd
+
+
+
+def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     assert spec.phase == Phase.fwd
     assert spec.groups == 1
     batch_buffer_index, batch_buffer_specs = zip(*(
@@ -366,7 +449,9 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine):
                 *load_map_reduce(set_gix(tid, i), batch_tiles, group_view)
                 )
 
-        store_output(tid, output_buffers, acc)
+        sem = to_semantic(*acc)
+
+        store_output(tid, output_buffers, sem)
 
     ns = {'ct': ct, 'fwd': fwd}
 
@@ -394,14 +479,12 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine):
     return ns['kernel']
 
 def mk_fwd_no_group(spec, map_reduce, combine, to_semantic=None, to_output=None):
-    kernel = mk_fwd_no_group_kernel(spec, map_reduce, combine)
+    kernel = mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic)
     def fwd(*inputs):
         outputs = tuple(b.empty('cuda') for b in spec.output_buffers)
         args = (*inputs, *outputs)
         launch_grid = (spec.grid.tasks, 1, 1)
         ct.launch(torch.cuda.current_stream(), launch_grid, kernel, args)
-        if to_semantic is not None:
-            outputs = to_semantic(*outputs)
         if to_output is not None:
             outputs = to_output(*outputs)
         return outputs

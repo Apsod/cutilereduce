@@ -208,47 +208,13 @@ class ConcreteBuffer(BaseBuffer[ConcreteDim]):
     def default(self, device=None):
         return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
 
+    def grad_buffer(self, device):
+        return torch.zeros(self.buffer_shape, device=device, dtype=torch.float32)
+
     @property
     def is_grouped(self):
         return any(d.grouped for d in self.dims)
 
     def make_derived(self, grid_index, extent, tile):
         return GroupedBuffer(self, grid_index, extent, tile)
-
-@dataclass(frozen=True)
-class GroupedBuffer:
-    base: ConcreteBuffer
-    index: int
-    extent: int
-    tile: int
-
-    def empty(self, device=None):
-        return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
-
-    def default(self, device=None):
-        return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
-
-    @property
-    def default(self):
-        return self.base.default
-
-    @property
-    def torch_dtype(self):
-        return self.base.torch_dtype
-
-    @property
-    def req_grad(self):
-        return self.base.req_grad
-    
-    @property
-    def grid_index(self):
-        return (self.index, *self.base.grid_index)
-
-    @property
-    def buffer_shape(self):
-        return (self.extent, *self.base.buffer_shape)
-
-    @property
-    def tile_shape(self):
-        return (self.tile, *self.base.tile_shape)
 

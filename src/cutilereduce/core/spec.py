@@ -14,6 +14,7 @@ from .variables import *
 class BaseSpec[D: Dim]:
     grid: BaseGrid[D]
     input: dict[str, BaseBuffer[D]]
+    execution: dict[str, BaseBuffer[D]]
     output: dict[str, BaseBuffer[D]]
     intermediate: tuple[BaseBuffer[D]]
     work: BaseWork[D]
@@ -24,11 +25,13 @@ class BaseSpec[D: Dim]:
             cls,
             grid: BaseGrid[D],
             input: dict[str, Buffer], 
+            execution: dict[str, Buffer], 
             output: dict[str, Buffer], 
             work: Work, 
             intermediate: list[Buffer] = None):
         index = 0
         input = {k: v.generic_bind(k, i, grid, BufferRole.Input) for (i, (k, v)) in enumerate(input.items())}
+        execution = {k: v.generic_bind(k, i, grid, BufferRole.Intermediate) for (i, (k, v)) in enumerate(execution.items())}
         output = {k: v.generic_bind(k, i, grid, BufferRole.Output) for (i, (k, v)) in enumerate(output.items())}
         intermediate = tuple(v.generic_bind(f'intermediate:{i}', i, grid, BufferRole.Intermediate) for i, v in enumerate(intermediate))
         #_input = {}
@@ -46,6 +49,7 @@ class BaseSpec[D: Dim]:
 
         return dict(
                 input=input,
+                execution=execution,
                 output=output,
                 work=bind_work(grid, work),
                 intermediate=intermediate
@@ -59,6 +63,10 @@ class BaseSpec[D: Dim]:
     @property
     def input_buffers(self):
         return (*self.input.values(),)
+
+    @property
+    def intermediate_buffers(self):
+        return (*self.execution.values(), *self.intermediate)
 
     @property
     def output_storage(self):
@@ -161,7 +169,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def residency_bytes(self):
-        return sum(v.tile_bytes for v in self.grouped_buffers + self.intermediate + self.batch_buffers)
+        return sum(v.tile_bytes for v in self.intermediate + self.batch_buffers)
 
     @property
     def output_bytes(self):
@@ -323,6 +331,7 @@ class Spec(BaseSpec[Dim]):
     @classmethod
     def make(cls, 
              input: dict[str, Buffer], 
+             execution: dict[str, Buffer],
              output: dict[str, Buffer], 
              batch: Dims, 
              fold: Dims, 
@@ -339,7 +348,7 @@ class Spec(BaseSpec[Dim]):
                 fold = fold,
                 )
 
-        kwargs = cls._mkhelp(grid=grid, input=input, output=output, intermediate=intermediate, work=work)
+        kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, intermediate=intermediate, work=work)
 
         ret = cls(
                 grid=grid,
@@ -353,6 +362,7 @@ class Spec(BaseSpec[Dim]):
 
     def concretize(self, config: Config):
         input = {k: v.base for k, v in self.input.items()}
+        execution = {k: v.base for k, v in self.execution.items()}
         output = {k: v.base for k, v in self.output.items()}
         batch = self.grid.base.batch
         fold = self.grid.base.fold
@@ -360,6 +370,7 @@ class Spec(BaseSpec[Dim]):
         intermediate = [b.base for b in self.intermediate]
         return ConcreteSpec.make(
                 input,
+                execution,
                 output,
                 batch,
                 fold,
@@ -416,6 +427,7 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
     @classmethod
     def make(cls, 
              input: dict[str, Buffer], 
+             execution: dict[str, Buffer], 
              output: dict[str, Buffer], 
              batch: Dims, 
              fold: Dims, 
@@ -435,7 +447,7 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 config = config,
                 )
 
-        kwargs = cls._mkhelp(grid=grid, input=input, output=output, intermediate=intermediate, work=work)
+        kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, intermediate=intermediate, work=work)
 
         return cls(
                 grid=grid,

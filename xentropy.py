@@ -15,10 +15,14 @@ xentropy = Spec.make(
             trg = Buffer.make('v d', ct.bfloat16, req_grad=True, default=0),
             targets = Buffer.make('b', ct.int32, default=-100),
         ),
-        output = dict(
+        execution = dict(
             m = Buffer.make('b', ct.float32, default=float('-inf')),
             e = Buffer.make('b', ct.float32, default=0),
             u = Buffer.make('b', ct.float32, default=0),
+        ),
+        output = dict(
+            z = Buffer.make('b', ct.float32, default=float('-inf')),
+            l = Buffer.make('b', ct.float32, default=0),
         ),
         intermediate = [
             Buffer.make('b v', ct.float32),
@@ -36,8 +40,8 @@ xentropy = Spec.make(
         )
 
 sizes = dict(
-        b = 1024*32,
-        v = 1024*32,
+        b = 1024,
+        v = 1024,
         d = 128,
         )
 
@@ -52,14 +56,12 @@ print(sweep.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', ''), '
 
 for (phase,), df in sweep.group_by('cfg:phase'):
     if phase == 'forward':
-        config = next(e.result2cfg(df))
-        break
+        fwd_conf = next(e.result2cfg(df))
+    elif phase == 'backward':
+        bwd_conf = next(e.result2cfg(df))
 
-spec = xentropy.concretize(config)
-
-@ct.function
-def embed(z, mu, g_z, g_mu):
-    return z, gz - mu * g_mu, g_mu
+fwd_spec = xentropy.concretize(fwd_conf)
+bwd_spec = xentropy.concretize(bwd_conf)
 
 LOG2E = math.log2(math.e)
 LN2 = math.log(2)
@@ -80,24 +82,22 @@ def map(tile, ctx, trg, targets):
     return logits, hits
 
 @ct.function
-def embed(output, gradients):
-    z, mu = output
-    g_z, g_mu =  gradients
-    return z, gz - mu * g_mu, g_mu
+def embed(z, mu, g_z, g_mu):
+    return z, g_z - mu * g_mu, g_mu
 
 @ct.function
 def map_finalize(tile, ctx, trg, targets, z, w, s):
-    logits, hits = map(ctx, trg, targets)
+    logits, hits = map(tile, ctx, trg, targets)
 
     scale = ct.exp2(logits - z[:, None])
 
-    g_l = scale * (w[:, None]  + s[:, None] * logits - hits)
+    g_l = (scale * (w[:, None]  + s[:, None] * logits - hits)).astype(ct.bfloat16)
 
     g_ctx = ct.zeros(ctx.shape, ct.float32)
-    g_ctx = torch.mma(g_l, trg, g_ctx)
+    g_ctx = ct.mma(g_l, trg, g_ctx)
 
     g_trg = ct.zeros(trg.shape, ct.float32)
-    g_trg = torch.mma(g_l.transpose(), ctx, g_trg)
+    g_trg = ct.mma(g_l.transpose(), ctx, g_trg)
 
     return g_ctx, g_trg
 
@@ -132,46 +132,53 @@ def combine(am, ae, av, bm, be, bv):
 
 @ct.function
 def to_semantic(m, e, v):
-    return (m + e.log2()) * LN2, v * LN2
-
-def to_semantic(m, e, v):
-    return (m + e.log2()) * LN2, v * LN2
+    return (m + ct.log2(e)) * LN2, v * LN2
 
 def to_output(z, v):
     return z - v
 
-def test(spec):
-    ctx, trg, targets = [b.empty('cuda') for b in spec.input.values()]
-    f = mk_fwd_no_group(spec, map_reduce, combine, to_semantic, to_output)
-    with torch.no_grad():
-        ctx.normal_()
-        trg.normal_()
-        targets.random_(0, trg.shape[0])
-    
+ctx, trg, targets = [b.empty('cuda') for b in fwd_spec.input.values()]
+f = mk_autograd_no_group(
+        fwd_spec,
+        bwd_spec,
+        map_reduce,
+        combine,
+        to_semantic,
+        to_output,
+        map_finalize,
+        embed,
+        )
+with torch.no_grad():
+    ctx.normal_()
+    trg.normal_()
+    targets.random_(0, trg.shape[0])
 
-    print(f(ctx, trg, targets))
-    print(torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none"))
 
-    pytorch = benchmark.Timer(
-            stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
-            setup='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
-            globals = {'ctx': ctx, 'trg': trg, 'targets': targets},
-            label = 'xentropy', sub_label='pytorch', description='',
-            num_threads=1
-            )
+print(f(ctx, trg, targets))
+print(torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none"))
 
-    cutile = benchmark.Timer(
-            stmt='f(ctx, trg, targets)',
-            setup='f(ctx, trg, targets)',
-            globals = {'f': f, 'ctx': ctx, 'trg': trg, 'targets': targets},
-            label = 'xentropy', sub_label='cutile', description='',
-            num_threads=1
-    )
+print('...')
+torch.autograd.gradcheck(f, (ctx, trg, targets), nondet_tol=1e-1)
+print('!')
+pytorch = benchmark.Timer(
+        stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
+        setup='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
+        globals = {'ctx': ctx, 'trg': trg, 'targets': targets},
+        label = 'xentropy', sub_label='pytorch', description='',
+        num_threads=1
+        )
 
-    results = []
-    results.append(cutile.blocked_autorange(min_run_time=5))
-    results.append(pytorch.blocked_autorange(min_run_time=5))
-    comparison = benchmark.Compare(results)
-    comparison.print()
+cutile = benchmark.Timer(
+        stmt='f(ctx, trg, targets)',
+        setup='f(ctx, trg, targets)',
+        globals = {'f': f, 'ctx': ctx, 'trg': trg, 'targets': targets},
+        label = 'xentropy', sub_label='cutile', description='',
+        num_threads=1
+)
 
-test(spec)
+results = []
+results.append(cutile.blocked_autorange(min_run_time=5))
+results.append(pytorch.blocked_autorange(min_run_time=5))
+comparison = benchmark.Compare(results)
+comparison.print()
+
