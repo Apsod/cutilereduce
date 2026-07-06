@@ -4,6 +4,8 @@ from copy import replace
 import sympy
 from sympy import Max, Min
 
+import cuda.tile as ct
+
 from .grid import BaseGrid, Dims, Grid, Dim, ConcreteDim
 from .buffer import BaseBuffer, Buffer, BufferRole, Phase
 from .work import BaseWork, Work, bind_work
@@ -88,7 +90,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def grad_buffers(self):
-        return tuple(b for b in self.input_buffers if b.req_grad)
+        return tuple(replace(b, dtype=ct.float32) for b in self.input_buffers if b.req_grad)
 
     @property
     def io_buffers(self):
@@ -169,11 +171,14 @@ class BaseSpec[D: Dim]:
 
     @property
     def residency_bytes(self):
-        return sum(v.tile_bytes for v in self.intermediate + self.batch_buffers)
+        base = sum(v.tile_bytes for v in self.intermediate + self.batch_buffers)
 
-    @property
-    def output_bytes(self):
-        return sum(v.tile_bytes for v in self.grouped_buffers)
+        if self.phase == Phase.bwd:
+            base += sum(v.tile_bytes for v in self.grad_buffers if self.group_dim in
+            v.absent)
+
+        return base
+
 
     @property
     def contention(self):

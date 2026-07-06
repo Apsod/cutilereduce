@@ -40,8 +40,8 @@ xentropy = Spec.make(
         )
 
 sizes = dict(
-        b = 1024,
-        v = 1024,
+        b = 1024*32,
+        v = 1024*32,
         d = 128,
         )
 
@@ -60,6 +60,9 @@ for (phase,), df in sweep.group_by('cfg:phase'):
         fwd_conf = next(e.result2cfg(df))
     elif phase == 'backward':
         bwd_conf = next(e.result2cfg(df))
+
+print(fwd_conf)
+print(bwd_conf)
 
 fwd_spec = xentropy.concretize(fwd_conf)
 bwd_spec = xentropy.concretize(bwd_conf)
@@ -83,22 +86,23 @@ def map(tile, ctx, trg, targets):
     return logits, hits
 
 @ct.function
-def embed(z, mu, g_z, g_mu):
-    return z, g_z - mu * g_mu, g_mu
+def embed(z, mu, g_z, g_l):
+    return z * LOG2E, g_z, g_l
+    #return z, g_z - mu * g_mu, g_mu
 
 @ct.function
-def map_finalize(tile, ctx, trg, targets, z, w, s):
+def map_finalize(tile, ctx, trg, targets, z, g_z, g_l):
     logits, hits = map(tile, ctx, trg, targets)
 
     scale = ct.exp2(logits - z[:, None])
 
-    g_l = (scale * (w[:, None]  + s[:, None] * logits - hits)).astype(ct.bfloat16)
+    g_logits = (scale * g_z[:, None] + hits * g_l[:, None]).astype(ct.bfloat16)
 
     g_ctx = ct.zeros(ctx.shape, ct.float32)
-    g_ctx = ct.mma(g_l, trg, g_ctx)
+    g_ctx = ct.mma(g_logits, trg, g_ctx)
 
     g_trg = ct.zeros(trg.shape, ct.float32)
-    g_trg = ct.mma(g_l.transpose(), ctx, g_trg)
+    g_trg = ct.mma(g_logits.transpose(), ctx, g_trg)
 
     return g_ctx, g_trg
 
@@ -155,18 +159,12 @@ with torch.no_grad():
 
 targets.random_(0, trg.shape[0])
 
+out_cutile = f(ctx, trg, targets)
 
-
-out = f(ctx, trg, targets)
-
-def f2(ctx, trg):
-    return f(ctx, trg, targets)
-
-def g(ctx, trg):
+def pytorch_xentropy(ctx, trg, targets):
     return torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")
 
-out_cutile, grad_cutile = torch.func.vjp(f2, ctx, trg)
-out_pytorch, grad_pytorch = torch.func.vjp(g, ctx, trg)
+out_pytorch = pytorch_xentropy(ctx, trg, targets)
 
 print(out_cutile)
 print(out_pytorch)
@@ -175,39 +173,54 @@ print((out_cutile - out_pytorch).abs().mean())
 mock = out_cutile.new_zeros(out_cutile.shape)
 mock.normal_()
 
+def cutile_pass(ctx, trg, targets):
+    (f(ctx, trg, targets) * mock).sum().backward()
 
-print(mock)
+def pytorch_pass(ctx, trg, targets):
+    (pytorch_xentropy(ctx, trg, targets) * mock).sum().backward()
 
-for a in grad_pytorch(mock):
-    print(a)
-
-#for b in grad_cutile(mock):
-#    print(b)
-
-(f(ctx, trg, targets) * mock).sum().backward()
 
 print(ctx.grad)
 print(trg.grad)
 
-pytorch = benchmark.Timer(
+pytorch_fwd = benchmark.Timer(
         stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
         setup='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',
         globals = {'ctx': ctx, 'trg': trg, 'targets': targets},
-        label = 'xentropy', sub_label='pytorch', description='',
+        label = 'xentropy fwd', sub_label='pytorch', description='',
         num_threads=1
         )
 
-cutile = benchmark.Timer(
+cutile_fwd = benchmark.Timer(
         stmt='f(ctx, trg, targets)',
         setup='f(ctx, trg, targets)',
         globals = {'f': f, 'ctx': ctx, 'trg': trg, 'targets': targets},
-        label = 'xentropy', sub_label='cutile', description='',
+        label = 'xentropy fwd', sub_label='cutile', description='',
         num_threads=1
 )
 
+pytorch_fwd_bwd = benchmark.Timer(
+        stmt='pytorch_pass(ctx, trg, targets)',
+        setup='pytorch_pass(ctx, trg, targets)',
+        globals = {'pytorch_pass': pytorch_pass, 'ctx': ctx, 'trg': trg, 'targets': targets},
+        label = 'xentropy fwd-bwd', sub_label='pytorch', description='',
+        num_threads=1
+        )
+
+cutile_fwd_bwd = benchmark.Timer(
+        stmt='cutile_pass(ctx, trg, targets)',
+        setup='cutile_pass(ctx, trg, targets)',
+        globals = {'cutile_pass': cutile_pass, 'ctx': ctx, 'trg': trg, 'targets': targets},
+        label = 'xentropy fwd-bwd', sub_label='cutile', description='',
+        num_threads=1
+)
+
+
 results = []
-results.append(cutile.blocked_autorange(min_run_time=5))
-results.append(pytorch.blocked_autorange(min_run_time=5))
+results.append(cutile_fwd.blocked_autorange(min_run_time=5))
+results.append(pytorch_fwd.blocked_autorange(min_run_time=5))
+results.append(cutile_fwd_bwd.blocked_autorange(min_run_time=5))
+results.append(pytorch_fwd_bwd.blocked_autorange(min_run_time=5))
 comparison = benchmark.Compare(results)
 comparison.print()
 
