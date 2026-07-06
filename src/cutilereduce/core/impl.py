@@ -266,7 +266,7 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
     store_batch_grad, add_batch_grad = make_buffer_helper(grad_batch_buffer_specs)['fused_store', 'add']
     load_output = make_buffer_helper(spec.output_buffers)['fused_load']
     load_group, view_group = make_buffer_helper(group_buffer_specs)['load', 'view']
-    add_group_grad = make_buffer_helper(grad_group_buffer_specs)['atomic_add']
+    add_group_grad, view_group_grad = make_buffer_helper(grad_group_buffer_specs)['atomic_add', 'view']
 
     def split_grad(tiles):
         return retile(tiles, grad_batch_buffer_index), retile(tiles, grad_group_buffer_index)
@@ -293,7 +293,7 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
         g_embedded = load_embed(tid, output_buffers, grad_buffers)
 
         group_view = view_group(group_buffers)
-        group_grad_view = view_group(group_grad_buffers)
+        group_grad_view = view_group_grad(group_grad_buffers)
 
         batch_grads, group_grads = load_map_finalize(tid, g_embedded, batch_tiles, group_view)
 

@@ -19,7 +19,7 @@ def contention_penalty(alpha, cap, contention):
     return Min(cap, alpha * log(Max(1, contention), 2))
 
 def atomic_add_penalty(contention):
-    return contention_penalty(alpha=0.5, cap=8, contention=contention)
+    return contention_penalty(alpha=1, cap=16, contention=contention)
 
 def spinlock_penalty(contention):
     return contention_penalty(alpha=2, cap=64, contention=contention)
