@@ -40,8 +40,8 @@ xentropy = Spec.make(
         )
 
 sizes = dict(
-        b = 1024*32,
-        v = 1024*32,
+        b = 1024*16,
+        v = 1024*16,
         d = 128,
         )
 
@@ -74,9 +74,7 @@ LN2 = math.log(2)
 def map(tile, ctx, trg, targets):
     ixs = tile.indices('v')
     mask = tile.mask('v')
-
-    B = ctx.shape[0]
-    V = trg.shape[0]
+    B, V = tile.shape('b', 'v')
 
     logits = ct.zeros((B, V), ct.float32)
     logits = ct.mma(ctx, trg.transpose(), logits)
@@ -88,7 +86,6 @@ def map(tile, ctx, trg, targets):
 @ct.function
 def embed(z, mu, g_z, g_l):
     return z * LOG2E, g_z, g_l
-    #return z, g_z - mu * g_mu, g_mu
 
 @ct.function
 def map_finalize(tile, ctx, trg, targets, z, g_z, g_l):

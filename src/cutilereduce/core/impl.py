@@ -1,4 +1,5 @@
 from __future__ import annotations
+import inspect
 from dataclasses import dataclass
 import linecache
 import uuid
@@ -16,8 +17,10 @@ def floor_pow2(x: int):
 
 def csv(*args):
     return ','.join(args)
+
 def tuplify(*args):
     return ('(' + ','.join(args) + ',)')
+
 
 @dataclass(frozen=True)
 class View:
@@ -36,121 +39,155 @@ class View:
     def atomic_add(self, tid, tile):
         return self.view.atomic_store_add(self.tid2vid(tid), tile)
 
-@ct.function
 def retile(original, index):
     ret = ()
     for i in ct.static_iter(index):
         ret += (original[i],)
     return ret
 
-def make_set_gix(grid):
-    @ct.function
-    def _set_gix(original, value):
+def ctmap(fun, xs):
+
+    def _ctmap(*args):
         ret = ()
-        for i in ct.static_iter(range(grid.group_dim.grid_index)):
-            ret += (original[i],)
-        ret += (value,)
-        for i in ct.static_iter(range(grid.group_dim.grid_index+1, len(grid.task_grid))):
-            ret += (original[i],)
+        for x in ct.static_iter(xs):
+            ret += (fun(*args, *x),)
         return ret
-    return _set_gix
+    return _ctmap
 
-def make_views(buffer_specs):
-    @ct.function
-    def _views(buffers):
-        views = ()
-        for i, grid_index, tile_shape, padding_mode in ct.static_iter(
-                (i, b.grid_index, b.tile_shape, b.padding_mode)
-                for i, b
-                in enumerate(buffer_specs)
-                ):
-            buffer = buffers[i]
-            view = buffer.tiled_view(tile_shape, padding_mode=padding_mode)
-            views += (View(view, grid_index),)
-        return views
-    return _views
+def ctzipmap(fun, xs, *, nzips=1):
 
-def make_loads(buffer_specs):
-    num = len(buffer_specs)
-
-    @ct.function
-    def _loads(tid, views):
-        tiles = ()
-        for i in ct.static_iter(range(num)):
-            tiles += (views[i].load(tid),)
-        return tiles
-
-    return _loads
-
-def make_fused_loads(buffer_specs):
-    @ct.function
-    def _fused_loads(tid, buffers):
-        tiles = ()
-        for i, grid_index, tile_shape, padding_mode in ct.static_iter(
-                (i, b.grid_index, b.tile_shape, b.padding_mode)
-                for i, b
-                in enumerate(buffer_specs)
-                ):
-            buffer = buffers[i]
-            view = buffer.tiled_view(tile_shape, padding_mode=padding_mode)
-            tiles += (View(view, grid_index).load(tid),)
-        return tiles
-    return _fused_loads
-
-def make_stores(buffer_specs):
-    num = len(buffer_specs)
-
-    @ct.function
-    def _stores(tid, views, tiles):
-        for i in ct.static_iter(range(num)):
-            views[i].store(tid, tiles[i])
-    return _stores
-
-def make_fused_stores(buffer_specs):
-    @ct.function
-    def _fused_stores(tid, buffers, tiles):
-        for i, grid_index, tile_shape in ct.static_iter(
-                (i, b.grid_index, b.tile_shape)
-                for i, b
-                in enumerate(buffer_specs)
-                ):
-            buffer = buffers[i]
-            view = buffer.tiled_view(tile_shape)
-            View(view, grid_index).store(tid, tiles[i])
-    return _fused_stores
-
-def make_atomic_adds(buffer_specs):
-    num = len(buffer_specs)
-
-    @ct.function
-    def _atomic_adds(tid, views, tiles):
-        for i in ct.static_iter(range(num)):
-            views[i].atomic_add(tid, tiles[i])
-
-    return _atomic_adds
-
-def make_adds(buffer_specs):
-    num = len(buffer_specs)
-    @ct.function
-    def _adds(tiles_x, tiles_y):
-        tiles_out = ()
-        for i in ct.static_iter(range(num)):
-            tiles_out += (tiles_x[i] + tiles_y[i],)
-        return tiles_out
-    return _adds
-
-
-def make_pads(buffer_specs):
-    num = len(buffer_specs)
-
-    @ct.function
-    def _pads(tiles):
+    def _ctzipmap(*args):
         ret = ()
-        for i in ct.static_iter(range(num)):
-            ret += (tiles[i][None],)
+        static = args[:-nzips]
+        zipped = args[-nzips:]
+        for i, x in ct.static_iter(enumerate(xs)):
+            current = ()
+            for j in ct.static_iter(range(nzips)):
+                current += (zipped[j][i],)
+            ret += (fun(*static, *current, *x),)
         return ret
-    return _pads
+    return _ctzipmap
 
+def ctzipmaprange(fun, *, nzips=1, num=1):
+
+    def _ctzipmaprange(*args):
+        ret = ()
+        static = args[:-nzips]
+        zipped = args[-nzips:]
+        for i in ct.static_iter(range(num)):
+            current = ()
+            for j in ct.static_iter(range(nzips)):
+                current += (zipped[j][i],)
+            ret += (fun(*static, *current),)
+        return ret
+    return _ctzipmaprange
+
+def ctdo(fun, xs):
+
+    def _ctdo(*args):
+        for x in ct.static_iter(xs):
+            fun(*args, *x)
+    return _ctdo
+
+def ctzipdo(fun, xs, *, nzips=1):
+
+    def _ctzipdo(*args):
+        static = args[:-nzips]
+        zipped = args[-nzips:]
+        for i, x in ct.static_iter(enumerate(xs)):
+            current = ()
+            for j in ct.static_iter(range(nzips)):
+                current += (zipped[j][i],)
+            fun(*static, *current, *x)
+    return _ctzipdo
+
+def ctzipdorange(fun, *, nzips=1, num=1):
+
+    def _ctzipdorange(*args):
+        static = args[:-nzips]
+        zipped = args[-nzips:]
+        for i in ct.static_iter(range(num)):
+            current = ()
+            for j in ct.static_iter(range(nzips)):
+                current += (zipped[j][i],)
+            fun(*static, *current)
+    return _ctzipdorange
+
+def ctiter(fun, *, nmut=-0, num=1):
+
+    def _ctiter(*args):
+        static = args[:-nmut]
+        muts = args[-nmut:]
+        for _ in ct.static_iter(range(num)):
+            muts = fun(*static, *muts)
+        return muts
+
+    return _ctiter
+
+def ctrange(fun, *, nmut=1, num=1):
+
+    def _ctrange(*args):
+        static = args[:-nmut]
+        muts = args[-nmut:]
+        for i in ct.static_iter(range(num)):
+            muts = fun(i, *static, *muts)
+        return muts
+
+    return _ctrange
+
+def make_buffer_helper(buffer_specs):
+    num = len(buffer_specs)
+    grid_tile_padding = tuple((b.grid_index, b.tile_shape, b.padding_mode) for b in buffer_specs)
+    tile_padding = tuple((b.tile_shape, b.padding_mode) for b in buffer_specs)
+    grid = tuple((b.grid_index,) for b in buffer_specs)
+
+    def _view_load(tid, view, grid_index):
+        return view.load(retile(tid, grid_index))
+
+    def _view_store(tid, view, tile, grid_index):
+        view.store(retile(tid, grid_index), tile)
+
+    def _view_atomic_add(tid, view, tile, grid_index):
+        view.atomic_store_add(retile(tid, grid_index), tile)
+
+    @dataclass(frozen=True)
+    class Views:
+        views: tuple(ct.TiledView)
+
+        def load(self, tid):
+            return ctzipmap(_view_load, grid)(tid, self.views)
+
+        def store(self, tid, tiles):
+            ctzipdo(_view_store, grid, nzips=2)(tid, self.views, tiles)
+
+        def atomic_add(self, tid, tiles):
+            ctzipdo(_view_atomic_add, grid, nzips=2)(tid, self.views, tiles)
+
+    def _mk_view(buffer, tile_shape, padding_mode):
+        return buffer.tiled_view(tile_shape, padding_mode=padding_mode)
+
+    def _mk_views(buffers):
+        return Views(ctzipmap(_mk_view, tile_padding)(buffers))
+
+    def _load(tid, buffer, grid_index, tile_shape, padding_mode):
+        return ct.load(buffer, retile(tid, grid_index), tile_shape, padding_mode=padding_mode)
+    
+    def _store(tid, buffer, tile, grid_index):
+        ct.store(buffer, retile(tid, grid_index), tile)
+
+    def _add(a, b):
+        return a + b
+
+    def _pad(tile):
+        return ct.expand_dim(tile, 0)
+
+    return Bundle(
+            view = _mk_views,
+            pad = ctzipmaprange(_pad, num=num),
+            load = ctzipmap(_load, grid_tile_padding),
+            store = ctzipdo(_store, grid, nzips=2),
+            add = ctzipmaprange(_add, num=num, nzips=2),
+    )
 
 class Bundle:
     def __init__(self, **kwargs):
@@ -163,33 +200,36 @@ class Bundle:
         else:
             return getattr(self, key)
 
-def make_buffer_helper(buffer_specs):
-    return Bundle(
-        load = make_loads(buffer_specs),
-        store = make_stores(buffer_specs),
-        view = make_views(buffer_specs),
-        pad = make_pads(buffer_specs),
-        fused_load = make_fused_loads(buffer_specs),
-        fused_store = make_fused_stores(buffer_specs),
-        add = make_adds(buffer_specs),
-        atomic_add = make_atomic_adds(buffer_specs),
-    )
+def make_grid_helper(grid):
+    gix = grid.group_dim.grid_index
+    groups = grid.group_dim.num_programs
+    base = grid.group_dim.num_tiles // groups
+    rem = grid.group_dim.num_tiles % groups
+    size = len(grid.task_grid)
 
-def make_tid_info(grid):
-    
-    dims = grid.dims
+    assert base >= 1
+
+    def get(dim, attribute, *more):
+        if more:
+            return tuple(
+                    getattr(grid.dims.get(dim), attr) 
+                    for attr 
+                    in (attribute, *more)
+                    )
+        else: 
+            return getattr(grid.dims.get(dim), attribute)
 
     @dataclass(frozen=True)
     class TidInfo:
         tid: tuple[int,...]
 
         def shape(self, dim, *more):
-            s = ct.static_eval(dims.get(dim).tile_exp)
+            s = ct.static_eval(get(dim, 'tile_exp'))
             if more:
                 ret = (s,)
                 for s in ct.static_iter(
-                        dims.get(d).tile_exp
-                        for d
+                        get(dim, 'tile_exp')
+                        for dim
                         in more
                         ):
                     ret += (s,)
@@ -198,23 +238,25 @@ def make_tid_info(grid):
                 return s
 
         def offset(self, dim):
-            i = ct.static_eval(dims.get(dim).grid_index)
-            return self.tid[i] * ct.static_eval(dims.get(dim).tile_exp)
+            i, s = ct.static_eval(get(dim, 'grid_index', 'tile_exp'))
+            return self.tid[i] * t
 
         def indices(self, dim):
-            i = ct.static_eval(dims.get(dim).grid_index)
-            s = ct.static_eval(dims.get(dim).tile_exp)
+            i, s = ct.static_eval(get(dim, 'grid_index', 'tile_exp'))
             return self.tid[i] * s + ct.arange(s, dtype=ct.int32)
 
-        def mask(self, dim):
-            i = ct.static_eval(dims.get(dim).grid_index)
-            s = ct.static_eval(dims.get(dim).tile_exp)
-            b = ct.static_eval(dims.get(dim).total_var)
-            return (self.tid[i] * s - b) + ct.arange(s, dtype=ct.int32) < 0 
+        def mask(self, dim, *more):
+            i, s, b = ct.static_eval(get(dim, 'grid_index', 'tile_exp', 'total_var'))
+            ret = ((self.tid[i] * s - b) + ct.arange(s, dtype=ct.int32)) < 0
+            if more:
+                for i, s, b in ct.static_iter(
+                        get(dim, 'grid_index', 'tile_exp', 'total_var')
+                        for dim
+                        in more):
+                    ret = ct.expand_dims(ret, -1)
+                    ret &= ((self.tid[i] * s - b) + ct.arange(s, dtype=ct.int32)) < 0
+            return ret
 
-    return TidInfo
-
-def make_init(grid):
     @ct.function
     def _init():
         pid = ct.bid(0)
@@ -224,59 +266,91 @@ def make_init(grid):
             tid += (lid,)
             pid = pid // s
         return tid
-    return _init
 
+    @ct.function
+    def _group_offset_and_extra(tid):
+        gid = tid[gix]
+        offset = base * gid + ct.minimum(gid, rem)
+        extra = (gid < rem)
+        return offset, extra
+
+    @ct.function
+    def _set_gix(original, value):
+        ret = ()
+        for i in ct.static_iter(range(gix)):
+            ret += (original[i],)
+        ret += (value,)
+        for i in ct.static_iter(range(gix+1, size)):
+            ret += (original[i],)
+        return ret
+
+    return Bundle(
+            group_size = base, 
+            gix = gix,
+            init = _init, 
+            offset_and_extra = _group_offset_and_extra, 
+            set_gix = _set_gix, 
+            tid_info = TidInfo
+            )
+
+def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
+    assert spec.phase == Phase.fwd
+    assert spec.groups == 1
+    gsize, init, set_gix, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'tid_info']
+
+    load_order = tuple(b.program_index for b in spec.batch_buffers + spec.fold_buffers)
+
+    load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
+    view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
+    store_output = make_buffer_helper(spec.output_buffers)['store']
+
+    @ct.function
+    def load_map_reduce(tid, batch_tiles, fold_view):
+        fold_tiles = fold_view.load(tid)
+        return map_reduce(tid_info(tid), *retile(batch_tiles + fold_tiles, load_order))
+
+    @ct.kernel
+    def fwd(batch_buffers, fold_buffers, output_buffers):
+        tid = init()
+        
+        batch_tiles = load_batch(tid, batch_buffers)
+        fold_view = view_fold(fold_buffers)
+        
+        acc = load_map_reduce(tid, batch_tiles, fold_view)
+        
+        for i in range(1, gsize):
+            acc = combine(
+                *acc, 
+                *load_map_reduce(set_gix(tid, i), batch_tiles, fold_view)
+                )
+
+        sem = to_semantic(*acc)
+
+        store_output(tid, output_buffers, sem)
+
+    return fwd
 
 def mk_bwd_no_group_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
     assert spec.groups == 1
+    
+    gsize, init, set_gix, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'tid_info']
 
-    gsize = spec.grid.group_dim.num_tiles
-    init = make_init(spec.grid)
-    set_gix = make_set_gix(spec.grid)
-    tid_info = make_tid_info(spec.grid)
+    load_order = tuple(spec.input_buffers.index(b) for b in  spec.batch_input_buffers + spec.fold_input_buffers)
+    grad_batch_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.batch_grad_buffers)
+    grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
 
-    batch_buffer_index, batch_buffer_specs = zip(*(
-        (i,b) 
-        for (i,b) 
-        in enumerate(spec.input_buffers) 
-        if not b.is_grouped))
-
-    group_buffer_index, group_buffer_specs = zip(*(
-        (i,b) 
-        for (i,b) 
-        in enumerate(spec.input_buffers) 
-        if b.is_grouped))
-
-    grad_batch_buffer_index, grad_batch_buffer_specs = zip(*(
-        (i,b)
-        for (i,b)
-        in enumerate(spec.grad_buffers)
-        if not b.is_grouped))
-
-    grad_group_buffer_index, grad_group_buffer_specs = zip(*(
-        (i,b)
-        for (i,b)
-        in enumerate(spec.grad_buffers)
-        if b.is_grouped))
-
-    load_order = batch_buffer_index + group_buffer_index
-
-    load_batch = make_buffer_helper(batch_buffer_specs)['fused_load']
-    store_batch_grad, add_batch_grad = make_buffer_helper(grad_batch_buffer_specs)['fused_store', 'add']
-    load_output = make_buffer_helper(spec.output_buffers)['fused_load']
-    load_group, view_group = make_buffer_helper(group_buffer_specs)['load', 'view']
-    add_group_grad, view_group_grad = make_buffer_helper(grad_group_buffer_specs)['atomic_add', 'view']
-
-    def split_grad(tiles):
-        return retile(tiles, grad_batch_buffer_index), retile(tiles, grad_group_buffer_index)
+    load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
+    store_batch_grad, add_batch_grad = make_buffer_helper(spec.batch_grad_buffers)['store', 'add']
+    load_output = make_buffer_helper(spec.output_buffers)['load']
+    view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
+    view_fold_grad = make_buffer_helper(spec.fold_grad_buffers)['view']
 
     @ct.function
-    def load_map_finalize(tid, g_embedded, batch_tiles, group_view):
-        group_tiles = load_group(tid, group_view)
-        grads = map_finalize(tid_info(tid), *retile(batch_tiles + group_tiles, load_order), *g_embedded)
-        batch, group = split_grad(grads)
-        return batch, group
+    def load_map_finalize(tid, g_embedded, batch_tiles, fold_view):
+        fold_tiles = fold_view.load(tid)
+        grads = map_finalize(tid_info(tid), *retile(batch_tiles + fold_tiles, load_order), *g_embedded)
+        return retile(grads, grad_batch_buffer_index), retile(grads, grad_fold_buffer_index)
 
     @ct.function
     def load_embed(tid, output_buffers, grad_buffers):
@@ -284,63 +358,29 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
         grad_tile = load_output(tid, grad_buffers)
         return embed(*out_tile, *grad_tile)
 
-    @ct.function
-    def bwd(batch_buffers, group_buffers, batch_grad_buffers, group_grad_buffers, output_buffers, grad_buffers):
+    @ct.kernel
+    def bwd(batch_buffers, fold_buffers, batch_grad_buffers, fold_grad_buffers, output_buffers, grad_buffers):
         tid = init()
         
         batch_tiles = load_batch(tid, batch_buffers)
         
         g_embedded = load_embed(tid, output_buffers, grad_buffers)
 
-        group_view = view_group(group_buffers)
-        group_grad_view = view_group_grad(group_grad_buffers)
+        fold_view = view_fold(fold_buffers)
+        fold_grad_view = view_fold_grad(fold_grad_buffers)
 
-        batch_grads, group_grads = load_map_finalize(tid, g_embedded, batch_tiles, group_view)
-
-        add_group_grad(tid, group_grad_view, group_grads)
+        batch_grads, fold_grads = load_map_finalize(tid, g_embedded, batch_tiles, fold_view)
+        
+        fold_grad_view.atomic_add(tid, fold_grads)
 
         for i in range(1, gsize):
             i_tid = set_gix(tid, i)
-            batch_grads_i, group_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, group_view)
-            add_group_grad(i_tid, group_grad_view, group_grads)
+            batch_grads_i, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view)
+            fold_grad_view.atomic_add(i_tid, fold_grads)
             batch_grads = add_batch_grad(batch_grads, batch_grads_i)
 
         store_batch_grad(tid, batch_grad_buffers, batch_grads)
-
-    ns = {'ct': ct, 'bwd': bwd}
-
-    input_args = tuple(f'in_{i}' for i in range(len(
-        batch_buffer_specs + 
-        group_buffer_specs
-        )))
-    in_grad_args = tuple(f'grad_in_{i}' for i in range(len(grad_batch_buffer_index + grad_group_buffer_index)))
-    output_args = tuple(f'out_{i}' for i in range(len(spec.output_buffers)))
-    out_grad_args = tuple(f'grad_out_{i}' for i in range(len(spec.output_buffers)))
-
-    batch_args = tuple(f'in_{i}' for i in batch_buffer_index)
-    group_args = tuple(f'in_{i}' for i in group_buffer_index)
-    grad_batch_args = tuple(f'grad_in_{i}' for i in grad_batch_buffer_index)
-    grad_group_args = tuple(f'grad_in_{i}' for i in grad_group_buffer_index)
-
-
-
-    source = (
-            "@ct.kernel\n"
-            f"def kernel({csv(*input_args, *in_grad_args, *output_args, *out_grad_args)}):\n"
-            f"  bwd({tuplify(*batch_args)}, {tuplify(*group_args)}, {tuplify(*grad_batch_args)}, {tuplify(*grad_group_args)}, {tuplify(*output_args)}, {tuplify(*out_grad_args)})\n"
-            )
-
-    filename = f"<cutilereduce_kernel_{uuid.uuid4().hex}>"
-    linecache.cache[filename] = (
-            len(source),
-            None,
-            source.splitlines(keepends=True),
-            filename,
-    )
-
-    code = compile(source, filename, "exec")
-    exec(code, ns)
-    return ns['kernel']
+    return bwd
 
 def mk_autograd_no_group(
         fwd_spec,
@@ -355,27 +395,41 @@ def mk_autograd_no_group(
     fwd_kernel = mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
     bwd_kernel = mk_bwd_no_group_kernel(bwd_spec, map_finalize, embed)
     num_inputs = len(fwd_spec.input_buffers)
-    index = 0
-    pmut = []
-    for b in fwd_spec.input_buffers:
-        if b.req_grad:
-            pmut.append(index)
-            index += 1
-        else:
-            pmut.append(None)
-    pmut = tuple(pmut)
+    
+    def batch_fold_split(spec, inputs):
+        batch = []
+        fold = []
+        for b, array in zip(spec.input_buffers, inputs):
+            if b.is_grouped:
+                fold.append(array)
+            else:
+                batch.append(array)
+        return tuple(batch), tuple(fold)
+
+    def mk_ret_batch_fold_grads():
+        batch = []
+        fold =  []
+        ret = []
+        for b in bwd_spec.input_buffers:
+            if b.req_grad:
+                arr = b.grad_buffer.zeros(device='cuda')
+                if b.is_grouped:
+                    fold.append(arr)
+                else:
+                    batch.append(arr)
+                ret.append(arr)
+            else:
+                ret.append(None)
+        return tuple(ret), tuple(batch), tuple(fold)
             
-
-
     class CutileReduceFn(torch.autograd.Function):
         @staticmethod
         def forward(*inputs):
             outputs = tuple(b.empty('cuda') for b in fwd_spec.output_buffers)
-            
+            batch, fold = batch_fold_split(fwd_spec, inputs)
             stream = torch.cuda.current_stream()
             grid = (fwd_spec.grid.tasks, 1, 1)
-            args = (*inputs, *outputs)
-
+            args = (batch, fold, outputs)
             ct.launch(stream, grid, fwd_kernel, args)
             return outputs
 
@@ -388,14 +442,16 @@ def mk_autograd_no_group(
             saved = ctx.saved_tensors
             inputs = saved[:num_inputs]
             outputs = saved[num_inputs:]
-            grad_storage = tuple(b.grad_buffer('cuda') for b in bwd_spec.grad_buffers)
+
+            batch, fold = batch_fold_split(bwd_spec, inputs)
+            grad_storage, batch_grads, fold_grads = mk_ret_batch_fold_grads()
 
             stream = torch.cuda.current_stream()
             launch_grid = (bwd_spec.grid.tasks, 1, 1)
-            args = (*inputs, *grad_storage, *outputs, *grad_outputs)
+            args = (batch, fold, batch_grads, fold_grads, outputs, grad_outputs)
 
             ct.launch(stream, launch_grid, bwd_kernel, args)
-            return tuple(grad_storage[i] if i is not None else None for i in pmut)
+            return grad_storage
 
     def fwd(*inputs):
         outputs = CutileReduceFn.apply(*inputs)
@@ -405,93 +461,6 @@ def mk_autograd_no_group(
 
 
 
-def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
-    assert spec.phase == Phase.fwd
-    assert spec.groups == 1
-    batch_buffer_index, batch_buffer_specs = zip(*(
-        (i,b) 
-        for (i,b) 
-        in enumerate(spec.input_buffers) 
-        if not b.is_grouped))
-
-    group_buffer_index, group_buffer_specs = zip(*(
-        (i,b) 
-        for (i,b) 
-        in enumerate(spec.input_buffers) 
-        if b.is_grouped))
-
-    load_order = batch_buffer_index + group_buffer_index
-    
-    init = make_init(spec.grid)
-    set_gix = make_set_gix(spec.grid)
-    tid_info = make_tid_info(spec.grid)
-
-    load_batch = make_buffer_helper(batch_buffer_specs)['fused_load']
-    load_group, view_group = make_buffer_helper(group_buffer_specs)['load', 'view']
-    store_output = make_buffer_helper(spec.output_buffers)['fused_store']
-    gsize = spec.grid.group_dim.num_tiles
-    gix = spec.grid.group_dim.grid_index
-
-    @ct.function
-    def load_map_reduce(tid, batch_tiles, group_view):
-        group_tiles = load_group(tid, group_view)
-        return map_reduce(tid_info(tid), *retile(batch_tiles + group_tiles, load_order))
-
-    @ct.function
-    def fwd(batch_buffers, group_buffers, output_buffers):
-        tid = init()
-        
-        batch_tiles = load_batch(tid, batch_buffers)
-        group_view = view_group(group_buffers)
-        
-        acc = load_map_reduce(tid, batch_tiles, group_view)
-        
-        for i in range(1, gsize):
-            acc = combine(
-                *acc, 
-                *load_map_reduce(set_gix(tid, i), batch_tiles, group_view)
-                )
-
-        sem = to_semantic(*acc)
-
-        store_output(tid, output_buffers, sem)
-
-    ns = {'ct': ct, 'fwd': fwd}
-
-    input_args = tuple(f'in_{i}' for i in range(len(spec.input)))
-    batch_args = tuple(f'in_{i}' for i in batch_buffer_index)
-    group_args = tuple(f'in_{i}' for i in group_buffer_index)
-    output_args = tuple(f'out_{i}' for i in range(len(spec.output)))
-
-    source = (
-            "@ct.kernel\n"
-            f"def kernel({csv(*input_args, *output_args)}):\n"
-            f"  fwd({tuplify(*batch_args)}, {tuplify(*group_args)}, {tuplify(*output_args)})\n"
-            )
-
-    filename = f"<cutilereduce_kernel_{uuid.uuid4().hex}>"
-    linecache.cache[filename] = (
-            len(source),
-            None,
-            source.splitlines(keepends=True),
-            filename,
-    )
-
-    code = compile(source, filename, "exec")
-    exec(code, ns)
-    return ns['kernel']
-
-def mk_fwd_no_group(spec, map_reduce, combine, to_semantic=None, to_output=None):
-    kernel = mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic)
-    def fwd(*inputs):
-        outputs = tuple(b.empty('cuda') for b in spec.output_buffers)
-        args = (*inputs, *outputs)
-        launch_grid = (spec.grid.tasks, 1, 1)
-        ct.launch(torch.cuda.current_stream(), launch_grid, kernel, args)
-        if to_output is not None:
-            outputs = to_output(*outputs)
-        return outputs
-    return fwd
 
 def mk_fwd(spec, map_reduce, combine, to_semantic, to_output):
     raise NotImplementedError()

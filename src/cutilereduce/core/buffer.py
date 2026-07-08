@@ -2,6 +2,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from fractions import Fraction
+from copy import replace
 
 import torch
 
@@ -194,6 +195,11 @@ class BaseBuffer[D: Dim]:
         if self.is_output:
             assert not self.req_grad
             assert self.spec.is_superset(self.grid.batch)
+    
+    @property
+    def grad_buffer(self):
+        assert self.req_grad
+        return replace(self, dtype=ct.float32)
 
 @dataclass(frozen=True)
 class BoundBuffer(BaseBuffer[Dim]):
@@ -208,13 +214,13 @@ class ConcreteBuffer(BaseBuffer[ConcreteDim]):
     def default(self, device=None):
         return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
 
-    def grad_buffer(self, device):
-        return torch.zeros(self.buffer_shape, device=device, dtype=torch.float32)
+    def zeros(self, device=None):
+        return torch.zeros(self.buffer_shape, device=device)
 
+
+    #xs = tuple((i, b.grid_index, b.tile_shape, b.padding_mode) for i, b in enumerate(buffer_specs))
+    #def fun(tid, buffers, i, grid_index, tile_shape, padding_mode):
+    #    return View(buffers[i].tiled_view(tile_shape, padding_mode=padding_mode), grid_index).load(tid)
     @property
     def is_grouped(self):
         return any(d.grouped for d in self.dims)
-
-    def make_derived(self, grid_index, extent, tile):
-        return GroupedBuffer(self, grid_index, extent, tile)
-

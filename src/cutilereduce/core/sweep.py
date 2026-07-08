@@ -111,7 +111,7 @@ Sweep.default = Sweep(
                 pl.col('resident_programs_per_sm') >= 1,
                 pl.col('group_size') >= 1,
                 pl.col('mma_efficiency') == 1,
-                pl.col('groups') == 1,
+                pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1),
                 ],
             paretos = [
                 'compute_time', 'traffic_time',

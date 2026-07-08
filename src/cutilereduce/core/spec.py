@@ -92,6 +92,7 @@ class BaseSpec[D: Dim]:
     def grad_buffers(self):
         return tuple(replace(b, dtype=ct.float32) for b in self.input_buffers if b.req_grad)
 
+
     @property
     def io_buffers(self):
         return (*self.input_buffers, *self.output_buffers)
@@ -122,6 +123,22 @@ class BaseSpec[D: Dim]:
     @property
     def grouped_buffers(self):
         return tuple(b for b in self.write_buffers if self.group_dim in b.absent)
+
+    @property
+    def batch_input_buffers(self):
+        return tuple(b for b in self.input_buffers if self.group_dim in b.absent)
+
+    @property
+    def fold_input_buffers(self):
+        return tuple(b for b in self.input_buffers if self.group_dim in b.dims)
+
+    @property
+    def batch_grad_buffers(self):
+        return tuple(b for b in self.grad_buffers if self.group_dim in b.absent)
+
+    @property
+    def fold_grad_buffers(self):
+        return tuple(b for b in self.grad_buffers if self.group_dim in b.dims)
 
     @property
     def batch_buffers(self):
