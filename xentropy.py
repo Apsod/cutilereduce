@@ -1,12 +1,11 @@
 
 import cuda.tile as ct
-import polars as pl
 import torch
 import torch.utils.benchmark as benchmark
 import math
 
-from cutilereduce.core import *
-from cutilereduce.util.spec import *
+from cutilereduce.core import Spec, Buffer, Dims, Work, Estimator, Sweep, mk_autograd
+from cutilereduce.util.spec import l4
 
 
 xentropy = Spec.make(
@@ -88,17 +87,14 @@ def embed(z, mu, g_z, g_l):
     return z * LOG2E, g_z, g_l
 
 @ct.function
-def map_finalize(tile, ctx, trg, targets, z, g_z, g_l):
+def map_finalize(tile, ctx, trg, targets, g_ctx, g_trg, z, g_z, g_l):
     logits, hits = map(tile, ctx, trg, targets)
 
     scale = ct.exp2(logits - z[:, None])
 
     g_logits = (scale * g_z[:, None] + hits * g_l[:, None]).astype(ct.bfloat16)
 
-    g_ctx = ct.zeros(ctx.shape, ct.float32)
     g_ctx = ct.mma(g_logits, trg, g_ctx)
-
-    g_trg = ct.zeros(trg.shape, ct.float32)
     g_trg = ct.mma(g_logits.transpose(), ctx, g_trg)
 
     return g_ctx, g_trg
@@ -140,7 +136,7 @@ def to_output(z, v):
     return z - v
 
 ctx, trg, targets = [b.empty('cuda') for b in fwd_spec.input.values()]
-f = mk_autograd_no_group(
+f = mk_autograd(
         fwd_spec,
         bwd_spec,
         map_reduce,
@@ -151,8 +147,8 @@ f = mk_autograd_no_group(
         embed,
         )
 with torch.no_grad():
-    ctx.normal_()
-    trg.normal_()
+    ctx.normal_(std=ctx.shape[1]**-.5)
+    trg.normal_(std=trg.shape[1]**-.5)
 
 targets.random_(0, trg.shape[0])
 
@@ -176,9 +172,19 @@ def cutile_pass(ctx, trg, targets):
 def pytorch_pass(ctx, trg, targets):
     (pytorch_xentropy(ctx, trg, targets) * mock).sum().backward()
 
+cutile_pass(ctx, trg, targets)
 
 print(ctx.grad)
 print(trg.grad)
+ctx.grad.zero_()
+trg.grad.zero_()
+
+pytorch_pass(ctx, trg, targets)
+
+print(ctx.grad)
+print(trg.grad)
+ctx.grad.zero_()
+trg.grad.zero_()
 
 pytorch_fwd = benchmark.Timer(
         stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',

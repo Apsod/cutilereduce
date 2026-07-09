@@ -5,8 +5,8 @@ import polars as pl
 import torch
 import torch.utils.benchmark as benchmark
 
-from cutilereduce.core import *
-from cutilereduce.util.spec import *
+from cutilereduce.core import Spec, Buffer, Dims, Work, Estimator, Sweep
+from cutilereduce.util.spec import l4
 
 
 attention = Spec.make(
@@ -62,7 +62,7 @@ spec = attention.concretize(config)
 
 @ct.function
 def embed(z, mu, g_z, g_mu):
-    return z, gz - mu * g_mu, g_mu
+    return z, g_z - mu * g_mu, g_mu
 
 LOG2E = math.log2(math.e)
 LN2 = math.log(2)

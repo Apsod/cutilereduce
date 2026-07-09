@@ -3,11 +3,16 @@ from dataclasses import dataclass
 from functools import cached_property
 from math import prod, ceil
 from fractions import Fraction
+from typing import TypeVar, ClassVar
 
 import sympy
 
 from .config import Config
-from .base import *
+from .base import TupleSet, field_names
+
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from .buffer import Buffer
 
 
 D = TypeVar('D')
@@ -69,9 +74,7 @@ class Dim(str):
 
     @property
     def span_exp(self):
-        match self.outer:
-            case True: return self.tile_var * self.group_var
-            case False: return self.total_var
+        return self.tile_var * self.group_var if self.outer else self.total_var
 
     @property
     def num_tiles_relaxed(self):
@@ -87,9 +90,7 @@ class Dim(str):
 
     @property
     def tile_exp(self):
-        match self.outer:
-            case True: return self.tile_var
-            case False: return self.total_var
+        return self.tile_var if self.outer else self.total_var
 
     def __repr__(self):
         return f"{self.__class__.__name__}({super().__repr__()}, grid={self.grid})"

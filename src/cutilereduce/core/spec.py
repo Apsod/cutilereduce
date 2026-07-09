@@ -6,11 +6,12 @@ from sympy import Max, Min
 
 import cuda.tile as ct
 
+from .base import Phase
 from .grid import BaseGrid, Dims, Grid, Dim, ConcreteDim
-from .buffer import BaseBuffer, Buffer, BufferRole, Phase
+from .buffer import BaseBuffer, Buffer, BufferRole
 from .work import BaseWork, Work, bind_work
 from .config import Config
-from .variables import *
+from .variables import READ, WRITE, GROUPS, PEAK_FLOPS, BANDWIDTH, FWD_CONTENTION, BWD_CONTENTION, SM_COUNT, MAX_PROGRAMS_PER_SM, SMEM_PER_SM
 
 @dataclass(frozen=True, kw_only=True)
 class BaseSpec[D: Dim]:
@@ -31,23 +32,10 @@ class BaseSpec[D: Dim]:
             output: dict[str, Buffer], 
             work: Work, 
             intermediate: list[Buffer] = None):
-        index = 0
         input = {k: v.generic_bind(k, i, grid, BufferRole.Input) for (i, (k, v)) in enumerate(input.items())}
         execution = {k: v.generic_bind(k, i, grid, BufferRole.Intermediate) for (i, (k, v)) in enumerate(execution.items())}
         output = {k: v.generic_bind(k, i, grid, BufferRole.Output) for (i, (k, v)) in enumerate(output.items())}
         intermediate = tuple(v.generic_bind(f'intermediate:{i}', i, grid, BufferRole.Intermediate) for i, v in enumerate(intermediate))
-        #_input = {}
-        #for k, v in input.items():
-        #    _input[k] = v.generic_bind(k, index, grid, BufferRole.Input)
-        #    index += 1
-        #_output = {}
-        #for k, v in output.items():
-        #    _output[k] = v.generic_bind(k, index, grid, BufferRole.Output)
-        #    index += 1
-        #_intermediate = []
-        #for i, v in enumerate(intermediate):
-        #    _intermediate.append(v.generic_bind(f'intermediate:{i}', index, grid, BufferRole.Intermediate))
-        #    index += 1
 
         return dict(
                 input=input,
@@ -65,6 +53,10 @@ class BaseSpec[D: Dim]:
     @property
     def input_buffers(self):
         return (*self.input.values(),)
+
+    @property
+    def execution_buffers(self):
+        return (*self.execution.values(),)
 
     @property
     def intermediate_buffers(self):
@@ -90,7 +82,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def grad_buffers(self):
-        return tuple(replace(b, dtype=ct.float32) for b in self.input_buffers if b.req_grad)
+        return tuple(replace(b, dtype=ct.float32, default=0) for b in self.input_buffers if b.req_grad)
 
 
     @property
@@ -153,8 +145,8 @@ class BaseSpec[D: Dim]:
     @property
     def C(self):
         match self.phase:
-            case Phase.fwd: return self.FWD_CONTENTION
-            case Phase.bwd: return self.BWD_CONTENTION
+            case Phase.fwd: return self.FWD_CONTENTION # noqa: E701
+            case Phase.bwd: return self.BWD_CONTENTION # noqa: E701
 
 
     def buffer_contention(self, b):
@@ -498,60 +490,3 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
             return self._eval(value)
         else:
             return value
-
-    #@property
-    #def PEAK_FLOPS(self):
-    #    return self.config.symbols[PEAK_FLOPS]
-
-    #@property
-    #def BANDWIDTH(self):
-    #    return self.config.symbols[BANDWIDTH]
-
-    #@property
-    #def SM_COUNT(self):
-    #    return self.config.symbols[SM_COUNT]
-
-    #@property
-    #def MAX_PROGRAMS_PER_SM(self):
-    #    return self.config.symbols[MAX_PROGRAMS_PER_SM]
-
-    #@property
-    #def SMEM_PER_SM(self):
-    #    return self.config.symbols[SMEM_PER_SM]
-
-    #@property
-    #def READ(self):
-    #    return self.config.symbols[READ]
-
-    #@property
-    #def WRITE(self):
-    #    return self.config.symbols[WRITE]
-
-    #@property
-    #def GROUPS(self):
-    #    return self.config.symbols[GROUPS]
-
-    #@property
-    #def FWD_CONTENTION(self):
-    #    return self.config.functions[FWD_CONTENTION]
-
-    #@property
-    #def BWD_CONTENTION(self):
-    #    return self.config.functions[BWD_CONTENTION]
-
-    #@property
-    #def config(self):
-    #    return self.grid.config
-
-
-    #@property
-    #def estimated_time(self):
-    #    return max(self.effective_total_work / self.effective_peak_flops, self.effective_traffic / self.effective_bandwidth)
-
-    #@property
-    #def resident_programs_per_sm(self):
-    #    return min(self.MAX_PROGRAMS_PER_SM, self.SMEM_PER_SM // self.residency_bytes)
-
-    #@property
-    #def active_programs(self):
-    #    return min(self.program_count, self.resident_programs)

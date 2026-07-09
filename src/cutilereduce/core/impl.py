@@ -1,8 +1,7 @@
 from __future__ import annotations
-import inspect
 from dataclasses import dataclass
-import linecache
-import uuid
+from typing import Any, Self
+from .buffer import Buffer
 
 import cuda.tile as ct
 import torch
@@ -25,7 +24,7 @@ def tuplify(*args):
 @dataclass(frozen=True)
 class View:
     view: ct.TiledView
-    grid_index: tuple[int,...]
+    grid_index: ct.Constant[tuple[int,...]]
 
     def tid2vid(self, tid):
         return retile(tid, self.grid_index)
@@ -39,7 +38,8 @@ class View:
     def atomic_add(self, tid, tile):
         return self.view.atomic_store_add(self.tid2vid(tid), tile)
 
-def retile(original, index):
+@ct.function
+def retile(original, index: ct.Constant[tuple[int,...]]):
     ret = ()
     for i in ct.static_iter(index):
         ret += (original[i],)
@@ -50,7 +50,7 @@ def ctmap(fun, xs):
     def _ctmap(*args):
         ret = ()
         for x in ct.static_iter(xs):
-            ret += (fun(*args, *x),)
+            ret += (fun(*args, x),)
         return ret
     return _ctmap
 
@@ -64,7 +64,7 @@ def ctzipmap(fun, xs, *, nzips=1):
             current = ()
             for j in ct.static_iter(range(nzips)):
                 current += (zipped[j][i],)
-            ret += (fun(*static, *current, *x),)
+            ret += (fun(*static, *current, x),)
         return ret
     return _ctzipmap
 
@@ -86,7 +86,7 @@ def ctdo(fun, xs):
 
     def _ctdo(*args):
         for x in ct.static_iter(xs):
-            fun(*args, *x)
+            fun(*args, x)
     return _ctdo
 
 def ctzipdo(fun, xs, *, nzips=1):
@@ -98,7 +98,7 @@ def ctzipdo(fun, xs, *, nzips=1):
             current = ()
             for j in ct.static_iter(range(nzips)):
                 current += (zipped[j][i],)
-            fun(*static, *current, *x)
+            fun(*static, *current, x)
     return _ctzipdo
 
 def ctzipdorange(fun, *, nzips=1, num=1):
@@ -135,45 +135,80 @@ def ctrange(fun, *, nmut=1, num=1):
 
     return _ctrange
 
+@dataclass(frozen=True)
+class BufferInfo:
+    grid_index: ct.Constant[tuple[int,...]]
+    tile_shape: ct.Constant[tuple[int,...]]
+    padding_mode: ct.Constant[ct.PaddingMode]
+    default: ct.Constant[Any]
+    dtype: ct.Constant[ct.DType]
+
+    def __getitem__(self, key):
+        if isinstance(key, tuple):
+            return tuple(getattr(self, k) for k in key)
+        else:
+            return getattr(self, key)
+
+
+    @staticmethod
+    def make(b: Buffer) -> Self:
+        return BufferInfo(
+                grid_index = b.grid_index,
+                tile_shape = b.tile_shape,
+                padding_mode = b.padding_mode,
+                default = b.default,
+                dtype = b.dtype
+                )
+
+    @staticmethod
+    def get(infos, *attributes):
+        tuple(info[*attributes] for info in infos)
+
+
+
 def make_buffer_helper(buffer_specs):
     num = len(buffer_specs)
-    grid_tile_padding = tuple((b.grid_index, b.tile_shape, b.padding_mode) for b in buffer_specs)
-    tile_padding = tuple((b.tile_shape, b.padding_mode) for b in buffer_specs)
-    grid = tuple((b.grid_index,) for b in buffer_specs)
+    infos = tuple(BufferInfo.make(b) for b in buffer_specs)
+    #grid_tile_padding = tuple((b.grid_index, b.tile_shape, b.padding_mode) for b in buffer_specs)
+    #tile_padding = tuple((b.tile_shape, b.padding_mode) for b in buffer_specs)
+    #grid = tuple((b.grid_index,) for b in buffer_specs)
 
-    def _view_load(tid, view, grid_index):
-        return view.load(retile(tid, grid_index))
+    def _view_load(tid, view, info):
+        return view.load(retile(tid, info.grid_index))
 
-    def _view_store(tid, view, tile, grid_index):
-        view.store(retile(tid, grid_index), tile)
+    def _view_store(tid, view, tile, info):
+        view.store(retile(tid, info.grid_index), tile)
 
-    def _view_atomic_add(tid, view, tile, grid_index):
-        view.atomic_store_add(retile(tid, grid_index), tile)
+    def _view_atomic_add(tid, view, tile, info):
+        view.atomic_store_add(retile(tid, info.grid_index), tile)
 
     @dataclass(frozen=True)
     class Views:
         views: tuple(ct.TiledView)
 
         def load(self, tid):
-            return ctzipmap(_view_load, grid)(tid, self.views)
+            return ctzipmap(_view_load, infos)(tid, self.views)
 
         def store(self, tid, tiles):
-            ctzipdo(_view_store, grid, nzips=2)(tid, self.views, tiles)
+            ctzipdo(_view_store, infos, nzips=2)(tid, self.views, tiles)
 
         def atomic_add(self, tid, tiles):
-            ctzipdo(_view_atomic_add, grid, nzips=2)(tid, self.views, tiles)
+            ctzipdo(_view_atomic_add, infos, nzips=2)(tid, self.views, tiles)
 
-    def _mk_view(buffer, tile_shape, padding_mode):
-        return buffer.tiled_view(tile_shape, padding_mode=padding_mode)
+    def _mk_view(buffer, info):
+        return buffer.tiled_view(info.tile_shape, padding_mode=info.padding_mode)
 
     def _mk_views(buffers):
-        return Views(ctzipmap(_mk_view, tile_padding)(buffers))
+        return Views(ctzipmap(_mk_view, infos)(buffers))
 
-    def _load(tid, buffer, grid_index, tile_shape, padding_mode):
-        return ct.load(buffer, retile(tid, grid_index), tile_shape, padding_mode=padding_mode)
+    def _load(tid, buffer, info):
+        return ct.load(buffer, retile(tid, info.grid_index), info.tile_shape, padding_mode=info.padding_mode)
     
-    def _store(tid, buffer, tile, grid_index):
-        ct.store(buffer, retile(tid, grid_index), tile)
+    def _store(tid, buffer, tile, info):
+        ct.store(buffer, retile(tid, info.grid_index), tile)
+
+    def _init(info):
+        return ct.full(info.tile_shape, info.default, info.dtype)
 
     def _add(a, b):
         return a + b
@@ -184,9 +219,10 @@ def make_buffer_helper(buffer_specs):
     return Bundle(
             view = _mk_views,
             pad = ctzipmaprange(_pad, num=num),
-            load = ctzipmap(_load, grid_tile_padding),
-            store = ctzipdo(_store, grid, nzips=2),
+            load = ctzipmap(_load, infos),
+            store = ctzipdo(_store, infos, nzips=2),
             add = ctzipmaprange(_add, num=num, nzips=2),
+            init = ctmap(_init, infos)
     )
 
 class Bundle:
@@ -239,7 +275,7 @@ def make_grid_helper(grid):
 
         def offset(self, dim):
             i, s = ct.static_eval(get(dim, 'grid_index', 'tile_exp'))
-            return self.tid[i] * t
+            return self.tid[i] * s
 
         def indices(self, dim):
             i, s = ct.static_eval(get(dim, 'grid_index', 'tile_exp'))
@@ -303,6 +339,7 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
     view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
     store_output = make_buffer_helper(spec.output_buffers)['store']
+    init_execution = make_buffer_helper(spec.execution_buffers)['init']
 
     @ct.function
     def load_map_reduce(tid, batch_tiles, fold_view):
@@ -315,14 +352,12 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
         
         batch_tiles = load_batch(tid, batch_buffers)
         fold_view = view_fold(fold_buffers)
-        
-        acc = load_map_reduce(tid, batch_tiles, fold_view)
-        
-        for i in range(1, gsize):
+        acc = init_execution()
+        for i in range(gsize):
             acc = combine(
-                *acc, 
-                *load_map_reduce(set_gix(tid, i), batch_tiles, fold_view)
-                )
+                    *acc, 
+                    *load_map_reduce(set_gix(tid, i), batch_tiles, fold_view)
+                    )
 
         sem = to_semantic(*acc)
 
@@ -330,26 +365,30 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
 
     return fwd
 
-def mk_bwd_no_group_kernel(spec, map_finalize, embed):
+def mk_bwd_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
-    assert spec.groups == 1
     
-    gsize, init, set_gix, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'tid_info']
+    gsize, init, set_gix, offset_and_extra, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'offset_and_extra', 'tid_info']
 
     load_order = tuple(spec.input_buffers.index(b) for b in  spec.batch_input_buffers + spec.fold_input_buffers)
     grad_batch_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.batch_grad_buffers)
     grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
+    grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
 
     load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
-    store_batch_grad, add_batch_grad = make_buffer_helper(spec.batch_grad_buffers)['store', 'add']
+    view_batch_grad, init_batch_grad, store_batch_grad = make_buffer_helper(spec.batch_grad_buffers)['view', 'init', 'store']
     load_output = make_buffer_helper(spec.output_buffers)['load']
     view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
-    view_fold_grad = make_buffer_helper(spec.fold_grad_buffers)['view']
+    view_fold_grad, init_fold_grad = make_buffer_helper(spec.fold_grad_buffers)['view', 'init']
 
     @ct.function
-    def load_map_finalize(tid, g_embedded, batch_tiles, fold_view):
+    def load_map_finalize(tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads):
         fold_tiles = fold_view.load(tid)
-        grads = map_finalize(tid_info(tid), *retile(batch_tiles + fold_tiles, load_order), *g_embedded)
+        grads = map_finalize(
+                tid_info(tid), 
+                *retile(batch_tiles + fold_tiles, load_order), 
+                *retile(batch_grads + fold_grads, grad_order),
+                *g_embedded)
         return retile(grads, grad_batch_buffer_index), retile(grads, grad_fold_buffer_index)
 
     @ct.function
@@ -358,31 +397,65 @@ def mk_bwd_no_group_kernel(spec, map_finalize, embed):
         grad_tile = load_output(tid, grad_buffers)
         return embed(*out_tile, *grad_tile)
 
-    @ct.kernel
-    def bwd(batch_buffers, fold_buffers, batch_grad_buffers, fold_grad_buffers, output_buffers, grad_buffers):
-        tid = init()
-        
-        batch_tiles = load_batch(tid, batch_buffers)
-        
-        g_embedded = load_embed(tid, output_buffers, grad_buffers)
+    if spec.groups == 1:
 
-        fold_view = view_fold(fold_buffers)
-        fold_grad_view = view_fold_grad(fold_grad_buffers)
+        @ct.kernel
+        def bwd(batch_buffers, fold_buffers, batch_grad_buffers, fold_grad_buffers, output_buffers, grad_buffers):
+            tid = init()
+            
+            batch_tiles = load_batch(tid, batch_buffers)
+            
+            g_embedded = load_embed(tid, output_buffers, grad_buffers)
 
-        batch_grads, fold_grads = load_map_finalize(tid, g_embedded, batch_tiles, fold_view)
-        
-        fold_grad_view.atomic_add(tid, fold_grads)
+            fold_view = view_fold(fold_buffers)
+            fold_grad_view = view_fold_grad(fold_grad_buffers)
 
-        for i in range(1, gsize):
-            i_tid = set_gix(tid, i)
-            batch_grads_i, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view)
-            fold_grad_view.atomic_add(i_tid, fold_grads)
-            batch_grads = add_batch_grad(batch_grads, batch_grads_i)
+            batch_grads = init_batch_grad()
 
-        store_batch_grad(tid, batch_grad_buffers, batch_grads)
+            for i in range(gsize):
+                i_tid = set_gix(tid, i)
+                fold_grads = init_fold_grad()
+                batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
+                fold_grad_view.atomic_add(i_tid, fold_grads)
+            
+            store_batch_grad(tid, batch_grad_buffers, batch_grads)
+
+    elif spec.groups >= 1:
+
+        @ct.kernel
+        def bwd(batch_buffers, fold_buffers, batch_grad_buffers, fold_grad_buffers, output_buffers, grad_buffers):
+            tid = init()
+            
+            batch_tiles = load_batch(tid, batch_buffers)
+            
+            g_embedded = load_embed(tid, output_buffers, grad_buffers)
+
+            fold_view = view_fold(fold_buffers)
+            fold_grad_view = view_fold_grad(fold_grad_buffers)
+
+            batch_grads = init_batch_grad()
+
+            offset, extra = offset_and_extra(tid)
+
+            for i in range(gsize):
+                i_tid = set_gix(tid, i+offset)
+                fold_grads = init_fold_grad()
+                batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
+                fold_grad_view.atomic_add(i_tid, fold_grads)
+
+            if extra:
+                i_tid = set_gix(tid, gsize+offset)
+                fold_grads = init_fold_grad()
+                batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
+                fold_grad_view.atomic_add(i_tid, fold_grads)
+
+            
+            view_batch_grad(batch_grad_buffers).atomic_add(tid, batch_grads)
+
+
     return bwd
 
-def mk_autograd_no_group(
+def mk_autograd(
         fwd_spec,
         bwd_spec,
         map_reduce,
@@ -393,7 +466,8 @@ def mk_autograd_no_group(
         embed,):
 
     fwd_kernel = mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
-    bwd_kernel = mk_bwd_no_group_kernel(bwd_spec, map_finalize, embed)
+    bwd_kernel = mk_bwd_kernel(bwd_spec, map_finalize, embed)
+
     num_inputs = len(fwd_spec.input_buffers)
     
     def batch_fold_split(spec, inputs):

@@ -12,7 +12,7 @@ import numpy
 from .base import kmap, Phase
 from .grid import Dim
 from .spec import Spec
-from .variables import * 
+from .variables import READ, WRITE, GROUPS, MIN_MMA_EFFICIENCY, FWD_CONTENTION, BWD_CONTENTION
 from .config import Config
 
 def contention_penalty(alpha, cap, contention):
@@ -130,7 +130,7 @@ class Estimator:
     @classmethod
     def make(
             cls, 
-            meta: Meta, 
+            meta: Spec, 
             sizes: dict[str, int], 
             symbols: dict[Symbol, int] = {},
             functions: dict[Symbol, Any] = {},

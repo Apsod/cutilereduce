@@ -1,3 +1,4 @@
+# ruff: noqa: E701
 from __future__ import annotations
 from dataclasses import dataclass
 from sympy import Min

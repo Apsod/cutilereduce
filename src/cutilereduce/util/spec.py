@@ -1,4 +1,4 @@
-from cutilereduce.core.variables import *
+from cutilereduce.core.variables import PEAK_FLOPS, BANDWIDTH, SM_COUNT, MAX_PROGRAMS_PER_SM, SMEM_PER_SM
 
 l4 = {
     PEAK_FLOPS: 121e12,              

@@ -3,12 +3,12 @@ from dataclasses import dataclass
 from enum import Enum
 from fractions import Fraction
 from copy import replace
+from typing import Self, Any
 
 import torch
 
-from .base import *
+from .base import Phase
 from .grid import BaseDims, Dims, D, Dim, BoundGrid, ConcreteDim, ConcreteGrid
-from .variables import * 
 from .typestuff import DType, to_torch_dtype
 import cuda.tile as ct
 
@@ -83,11 +83,11 @@ class BaseBuffer[D: Dim]:
     @property
     def padding_mode(self):
         match self.default:
-            case 0: return ct.PaddingMode.ZERO
-            case -0: return ct.PaddingMode.NEG_ZERO
-            case float('inf'): return ct.PaddingMode.POS_INF
-            case float('-inf'): return ct.PaddingMode.NEG_INF
-            case _: return ct.PaddingMode.UNDETERMINED
+            case 0: return ct.PaddingMode.ZERO                      # noqa: E701
+            case -0: return ct.PaddingMode.NEG_ZERO                 # noqa: E701
+            case float('inf'): return ct.PaddingMode.POS_INF        # noqa: E701
+            case float('-inf'): return ct.PaddingMode.NEG_INF       # noqa: E701
+            case _: return ct.PaddingMode.UNDETERMINED              # noqa: E701
 
     @property
     def dims(self):
@@ -128,11 +128,11 @@ class BaseBuffer[D: Dim]:
 
     @property
     def dependency(self):
-        match (bool(self.spec.batch), bool(self.spec.fold)):
-            case (True, True): return BufferDep.Batch_Fold
-            case (True, False): return BufferDep.Batch
-            case (False, True): return BufferDep.Fold
-            case (False, False): return BufferDep.Constant
+        match (bool(self.spec.batch), bool(self.spec.fold)): 
+            case (True, True): return BufferDep.Batch_Fold     # noqa: E701
+            case (True, False): return BufferDep.Batch         # noqa: E701
+            case (False, True): return BufferDep.Fold          # noqa: E701
+            case (False, False): return BufferDep.Constant     # noqa: E701
 
     @property
     def contribution(self):
@@ -156,13 +156,13 @@ class BaseBuffer[D: Dim]:
 
     def is_write(self, phase):
         match phase:
-            case Phase.fwd: return self.is_output
-            case Phase.bwd: return self.req_grad
+            case Phase.fwd: return self.is_output              # noqa: E701
+            case Phase.bwd: return self.req_grad               # noqa: E701
 
     def is_read(self, phase):
         match phase:
-            case Phase.fwd: return self.is_input
-            case Phase.bwd: return self.is_input | self.is_output
+            case Phase.fwd: return self.is_input                     # noqa: E701
+            case Phase.bwd: return self.is_input | self.is_output    # noqa: E701
 
     @property
     def numel(self):
