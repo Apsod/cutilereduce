@@ -173,9 +173,16 @@ def pytorch_pass(ctx, trg, targets):
 
 cutile_pass(ctx, trg, targets)
 
-grads = run_grad(ctx, trg, targets, cutile=f, pytorch=pytorch_xentropy)
-for c, p in zip(grads['cutile'], grads['pytorch']):
+check = run_grad(ctx, trg, targets, cutile=f, pytorch=pytorch_xentropy)
+
+print('forward diff')
+for c, p in zip(check['cutile']['fwd'], check['pytorch']['fwd']):
     print((c - p).abs().mean())
+
+print('backward diff')
+for c, p in zip(check['cutile']['bwd'], check['pytorch']['bwd']):
+    print((c - p).abs().mean())
+
 
 pytorch_fwd = benchmark.Timer(
         stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',

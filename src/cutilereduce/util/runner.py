@@ -15,17 +15,21 @@ def run_grad(*args, **functions):
                     m.normal_()
                 def bw(xs):
                     sum([(x * m).sum() for x, m in zip(xs, mock)]).backward()
+                    return tuple(x.detach() for x in xs)
             else:
                 mock = out.new_zeros(out.shape)
                 mock.normal_()
                 def bw(x):
                     (x * mock).sum().backward()
-        bw(out)
-        ret[k] = []
-
+                    return (x.detach(),)
+        out = bw(out)
+        ret[k] = {}
+        ret[k]['fwd'] = out
+        grads = []
         for arg in args:
             if arg.grad is not None:
-                ret[k].append(arg.grad.clone())
+                grads.append(arg.grad.clone())
+            ret[k]['bwd'] = tuple(grads)
     return ret
             
 

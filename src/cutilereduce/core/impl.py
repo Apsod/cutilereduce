@@ -424,7 +424,6 @@ def mk_bwd_kernel(spec, map_finalize, embed):
             
             batch_tiles = load_batch(tid, batch_buffers)
             
-            g_embedded = load_embed(tid, output_buffers, grad_buffers)
 
             fold_view = view_fold(fold_buffers)
             fold_grad_view = view_fold_grad(fold_grad_buffers)
@@ -433,11 +432,12 @@ def mk_bwd_kernel(spec, map_finalize, embed):
 
             for i in range(gsize):
                 i_tid = set_gix(tid, i)
+                g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
                 fold_grads = init_fold_grad()
                 batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
                 fold_grad_view.atomic_add(i_tid, fold_grads)
             
-            store_batch_grad(tid, batch_grad_buffers, batch_grads)
+            view_batch_grad(batch_grad_buffers).atomic_add(tid, batch_grads)
 
     elif spec.groups >= 1:
 
@@ -447,7 +447,6 @@ def mk_bwd_kernel(spec, map_finalize, embed):
             
             batch_tiles = load_batch(tid, batch_buffers)
             
-            g_embedded = load_embed(tid, output_buffers, grad_buffers)
 
             fold_view = view_fold(fold_buffers)
             fold_grad_view = view_fold_grad(fold_grad_buffers)
@@ -458,6 +457,7 @@ def mk_bwd_kernel(spec, map_finalize, embed):
 
             for i in range(gsize):
                 i_tid = set_gix(tid, i+offset)
+                g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
                 fold_grads = init_fold_grad()
                 batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
                 fold_grad_view.atomic_add(i_tid, fold_grads)
@@ -514,6 +514,9 @@ def mk_autograd(
             else:
                 ret.append(None)
         return tuple(ret), tuple(batch), tuple(fold)
+
+    def bundlestr(bundle):
+        return ','.join([str(x.shape) for x in bundle])
             
     class CutileReduceFn(torch.autograd.Function):
         @staticmethod
@@ -523,6 +526,9 @@ def mk_autograd(
             stream = torch.cuda.current_stream()
             grid = (fwd_spec.grid.tasks, 1, 1)
             args = (batch, fold, outputs)
+            #print('batch', bundlestr(batch))
+            #print('fold', bundlestr(fold))
+            #print('outputs', bundlestr(outputs))
             ct.launch(stream, grid, fwd_kernel, args)
             return outputs
 
@@ -541,7 +547,15 @@ def mk_autograd(
 
             stream = torch.cuda.current_stream()
             launch_grid = (bwd_spec.grid.tasks, 1, 1)
+            #print('BWD GRID', bwd_spec.grid.dims, bwd_spec.grid.task_grid)
             args = (batch, fold, batch_grads, fold_grads, outputs, grad_outputs)
+
+            #print('batch', bundlestr(batch))
+            #print(' grads', bundlestr(batch_grads))
+            #print('fold', bundlestr(fold))
+            #print(' grads', bundlestr(fold_grads))
+            #print('outputs', bundlestr(outputs))
+            #print(' grads', bundlestr(grad_outputs))
 
             ct.launch(stream, launch_grid, bwd_kernel, args)
             return grad_storage

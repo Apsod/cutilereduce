@@ -97,12 +97,13 @@ def map(tile, query, key):
     """
     L, G, H, R, DQK = tile.shape('l', 'g', 'h', 'r', 'dqk')
     rmask = tile.mask('r')
+    lgmask = (tile.mask('l')[:, None] & tile.mask('g')[None, :]).reshape((L*G,))
 
     key = key.transpose(1, 2)
     query = query.reshape((H, L*G, DQK))
     logits = ct.zeros((H, L*G, R), ct.float32)
     logits = ct.mma(query, key, logits)
-    logits = ct.where(rmask[None,None,:], logits, float('-inf'))
+    logits = ct.where(rmask[None,None,:] & lgmask[None, :, None], logits, float('-inf'))
     logits = logits
     return logits
 
@@ -135,7 +136,7 @@ def map_finalize(tile, query, key, value, g_query, g_key, g_value, z, g_z, g_mu)
             )
     
     # h (l g) r
-    #g_logits = ct.zeros((H, L*G, R), ct.float32) 
+    #g_logits = ct.zeros((H, L*G, R), ct.float32) + g_z.reshape((H, L*G, 1))
     g_logits = ct.broadcast_to(g_z.reshape((H, L*G, 1)), (H, L*G, R))
     g_logits = ct.mma(
             g_mu.astype(ct.bfloat16),
@@ -147,11 +148,11 @@ def map_finalize(tile, query, key, value, g_query, g_key, g_value, z, g_z, g_mu)
     g_query = ct.mma(
             g_logits, 
             key, 
-            g_query.reshape((H, L*G, DV))
-            ).reshape((H, L, G, DV))
+            g_query.reshape((H, L*G, DQK))
+            ).reshape((H, L, G, DQK))
     g_key = ct.mma(
             g_logits.transpose(1, 2), 
-            query.reshape((H, L*G, DV)), 
+            query.reshape((H, L*G, DQK)), 
             g_key
             )
 
@@ -277,9 +278,14 @@ print('cutile - naive', (a - b).abs().mean().item())
 print('naive - sdpa  ', (b - c).abs().mean().item())
 
 
-grads = run_grad(query, key, value, cutile=f, pytorch=sdpa)
+check = run_grad(query, key, value, cutile=f, pytorch=sdpa)
 
-for c, p in zip(grads['cutile'], grads['pytorch']):
+print('forward diff')
+for c, p in zip(check['cutile']['fwd'], check['pytorch']['fwd']):
+    print((c - p).abs().mean())
+
+print('backward diff')
+for c, p in zip(check['cutile']['bwd'], check['pytorch']['bwd']):
     print((c - p).abs().mean())
 
 args = {'query': query, 'key': key, 'value': value}
@@ -325,9 +331,9 @@ cutile_fwd_bwd = benchmark.Timer(
 )
 
 results = []
-#results.append(cutile.blocked_autorange(min_run_time=5))
-#results.append(pytorch_naive.blocked_autorange(min_run_time=5))
-#results.append(pytorch_sdpa.blocked_autorange(min_run_time=5))
+results.append(cutile.blocked_autorange(min_run_time=5))
+results.append(pytorch_naive.blocked_autorange(min_run_time=5))
+results.append(pytorch_sdpa.blocked_autorange(min_run_time=5))
 results.append(cutile_fwd_bwd.blocked_autorange(min_run_time=5))
 results.append(pytorch_fwd_bwd.blocked_autorange(min_run_time=5))
 comparison = benchmark.Compare(results)
