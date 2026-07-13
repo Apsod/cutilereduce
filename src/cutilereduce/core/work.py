@@ -1,6 +1,6 @@
 # ruff: noqa: E701
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from sympy import Min
 from math import prod
 
@@ -15,9 +15,13 @@ class MatMul:
     k: Dims
 
     @classmethod
-    def make(cls, string: str):
-        return cls(*map(Dims.parse, string.split(':')))
-
+    def make(cls, *, B:str='', M:str, N: str, K: str):
+        return cls(
+                b = Dims.parse(B),
+                m = Dims.parse(M),
+                n = Dims.parse(N),
+                k = Dims.parse(K),
+        )
 
 @dataclass(frozen=True)
 class BaseMatMul[D: Dim]:
@@ -76,15 +80,8 @@ class ConcreteMatMul(BaseMatMul[ConcreteDim]):
         
 @dataclass(frozen=True)
 class Work:
-    forward: list[MatMul]
-    recompute: list[MatMul]
-
-    @classmethod
-    def make(cls, forward: list[str], recompute: list[str]):
-        return cls(
-                forward = [MatMul.make(m) for m in forward],
-                recompute = [MatMul.make(m) for m in recompute],
-        )
+    forward: list[MatMul] = field(default_factory=list)
+    recompute: list[MatMul] = field(default_factory=list)
 
 def bind_work(grid, work):
     if isinstance(grid, ConcreteGrid):

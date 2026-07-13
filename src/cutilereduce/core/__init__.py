@@ -7,7 +7,7 @@ from .spec import Spec, ConcreteSpec
 from .sweep import Estimator, Sweep
 from .variables import * #noqa F403
 from .variables import __all__ as _variables_all
-from .work import Work
+from .work import Work, MatMul
 from .config import Config
 from .impl import mk_autograd
 from .typestuff import to_torch_dtype
@@ -20,6 +20,7 @@ __all__ = [
     "Spec",
     "ConcreteSpec",
     "Work",
+    "MatMul",
     "Config",
     "to_torch_dtype",
     "mk_autograd",

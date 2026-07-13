@@ -45,6 +45,12 @@ def retile(original, index: ct.Constant[tuple[int,...]]):
         ret += (original[i],)
     return ret
 
+def inverse_p(p):
+    ret = [None] * len(p)
+    for i, j in enumerate(p):
+        ret[j] = i
+    return tuple(ret)
+
 def ctmap(fun, xs):
 
     def _ctmap(*args):
@@ -335,6 +341,7 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     gsize, init, set_gix, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'tid_info']
 
     load_order = tuple(b.program_index for b in spec.batch_buffers + spec.fold_buffers)
+    inv_load_order = inverse_p(load_order)
 
     load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
     view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
@@ -344,7 +351,7 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     @ct.function
     def load_map_reduce(tid, batch_tiles, fold_view):
         fold_tiles = fold_view.load(tid)
-        return map_reduce(tid_info(tid), *retile(batch_tiles + fold_tiles, load_order))
+        return map_reduce(tid_info(tid), *retile(batch_tiles + fold_tiles, inv_load_order))
 
     @ct.kernel
     def fwd(batch_buffers, fold_buffers, output_buffers):
@@ -371,9 +378,21 @@ def mk_bwd_kernel(spec, map_finalize, embed):
     gsize, init, set_gix, offset_and_extra, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'offset_and_extra', 'tid_info']
 
     load_order = tuple(spec.input_buffers.index(b) for b in  spec.batch_input_buffers + spec.fold_input_buffers)
+    inv_load_order = inverse_p(load_order)
     grad_batch_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.batch_grad_buffers)
     grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
     grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
+    inv_grad_order = inverse_p(grad_order)
+    
+    print('GRAD LOAD STUFF')
+    print(inv_grad_order)
+    print(' '.join([(spec.batch_grad_buffers + spec.fold_grad_buffers)[i].name for i in inv_grad_order]))
+    print(' '.join([spec.grad_buffers[i].name for i in grad_batch_buffer_index]), ',', ' '.join([spec.grad_buffers[i].name for i in grad_fold_buffer_index]))
+    print('INPUT LOAD STUFF')
+    print(inv_load_order)
+    print(' '.join([(spec.batch_input_buffers + spec.fold_input_buffers)[i].name for i in inv_load_order]))
+
+
 
     load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
     view_batch_grad, init_batch_grad, store_batch_grad = make_buffer_helper(spec.batch_grad_buffers)['view', 'init', 'store']
@@ -386,8 +405,8 @@ def mk_bwd_kernel(spec, map_finalize, embed):
         fold_tiles = fold_view.load(tid)
         grads = map_finalize(
                 tid_info(tid), 
-                *retile(batch_tiles + fold_tiles, load_order), 
-                *retile(batch_grads + fold_grads, grad_order),
+                *retile(batch_tiles + fold_tiles, inv_load_order), 
+                *retile(batch_grads + fold_grads, inv_grad_order),
                 *g_embedded)
         return retile(grads, grad_batch_buffer_index), retile(grads, grad_fold_buffer_index)
 

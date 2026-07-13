@@ -1,11 +1,12 @@
+import math
 
 import cuda.tile as ct
 import torch
 import torch.utils.benchmark as benchmark
-import math
 
-from cutilereduce.core import Spec, Buffer, Dims, Work, Estimator, Sweep, mk_autograd
+from cutilereduce.core import Spec, Buffer, Dims, Work, Estimator, Sweep, mk_autograd, MatMul
 from cutilereduce.util.spec import l4
+from cutilereduce.util.runner import run_grad
 
 
 xentropy = Spec.make(
@@ -26,12 +27,12 @@ xentropy = Spec.make(
         intermediate = [
             Buffer.make('b v', ct.float32),
             ],
-        work = Work.make(
+        work = Work(
             forward=[
-                ': b : v : d',
+                MatMul.make(M='b', N='v', K='d'),
                 ],
             recompute=[
-                ': b : v : d',
+                MatMul.make(M='b', N='v', K='d'),
                 ],
             ),
         batch = Dims.parse('b'),
@@ -53,8 +54,6 @@ e = Estimator.make(
 sweep = Sweep.default.run_all(e)
 
 for (phase,), df in sweep.group_by('cfg:phase'):
-    print(phase)
-    print(df)
     if phase == 'forward':
         fwd_conf = next(e.result2cfg(df))
     elif phase == 'backward':
@@ -174,17 +173,9 @@ def pytorch_pass(ctx, trg, targets):
 
 cutile_pass(ctx, trg, targets)
 
-print(ctx.grad)
-print(trg.grad)
-ctx.grad.zero_()
-trg.grad.zero_()
-
-pytorch_pass(ctx, trg, targets)
-
-print(ctx.grad)
-print(trg.grad)
-ctx.grad.zero_()
-trg.grad.zero_()
+grads = run_grad(ctx, trg, targets, cutile=f, pytorch=pytorch_xentropy)
+for c, p in zip(grads['cutile'], grads['pytorch']):
+    print((c - p).abs().mean())
 
 pytorch_fwd = benchmark.Timer(
         stmt='torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")',

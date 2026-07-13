@@ -5,33 +5,39 @@ import polars as pl
 import torch
 import torch.utils.benchmark as benchmark
 
-from cutilereduce.core import Spec, Buffer, Dims, Work, Estimator, Sweep
+from cutilereduce.core import Spec, Buffer, Dims, Work, Estimator, Sweep, MatMul, mk_autograd
 from cutilereduce.util.spec import l4
+from cutilereduce.util.runner import run_grad
 
 
 attention = Spec.make(
         input = dict(
-            q = Buffer.make('l g h dqk', ct.bfloat16, req_grad=True, default=0),
-            k = Buffer.make('r h dqk', ct.bfloat16, req_grad=True, default=0),
-            v = Buffer.make('r h dv', ct.bfloat16, req_grad=True, default=0),
+            q = Buffer.make('h l g dqk', ct.bfloat16, req_grad=True, default=0),
+            k = Buffer.make('h r dqk', ct.bfloat16, req_grad=True, default=0),
+            v = Buffer.make('h r dv', ct.bfloat16, req_grad=True, default=0),
+        ),
+        execution = dict(
+            m = Buffer.make('h l g', ct.float32, default=float('-inf')),
+            e = Buffer.make('h l g', ct.float32, default=0),
+            u = Buffer.make('h l g dv', ct.float32, default=0),
         ),
         output = dict(
-            m = Buffer.make('l g h', ct.float32, default=float('-inf')),
-            e = Buffer.make('l g h', ct.float32, default=0),
-            u = Buffer.make('l g h dv', ct.float32, default=0),
+            z = Buffer.make('h l g', ct.float32, default=float('-inf')),
+            mu = Buffer.make('h l g dv', ct.float32, default=0),
         ),
         intermediate = [
-            Buffer.make('l r g h', ct.float32),
+            Buffer.make('h l r g', ct.float32),
             ],
-        work = Work.make(
+        work = Work(
             forward=[
-                'h : l g : r : dqk',
+                MatMul.make(B='h', M='l g', N='r', K='dqk'),
+                MatMul.make(B='h', M='l g', N='dv', K='r')
                 ],
             recompute=[
-                'h : l g : dv : r',
+                MatMul.make(B='h', M='l g', N='r', K='dqk'),
                 ],
             ),
-        batch = Dims.parse('l g h'),
+        batch = Dims.parse('h l g'),
         fold = Dims.parse('r'),
         )
 
@@ -51,63 +57,144 @@ e = Estimator.make(
         )
 
 sweep = Sweep.default.run_all(e)
-print(sweep.select(pl.selectors.starts_with('cfg:').name.replace('^cfg:', '')))
 
 for (phase,), df in sweep.group_by('cfg:phase'):
     if phase == 'forward':
-        config = next(e.result2cfg(df))
-        break
+        fwd_conf = next(e.result2cfg(df))
+    elif phase == 'backward':
+        bwd_conf = next(e.result2cfg(df))
 
-spec = attention.concretize(config)
+print(fwd_conf)
+print(bwd_conf)
+
+fwd_spec = attention.concretize(fwd_conf)
+bwd_spec = attention.concretize(bwd_conf)
 
 @ct.function
 def embed(z, mu, g_z, g_mu):
-    return z, g_z - mu * g_mu, g_mu
+    """
+    z, g_z: h l g
+    mu, g_mu: h l g dv 
+    return: h l g, h l g, h l g dv
+    """
+    return (
+            z,
+            g_z - ct.sum(mu * g_mu, 3),
+            g_mu,
+            )
 
 LOG2E = math.log2(math.e)
 LN2 = math.log(2)
 
 @ct.function
-def map_reduce(tile, query, key, value):
+def map(tile, query, key):
     """
-    query: l g h dqk
-    key: r h dqk
-    value: r h dv
+    tile: metadata
+    query: h l g dqk
+    key: h r dqk
+    value: h r dv
+    returns: h (l g) r-shaped logits
     """
-    L, G, H, R, DV = tile.shape('l', 'g', 'h', 'r', 'dv')
+    L, G, H, R, DQK = tile.shape('l', 'g', 'h', 'r', 'dqk')
     rmask = tile.mask('r')
 
-    key = key.permute((1, 2, 0))
-    query = query.reshape((L*G, H, -1)).transpose(0, 1)
+    key = key.transpose(1, 2)
+    query = query.reshape((H, L*G, DQK))
     logits = ct.zeros((H, L*G, R), ct.float32)
     logits = ct.mma(query, key, logits)
     logits = ct.where(rmask[None,None,:], logits, float('-inf'))
-    logits = logits * LOG2E
+    logits = logits
+    return logits
 
-    value = value.transpose(0, 1)
+@ct.function
+def map_finalize(tile, query, key, value, g_query, g_key, g_value, z, g_z, g_mu):
+    """
+    tile: metadata
+    [g_]query: h l g dqk
+    [g_]key: h r dqk
+    [g_]value: h r dv
+    z: h l g
+    g_z: h l g
+    g_mu: h l g dv
+    """
+
+    logits = map(tile, query, key)
+
+    L, G, H, R, DV, DQK = tile.shape('l', 'g', 'h', 'r', 'dv', 'dqk')
+    
+    # h (l g) r
+    scale = ct.exp(logits - z.reshape((H, L*G, 1)))
+
+    g_mu = g_mu.reshape((H, L*G, DV))
+
+    # h r dv
+    g_value = ct.mma(
+            scale.transpose(1, 2).astype(ct.bfloat16),
+            g_mu.astype(ct.bfloat16),
+            g_value
+            )
+    
+    # h (l g) r
+    #g_logits = ct.zeros((H, L*G, R), ct.float32) 
+    g_logits = ct.broadcast_to(g_z.reshape((H, L*G, 1)), (H, L*G, R))
+    g_logits = ct.mma(
+            g_mu.astype(ct.bfloat16),
+            value.transpose(1, 2), 
+            g_logits)
+    #g_logits = g_logits + g_z[:, :, None]
+    g_logits = (scale * g_logits).astype(ct.bfloat16)
+
+    g_query = ct.mma(
+            g_logits, 
+            key, 
+            g_query.reshape((H, L*G, DV))
+            ).reshape((H, L, G, DV))
+    g_key = ct.mma(
+            g_logits.transpose(1, 2), 
+            query.reshape((H, L*G, DV)), 
+            g_key
+            )
+
+    return g_query, g_key, g_value
+
+@ct.function
+def map_reduce(tile, query, key, value):
+    """
+    query: h l g dqk
+    key: h r dqk
+    value: h r dv
+    """
+
+    L, G, H, R, DV, DQK = tile.shape('l', 'g', 'h', 'r', 'dv', 'dqk')
+    
+    # logits: h (l g) r
+    logits = map(tile, query, key) * LOG2E
 
     m = ct.max(logits, 2) # H LG 
     logits = ct.exp2(logits - m[:, :, None]) # H LG R
+
     e = ct.sum(logits, 2) # H LG
+
     u = ct.zeros((H, L*G, DV), ct.float32) # H LG DV
     u = ct.mma(logits.astype(ct.bfloat16), value, u)
+
     return (
-            m.transpose(0, 1).reshape((L, G, H)), 
-            e.transpose(0, 1).reshape((L, G, H)),
-            u.transpose(0, 1).reshape((L, G, H, DV)),
+            m.reshape((H, L, G)), 
+            e.reshape((H, L, G)),
+            u.reshape((H, L, G, DV)),
             )
 
 @ct.function
-def combine(am, ae, av, bm, be, bv):
+def combine(am, ae, au, bm, be, bu):
     key = am > bm
     
     hi_m = ct.where(key, am, bm)
     hi_e = ct.where(key, ae, be)
-    hi_v = ct.where(key[:, :, None], av, bv)
+    hi_u = ct.where(key[:, :, :, None], au, bu)
 
     lo_m = ct.where(key, bm, am)
     lo_e = ct.where(key, be, ae)
-    lo_v = ct.where(key[:, :, None], bv, av)
+    lo_u = ct.where(key[:, :, :, None], bu, au)
 
     skip = hi_m == float('-inf')
 
@@ -115,90 +202,133 @@ def combine(am, ae, av, bm, be, bv):
 
     m = hi_m
     e = ct.where(skip, hi_e, hi_e + lo_e * scaling)
-    v = ct.where(skip[:, :, :, None], hi_v, hi_v + lo_v * scaling[:, :, :, None])
+    v = ct.where(skip[:, :, :, None], hi_u, hi_u + lo_u * scaling[:, :, :, None])
 
     return m, e, v
 
+@ct.function
 def to_semantic(m, e, v):
-    return (m + e.log2()) * LN2, v / e[:, :, :, None]
+    return (m + ct.log2(e)) * LN2, v / e[:, :, :, None]
 
 def to_output(z, v):
     return v
 
-def test(spec):
-    query, key, value = [b.empty('cuda') for b in spec.input.values()]
-    f = mk_fwd_no_group(spec, map_reduce, combine, to_semantic, to_output)
-    with torch.no_grad():
-        query.normal_()
-        key.normal_()
-        value.normal_()
-    
-
-    a = f(query, key, value)
-
-    def naive(query, key, value):
-        query, key, value = (x.to(torch.float32) for x in (query, key, value))
-        att = torch.einsum('lghd,rhd->lghr', query, key)
-        att = att.softmax(dim=3)
-        return torch.einsum('lghr,rhd->lghd', att, value)
-
-    h = sizes['h']
-    g = sizes['g']
-    l = sizes['l']
-    r = sizes['r']
-    dqk = sizes['dqk']
-    dv = sizes['dv']
-    
-    def sdpa(query, key, value):
-        q_sdpa = query.permute(2, 1, 0, 3).reshape(1, h * g, l, dqk)
-        k_sdpa = key.permute(1, 0, 2).reshape(1, h, r, dqk)
-        v_sdpa = value.permute(1, 0, 2).reshape(1, h, r, dv)
-
-        out_sdpa = torch.nn.functional.scaled_dot_product_attention(
-            q_sdpa, k_sdpa, v_sdpa,
-            enable_gqa=True,
-            scale=1.0,
-            dropout_p=0.0,
+query, key, value = [b.empty('cuda') for b in fwd_spec.input.values()]
+f = mk_autograd(
+        fwd_spec,
+        bwd_spec,
+        map_reduce,
+        combine,
+        to_semantic,
+        to_output,
+        map_finalize,
+        embed,
         )
+with torch.no_grad():
+    query.normal_()
+    key.normal_()
+    value.normal_()
+    
+a = f(query, key, value)
 
-        # SDPA layout -> kernel layout
-        return out_sdpa.reshape(1, h, g, l, dv)[0].permute(2, 1, 0, 3)
-    b = naive(query, key, value)
-    c = sdpa(query, key, value)
+def naive(query, key, value):
+    query, key, value = (x.to(torch.float32) for x in (query, key, value))
+    att = torch.einsum('hlgd,hrd->hlgr', query, key)
+    att = att.softmax(dim=3)
+    return torch.einsum('hlgr,hrd->hlgd', att, value)
 
-    print((a - c).abs().mean())
-    print((a - b).abs().mean())
-    print((b - c).abs().mean())
+h = sizes['h']
+g = sizes['g']
+l = sizes['l']
+r = sizes['r']
+dqk = sizes['dqk']
+dv = sizes['dv']
+    
+def sdpa(query, key, value):
 
-    pytorch_naive = benchmark.Timer(
-            stmt='naive(query, key, value)',
-            setup='naive(query, key, value)',
-            globals = {'naive': naive, 'query': query, 'key': key, 'value': value},
-            label = 'attention', sub_label='pytorch naive', description='',
-            num_threads=1
-            )
+    q_sdpa = query.transpose(1, 2).reshape(1, h * g, l, dqk)
+    k_sdpa = key.reshape(1, h, r, dqk)
+    v_sdpa = value.reshape(1, h, r, dv)
 
-    pytorch_sdpa = benchmark.Timer(
-            stmt='sdpa(query, key, value)',
-            setup='sdpa(query, key, value)',
-            globals = {'sdpa': sdpa, 'query': query, 'key': key, 'value': value},
-            label = 'attention', sub_label='pytorch sdpa', description='',
-            num_threads=1
-            )
-
-    cutile = benchmark.Timer(
-            stmt='f(query, key, value)',
-            setup='f(query, key, value)',
-            globals = {'f': f, 'query': query, 'key': key, 'value': value},
-            label = 'attention', sub_label='cutile', description='',
-            num_threads=1
+    out_sdpa = torch.nn.functional.scaled_dot_product_attention(
+        q_sdpa, k_sdpa, v_sdpa,
+        enable_gqa=True,
+        scale=1.0,
+        dropout_p=0.0,
     )
 
-    results = []
-    results.append(cutile.blocked_autorange(min_run_time=5))
-    results.append(pytorch_naive.blocked_autorange(min_run_time=5))
-    results.append(pytorch_sdpa.blocked_autorange(min_run_time=5))
-    comparison = benchmark.Compare(results)
-    comparison.print()
+    # SDPA layout -> kernel layout
+    return out_sdpa.reshape(1, h, g, l, dv)[0].transpose(1, 2)
+b = naive(query, key, value)
+c = sdpa(query, key, value)
 
-test(spec)
+mock = a.new_zeros(a.shape)
+mock.normal_()
+
+def cutile_pass(query, key, value):
+    (f(query, key, value) * mock).sum().backward()
+
+def pytorch_pass(ctx, trg, targets):
+    (sdpa(ctx, trg, targets) * mock).sum().backward()
+
+
+print('cutile - sdpa ', (a - c).abs().mean().item())
+print('cutile - naive', (a - b).abs().mean().item())
+print('naive - sdpa  ', (b - c).abs().mean().item())
+
+
+grads = run_grad(query, key, value, cutile=f, pytorch=sdpa)
+
+for c, p in zip(grads['cutile'], grads['pytorch']):
+    print((c - p).abs().mean())
+
+args = {'query': query, 'key': key, 'value': value}
+
+pytorch_naive = benchmark.Timer(
+        stmt='naive(query, key, value)',
+        setup='naive(query, key, value)',
+        globals = {'naive': naive, **args},
+        label = 'attention', sub_label='pytorch naive', description='',
+        num_threads=1
+        )
+
+pytorch_sdpa = benchmark.Timer(
+        stmt='sdpa(query, key, value)',
+        setup='sdpa(query, key, value)',
+        globals = {'sdpa': sdpa, **args},
+        label = 'attention', sub_label='pytorch sdpa', description='',
+        num_threads=1
+        )
+
+cutile = benchmark.Timer(
+        stmt='f(query, key, value)',
+        setup='f(query, key, value)',
+        globals = {'f': f, **args},
+        label = 'attention', sub_label='cutile', description='',
+        num_threads=1
+)
+
+pytorch_fwd_bwd = benchmark.Timer(
+        stmt='pytorch_pass(query, key, value)',
+        setup='pytorch_pass(query, key, value)',
+        globals = {'pytorch_pass': pytorch_pass, **args},
+        label = 'attention fwd-bwd', sub_label='pytorch', description='',
+        num_threads=1
+        )
+
+cutile_fwd_bwd = benchmark.Timer(
+        stmt='cutile_pass(query, key, value)',
+        setup='cutile_pass(query, key, value)',
+        globals = {'cutile_pass': cutile_pass, **args},
+        label = 'attention fwd-bwd', sub_label='cutile', description='',
+        num_threads=1
+)
+
+results = []
+#results.append(cutile.blocked_autorange(min_run_time=5))
+#results.append(pytorch_naive.blocked_autorange(min_run_time=5))
+#results.append(pytorch_sdpa.blocked_autorange(min_run_time=5))
+results.append(cutile_fwd_bwd.blocked_autorange(min_run_time=5))
+results.append(pytorch_fwd_bwd.blocked_autorange(min_run_time=5))
+comparison = benchmark.Compare(results)
+comparison.print()
