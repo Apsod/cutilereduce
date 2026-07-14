@@ -348,6 +348,12 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     store_output = make_buffer_helper(spec.output_buffers)['store']
     init_execution = make_buffer_helper(spec.execution_buffers)['init']
 
+    print('FWD')
+    print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
+    print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
+    print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
+    print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
+
     @ct.function
     def load_map_reduce(tid, batch_tiles, fold_view):
         fold_tiles = fold_view.load(tid)
@@ -383,7 +389,11 @@ def mk_bwd_kernel(spec, map_finalize, embed):
     grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
     grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
     inv_grad_order = inverse_p(grad_order)
-    
+    print('BWD')
+    print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
+    print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
+    print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
+    print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
     print('GRAD LOAD STUFF')
     print(inv_grad_order)
     print(' '.join([(spec.batch_grad_buffers + spec.fold_grad_buffers)[i].name for i in inv_grad_order]))
@@ -464,13 +474,12 @@ def mk_bwd_kernel(spec, map_finalize, embed):
 
             if extra:
                 i_tid = set_gix(tid, gsize+offset)
+                g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
                 fold_grads = init_fold_grad()
                 batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
                 fold_grad_view.atomic_add(i_tid, fold_grads)
-
             
             view_batch_grad(batch_grad_buffers).atomic_add(tid, batch_grads)
-
 
     return bwd
 

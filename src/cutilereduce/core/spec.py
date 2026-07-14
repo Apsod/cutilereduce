@@ -19,6 +19,7 @@ class BaseSpec[D: Dim]:
     input: dict[str, BaseBuffer[D]]
     execution: dict[str, BaseBuffer[D]]
     output: dict[str, BaseBuffer[D]]
+    grad_accumulator : dict[str, BaseBuffer[D]]
     intermediate: tuple[BaseBuffer[D]]
     work: BaseWork[D]
     phase: Phase
@@ -30,17 +31,20 @@ class BaseSpec[D: Dim]:
             input: dict[str, Buffer], 
             execution: dict[str, Buffer], 
             output: dict[str, Buffer], 
+            grad_accumulator: dict[str, Buffer],
             work: Work, 
             intermediate: list[Buffer] = None):
         input = {k: v.generic_bind(k, i, grid, BufferRole.Input) for (i, (k, v)) in enumerate(input.items())}
         execution = {k: v.generic_bind(k, i, grid, BufferRole.Intermediate) for (i, (k, v)) in enumerate(execution.items())}
         output = {k: v.generic_bind(k, i, grid, BufferRole.Output) for (i, (k, v)) in enumerate(output.items())}
+        grad_accumulator = {k: v.generic_bind(k, i, grid, BufferRole.Intermediate) for (i, (k, v)) in enumerate(grad_accumulator.items())}
         intermediate = tuple(v.generic_bind(f'intermediate:{i}', i, grid, BufferRole.Intermediate) for i, v in enumerate(intermediate))
 
         return dict(
                 input=input,
                 execution=execution,
                 output=output,
+                grad_accumulator=grad_accumulator,
                 work=bind_work(grid, work),
                 intermediate=intermediate
                 )
@@ -60,7 +64,11 @@ class BaseSpec[D: Dim]:
 
     @property
     def intermediate_buffers(self):
-        return (*self.execution.values(), *self.intermediate)
+        match self.phase:
+            case Phase.fwd:
+                return (*self.intermediate, *self.execution.values())
+            case Phase.bwd:
+                return (*self.intermediate, *self.grad_accumulator.values())
 
     @property
     def output_storage(self):
@@ -84,18 +92,27 @@ class BaseSpec[D: Dim]:
     def grad_buffers(self):
         return tuple(replace(b, dtype=ct.float32, default=0) for b in self.input_buffers if b.req_grad)
 
-
-    @property
-    def io_buffers(self):
-        return (*self.input_buffers, *self.output_buffers)
+    #@property
+    #def io_buffers(self):
+    #    return (*self.input_buffers, *self.output_buffers)
 
     @property
     def read_buffers(self):
-        return tuple(b for b in self.io_buffers if b.is_read(self.phase))
-
+        buffers = self.input_buffers
+        if self.phase == Phase.bwd:
+            buffers += self.output_buffers
+            buffers += self.output_buffers # output_grad, assumed to have same dtype as output
+        return buffers
+    
     @property
     def write_buffers(self):
-        return tuple(b for b in self.io_buffers if  b.is_write(self.phase))
+        buffers = ()
+        match self.phase:
+            case Phase.fwd:
+                buffers += self.output_buffers
+            case Phase.bwd:
+                buffers += self.grad_buffers
+        return buffers
 
     @property
     def mmas(self):
@@ -109,8 +126,9 @@ class BaseSpec[D: Dim]:
         self.grid.check()
         for b in self.intermediate:
             b.check()
-        for b in self.io_buffers:
-            b.check()
+        for bundle in (self.input, self.output, self.execution, self.grad_accumulator):
+            for b in bundle.values():
+                b.check()
 
     @property
     def grouped_buffers(self):
@@ -139,7 +157,18 @@ class BaseSpec[D: Dim]:
     @property
     def fold_buffers(self):
         return tuple(b for b in self.read_buffers if self.group_dim in b.dims)
-    
+
+    @property
+    def residency_buffers(self):
+        buffers = self.intermediate_buffers + self.batch_input_buffers + self.fold_input_buffers
+        match self.phase:
+            case Phase.fwd:
+                buffers += self.execution_buffers
+            case Phase.bwd:
+                buffers += self.batch_grad_buffers
+                buffers += self.fold_grad_buffers
+        return buffers
+
     ################# QUANTITIES #################
 
     @property
@@ -150,8 +179,6 @@ class BaseSpec[D: Dim]:
 
 
     def buffer_contention(self, b):
-        if not b.is_write(self.phase):
-            return 0
         R = b.residual_multiplicity
         P = self.program_count
         A = self.active_programs
@@ -166,32 +193,26 @@ class BaseSpec[D: Dim]:
             kind += self.READ
         return kind * b.accessed_bytes
 
+
+
     @property
     def traffic(self):
-        return sum(self.buffer_traffic(v) for v in self.io_buffers)
+        return (
+                self.READ * sum(b.accessed_bytes for b in self.read_buffers) +
+                self.WRITE * sum(b.accessed_bytes for b in self.write_buffers)
+                )
 
     @property
     def effective_traffic(self):
         return self.traffic + self.contention
 
     @property
-    def tile_bytes(self):
-        return sum(v.tile_bytes for v in self.io_buffers + self.intermediate)
-
-    @property
     def residency_bytes(self):
-        base = sum(v.tile_bytes for v in self.intermediate + self.batch_buffers)
-
-        if self.phase == Phase.bwd:
-            base += sum(v.tile_bytes for v in self.grad_buffers if self.group_dim in
-            v.absent)
-
-        return base
-
+        return sum(b.tile_bytes for b in self.residency_buffers)
 
     @property
     def contention(self):
-        return sum(self.buffer_contention(v) for v in self.io_buffers)
+        return sum(self.buffer_contention(b) for b in self.write_buffers)
 
     @property
     def expected_group_active_programs(self):
@@ -347,6 +368,7 @@ class Spec(BaseSpec[Dim]):
              input: dict[str, Buffer], 
              execution: dict[str, Buffer],
              output: dict[str, Buffer], 
+             grad_accumulator: dict[str, Buffer],
              batch: Dims, 
              fold: Dims, 
              work: Work, 
@@ -362,7 +384,7 @@ class Spec(BaseSpec[Dim]):
                 fold = fold,
                 )
 
-        kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, intermediate=intermediate, work=work)
+        kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, grad_accumulator=grad_accumulator, intermediate=intermediate, work=work)
 
         ret = cls(
                 grid=grid,
@@ -378,19 +400,21 @@ class Spec(BaseSpec[Dim]):
         input = {k: v.base for k, v in self.input.items()}
         execution = {k: v.base for k, v in self.execution.items()}
         output = {k: v.base for k, v in self.output.items()}
+        grad_accumulator = {k: v.base for k, v in self.grad_accumulator.items()}
         batch = self.grid.base.batch
         fold = self.grid.base.fold
         work = self.work.base
         intermediate = [b.base for b in self.intermediate]
         return ConcreteSpec.make(
-                input,
-                execution,
-                output,
-                batch,
-                fold,
-                work,
-                config,
-                intermediate,
+                input=input,
+                execution=execution,
+                output=output,
+                grad_accumulator=grad_accumulator,
+                batch=batch,
+                fold=fold,
+                work=work,
+                config=config,
+                intermediate=intermediate,
                 )
 
 
@@ -443,6 +467,7 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
              input: dict[str, Buffer], 
              execution: dict[str, Buffer], 
              output: dict[str, Buffer], 
+             grad_accumulator: dict[str, Buffer],
              batch: Dims, 
              fold: Dims, 
              work: Work, 
@@ -461,7 +486,7 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 config = config,
                 )
 
-        kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, intermediate=intermediate, work=work)
+        kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, grad_accumulator=grad_accumulator, intermediate=intermediate, work=work)
 
         return cls(
                 grid=grid,

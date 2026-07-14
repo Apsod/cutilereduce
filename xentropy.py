@@ -24,6 +24,11 @@ xentropy = Spec.make(
             z = Buffer.make('b', ct.float32, default=float('-inf')),
             l = Buffer.make('b', ct.float32, default=0),
         ),
+        grad_accumulator = dict(
+            z = Buffer.make('b', ct.float32, default=float('-inf')),
+            g_z = Buffer.make('b', ct.float32, default=0),
+            g_l = Buffer.make('b', ct.float32, default=0),
+        ),
         intermediate = [
             Buffer.make('b v', ct.float32),
             ],

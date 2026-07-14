@@ -25,6 +25,11 @@ attention = Spec.make(
             z = Buffer.make('h l g', ct.float32, default=float('-inf')),
             mu = Buffer.make('h l g dv', ct.float32, default=0),
         ),
+        grad_accumulator = dict(
+            z = Buffer.make('h l g', ct.float32, default=float('-inf')),
+            g_z = Buffer.make('h l g', ct.float32, default=0),
+            g_mu = Buffer.make('h l g dv', ct.float32, default=0),
+        ),
         intermediate = [
             Buffer.make('h l r g', ct.float32),
             ],
@@ -183,6 +188,39 @@ def map_reduce(tile, query, key, value):
             m.reshape((H, L, G)), 
             e.reshape((H, L, G)),
             u.reshape((H, L, G, DV)),
+            )
+
+@ct.function
+def map_reduce_combine(tile, query, key, value, acc_m, acc_e, acc_u):
+    """
+    query: h l g dqk
+    key: h r dqk
+    value: h r dv
+    """
+
+    L, G, H, R, DV, DQK = tile.shape('l', 'g', 'h', 'r', 'dv', 'dqk')
+    
+    # logits: h (l g) r
+    logits = map(tile, query, key) * LOG2E
+
+    loc_m = ct.max(logits, 2).reshape((H, L, G)) # H L G 
+    key = acc_m > loc_m
+
+    acc_m = tl.where(key, acc_m, loc_m)
+
+    scaling = tl.where(key, 1, ct.exp2(loc_m - acc_m))
+    
+    logits = ct.exp2(logits - acc_m.reshape((H, L*G, 1)))
+
+    acc_e = acc_e * scaling + ct.sum(logits, 2).reshape((H, L, G)) # H LG
+
+    acc_u = scaling[:,:,:, None] * acc_u
+    acc_u = ct.mma(logits.astype(ct.bfloat16), value, acc_u.reshape((H, L*G, DV))).reshape((H, L, G, DV))
+
+    return (
+            acc_m,
+            acc_e,
+            acc_u,
             )
 
 @ct.function

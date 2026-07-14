@@ -154,15 +154,15 @@ class BaseBuffer[D: Dim]:
     def residual_multiplicity(self):
         return self.absent.total_prod / self.absent.span_prod
 
-    def is_write(self, phase):
-        match phase:
-            case Phase.fwd: return self.is_output              # noqa: E701
-            case Phase.bwd: return self.req_grad               # noqa: E701
+    #def is_write(self, phase):
+    #    match phase:
+    #        case Phase.fwd: return self.is_output              # noqa: E701
+    #        case Phase.bwd: return self.req_grad               # noqa: E701
 
-    def is_read(self, phase):
-        match phase:
-            case Phase.fwd: return self.is_input                     # noqa: E701
-            case Phase.bwd: return self.is_input | self.is_output    # noqa: E701
+    #def is_read(self, phase):
+    #    match phase:
+    #        case Phase.fwd: return self.is_input                     # noqa: E701
+    #        case Phase.bwd: return self.is_input | self.is_output    # noqa: E701
 
     @property
     def numel(self):
