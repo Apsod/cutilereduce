@@ -11,7 +11,7 @@ from .grid import BaseGrid, Dims, Grid, Dim, ConcreteDim
 from .buffer import BaseBuffer, Buffer, BufferRole
 from .work import BaseWork, Work, bind_work
 from .config import Config
-from .variables import READ, WRITE, GROUPS, PEAK_FLOPS, BANDWIDTH, FWD_CONTENTION, BWD_CONTENTION, SM_COUNT, MAX_PROGRAMS_PER_SM, SMEM_PER_SM
+from .variables import READ, WRITE, GROUPS, PEAK_FLOPS, BANDWIDTH, FWD_CONTENTION, BWD_CONTENTION, SM_COUNT, MAX_PROGRAMS_PER_SM, SMEM_PER_SM, ATOMIC_ADD
 
 @dataclass(frozen=True, kw_only=True)
 class BaseSpec[D: Dim]:
@@ -161,12 +161,9 @@ class BaseSpec[D: Dim]:
     @property
     def residency_buffers(self):
         buffers = self.intermediate_buffers + self.batch_input_buffers + self.fold_input_buffers
-        match self.phase:
-            case Phase.fwd:
-                buffers += self.execution_buffers
-            case Phase.bwd:
-                buffers += self.batch_grad_buffers
-                buffers += self.fold_grad_buffers
+        if self.phase == Phase.bwd:
+            buffers += self.batch_grad_buffers
+            buffers += self.fold_grad_buffers
         return buffers
 
     ################# QUANTITIES #################
@@ -179,10 +176,9 @@ class BaseSpec[D: Dim]:
 
 
     def buffer_contention(self, b):
-        R = b.residual_multiplicity
-        P = self.program_count
-        A = self.active_programs
-        active_multiplicity = Min(R, 1 + (A - 1) * (R - 1) / Max(1, P-1))
+        writers_per_tile = b.residual_multiplicity
+        active_writers_per_tile = self.active_programs / b.target_tiles
+        active_multiplicity = Min(writers_per_tile, Max(1, active_writers_per_tile))
         return b.accessed_bytes * self.C(active_multiplicity)
 
     def buffer_traffic(self, b):
@@ -193,6 +189,17 @@ class BaseSpec[D: Dim]:
             kind += self.READ
         return kind * b.accessed_bytes
 
+    @property
+    def atomic_add_penalty(self):
+        match self.phase:
+            case Phase.fwd:
+                return self.ATOMIC_ADD * 0 # sympy hack
+            case Phase.bwd:
+                return self.ATOMIC_ADD * sum(b.accessed_bytes * (b.residual_multiplicity-1) for b in self.write_buffers)
+    
+    @property
+    def atomic_ops(self):
+        return (b.accessed_elems for b in self.write_buffers if b.residual_multiplicity > 1)
 
 
     @property
@@ -345,6 +352,10 @@ class BaseSpec[D: Dim]:
     @property
     def WRITE(self):
         return WRITE
+
+    @property
+    def ATOMIC_ADD(self):
+        return ATOMIC_ADD
 
     @property
     def GROUPS(self):

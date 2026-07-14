@@ -1,8 +1,10 @@
 from sympy import Symbol, Function
 
 __all__ = [
+    "DUMMY",
     "READ",
     "WRITE",
+    "ATOMIC_ADD",
     "GROUPS",
     "PEAK_FLOPS",
     "BANDWIDTH",
@@ -14,8 +16,10 @@ __all__ = [
     "SMEM_PER_SM",
 ]
 
+DUMMY = Symbol('DUMMY')
 READ = Symbol('READ')
 WRITE = Symbol('WRITE')
+ATOMIC_ADD = Symbol('ATOMIC_ADD')
 GROUPS = Symbol('GROUPS')
 PEAK_FLOPS = Symbol('PEAK_FLOPS')
 BANDWIDTH = Symbol('BANDWIDTH')

@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
+import math
+
 from .buffer import Buffer
 
 import cuda.tile as ct
@@ -148,6 +150,7 @@ class BufferInfo:
     padding_mode: ct.Constant[ct.PaddingMode]
     default: ct.Constant[Any]
     dtype: ct.Constant[ct.DType]
+    multiplicity: ct.Constnat[int]
 
     def __getitem__(self, key):
         if isinstance(key, tuple):
@@ -163,7 +166,8 @@ class BufferInfo:
                 tile_shape = b.tile_shape,
                 padding_mode = b.padding_mode,
                 default = b.default,
-                dtype = b.dtype
+                dtype = b.dtype,
+                multiplicity = math.ceil(b.residual_multiplicity),
                 )
 
     @staticmethod
@@ -175,18 +179,15 @@ class BufferInfo:
 def make_buffer_helper(buffer_specs):
     num = len(buffer_specs)
     infos = tuple(BufferInfo.make(b) for b in buffer_specs)
-    #grid_tile_padding = tuple((b.grid_index, b.tile_shape, b.padding_mode) for b in buffer_specs)
-    #tile_padding = tuple((b.tile_shape, b.padding_mode) for b in buffer_specs)
-    #grid = tuple((b.grid_index,) for b in buffer_specs)
 
     def _view_load(tid, view, info):
         return view.load(retile(tid, info.grid_index))
 
-    def _view_store(tid, view, tile, info):
-        view.store(retile(tid, info.grid_index), tile)
-
-    def _view_atomic_add(tid, view, tile, info):
-        view.atomic_store_add(retile(tid, info.grid_index), tile)
+    def _view_store_add(tid, view, tile, info):
+        if info.multiplicity == 1:
+            view.store(retile(tid, info.grid_index), tile)
+        else:
+            view.atomic_store_add(retile(tid, info.grid_index), tile)
 
     @dataclass(frozen=True)
     class Views:
@@ -195,11 +196,8 @@ def make_buffer_helper(buffer_specs):
         def load(self, tid):
             return ctzipmap(_view_load, infos)(tid, self.views)
 
-        def store(self, tid, tiles):
-            ctzipdo(_view_store, infos, nzips=2)(tid, self.views, tiles)
-
-        def atomic_add(self, tid, tiles):
-            ctzipdo(_view_atomic_add, infos, nzips=2)(tid, self.views, tiles)
+        def store_add(self, tid, tiles):
+            ctzipdo(_view_store_add, infos, nzips=2)(tid, self.views, tiles)
 
     def _mk_view(buffer, info):
         return buffer.tiled_view(info.tile_shape, padding_mode=info.padding_mode)
@@ -445,9 +443,9 @@ def mk_bwd_kernel(spec, map_finalize, embed):
                 g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
                 fold_grads = init_fold_grad()
                 batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
-                fold_grad_view.atomic_add(i_tid, fold_grads)
+                fold_grad_view.store_add(i_tid, fold_grads)
             
-            view_batch_grad(batch_grad_buffers).atomic_add(tid, batch_grads)
+            view_batch_grad(batch_grad_buffers).store_add(tid, batch_grads)
 
     elif spec.groups >= 1:
 
@@ -470,16 +468,16 @@ def mk_bwd_kernel(spec, map_finalize, embed):
                 g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
                 fold_grads = init_fold_grad()
                 batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
-                fold_grad_view.atomic_add(i_tid, fold_grads)
+                fold_grad_view.store_add(i_tid, fold_grads)
 
             if extra:
                 i_tid = set_gix(tid, gsize+offset)
                 g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
                 fold_grads = init_fold_grad()
                 batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
-                fold_grad_view.atomic_add(i_tid, fold_grads)
+                fold_grad_view.store_add(i_tid, fold_grads)
             
-            view_batch_grad(batch_grad_buffers).atomic_add(tid, batch_grads)
+            view_batch_grad(batch_grad_buffers).store_add(tid, batch_grads)
 
     return bwd
 

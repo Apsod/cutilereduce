@@ -147,12 +147,20 @@ class BaseBuffer[D: Dim]:
         return Fraction(self.dtype.bitwidth, 8)
 
     @property
+    def accessed_elems(self):
+        return self.contribution.total_prod / self.absent.span_prod
+
+    @property
     def accessed_bytes(self):
-        return self.bsize * self.contribution.total_prod / self.absent.span_prod
+        return self.bsize * self.accessed_elems
 
     @property
     def residual_multiplicity(self):
         return self.absent.total_prod / self.absent.span_prod
+
+    @property
+    def target_tiles(self):
+        return self.spec.total_prod / self.spec.span_prod
 
     #def is_write(self, phase):
     #    match phase:

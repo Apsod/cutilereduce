@@ -61,7 +61,12 @@ e = Estimator.make(
         symbols=l4,
         )
 
-sweep = Sweep.default.run_all(e)
+sweeper = Sweep.default
+sweeper = sweeper.add_filters(
+        pl.when(pl.col('cfg:phase') == 'backward').then(pl.col('cfg:g') == sizes['g']).otherwise(True)
+        )
+
+sweep = sweeper.run_all(e)
 
 for (phase,), df in sweep.group_by('cfg:phase'):
     if phase == 'forward':

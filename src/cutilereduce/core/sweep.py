@@ -12,14 +12,14 @@ import numpy
 from .base import kmap, Phase
 from .grid import Dim
 from .spec import Spec
-from .variables import READ, WRITE, GROUPS, MIN_MMA_EFFICIENCY, FWD_CONTENTION, BWD_CONTENTION
+from .variables import READ, WRITE, GROUPS, MIN_MMA_EFFICIENCY, FWD_CONTENTION, BWD_CONTENTION, ATOMIC_ADD
 from .config import Config
 
 def contention_penalty(alpha, cap, contention):
     return Min(cap, alpha * log(Max(1, contention), 2))
 
 def atomic_add_penalty(contention):
-    return contention_penalty(alpha=1, cap=16, contention=contention)
+    return contention_penalty(alpha=4, cap=64, contention=contention)
 
 def spinlock_penalty(contention):
     return contention_penalty(alpha=2, cap=64, contention=contention)
@@ -30,6 +30,7 @@ def group_penalty(contention):
 DEFAULT_SYMBOLS = {
         READ: 1, 
         WRITE: 1,
+        ATOMIC_ADD: 2, 
         MIN_MMA_EFFICIENCY: 1,
         }
 
@@ -63,6 +64,19 @@ class Sweep:
     sort: list[pl.Expr]
 
     default: ClassVar[Sweep]
+
+    def add_attributes(self, *attributes):
+        return replace(self, attributes=self.attributes + list(attributes))
+
+    def add_filters(self, *filters):
+        return replace(self, filters=self.filters + list(filters))
+
+    def add_paretos(self, *paretos):
+        return replace(self, paretos=self.paretos + list(paretos))
+
+    def add_sorts(self, *sorts):
+        return replace(self, sorts=self.sorts + list(sorts))
+
 
     def filter(self, df):
         if self.filters:
@@ -104,8 +118,8 @@ Sweep.default = Sweep(
                 'estimated_time', 'compute_time', 'traffic_time', 
                 'excess_storage_ratio', 'effective_tile_work',
                 'mma_efficiency', 'resident_programs_per_sm', 'group_size', 
-                'residency_bytes', 'groups', 
-                'SM_utilization',
+                'residency_bytes', 'groups', 'atomic_add_penalty',
+                'SM_utilization', 'contention',
                 ],
             filters = [
                 pl.col('resident_programs_per_sm') >= 1,
@@ -116,7 +130,7 @@ Sweep.default = Sweep(
             paretos = [
                 'compute_time', 'traffic_time',
                 ],
-            sort = ['estimated_time', pl.col('SM_utilization').neg(), 'residency_bytes', pl.col('effective_tile_work').neg()]
+            sort = ['estimated_time', pl.col('SM_utilization').neg(), 'contention', 'atomic_add_penalty', 'residency_bytes', pl.col('effective_tile_work').neg()]
             )
 
 
@@ -187,7 +201,18 @@ class Estimator:
 
         def chunk_inner(g):
             grouped = self.group(g)
-            expressions = tuple(grouped._eval(getattr(grouped.meta, n)) for n in attributes)
+
+            expressions = []
+            for n in attributes:
+                try:
+                    a = getattr(grouped.meta, n)
+                    e = grouped._eval(a)
+                    expressions.append(e)
+                except Exception as e:
+                    e.add_note(f'{n} not a sympy expressions: {type(a)}, {a}')
+                    raise 
+            expressions = tuple(expressions)
+            #expressions = tuple(grouped._eval(getattr(grouped.meta, n)) for n in attributes)
             f = sympy.lambdify(args, expressions, 'numpy', cse=True)
             for e in expressions:
                 free = e.free_symbols - set(args)
@@ -197,7 +222,14 @@ class Estimator:
                 cols = list(zip(*chunk))
                 configs = pl.DataFrame({'cfg:phase': self.meta.phase, 'cfg:group': g, **{f'cfg:{k}': v for k,v in zip(params, cols)}})
                 metrics = f(*(numpy.array(col, dtype=numpy.float128) for col in cols))
-                metrics = pl.DataFrame({n: v.astype(numpy.float64) for n, v in zip(attributes, metrics)})
+                frame = {}
+                for n, v in zip(attributes, metrics):
+                    if isinstance(v, numpy.ndarray):
+                        frame[n] = v.astype(numpy.float64)
+                    else:
+                        frame[n] = float(v)
+                    
+                metrics = pl.DataFrame(frame)
                 yield pl.concat((configs, metrics), how='horizontal')
 
         for g in i2g:
