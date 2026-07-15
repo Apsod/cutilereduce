@@ -28,7 +28,7 @@ attention = Spec.make(
         grad_accumulator = dict(
             z = Buffer.make('h l g', ct.float32, default=float('-inf')),
             g_z = Buffer.make('h l g', ct.float32, default=0),
-            g_mu = Buffer.make('h l g dv', ct.float32, default=0),
+            g_mu = Buffer.make('h l g dv', ct.float16, default=0),
         ),
         intermediate = [
             Buffer.make('h l r g', ct.float32),
@@ -38,8 +38,12 @@ attention = Spec.make(
                 MatMul.make(B='h', M='l g', N='r', K='dqk'),
                 MatMul.make(B='h', M='l g', N='dv', K='r')
                 ],
-            recompute=[
-                MatMul.make(B='h', M='l g', N='r', K='dqk'),
+            backward=[
+                MatMul.make(B='h', M='l g', N='r', K='dqk'),  # recompute logits
+                MatMul.make(B='h', M='l g', N='r', K='dv'),   # dLogits
+                MatMul.make(B='h', M='r', N='dv', K='l g'),   # dV
+                MatMul.make(B='h', M='l g', N='dqk', K='r'),  # dQ
+                MatMul.make(B='h', M='r', N='dqk', K='l g'),  # dK
                 ],
             ),
         batch = Dims.parse('h l g'),
@@ -61,24 +65,6 @@ e = Estimator.make(
         symbols=l4,
         )
 
-sweeper = Sweep.default
-sweeper = sweeper.add_filters(
-        pl.when(pl.col('cfg:phase') == 'backward').then(pl.col('cfg:g') == sizes['g']).otherwise(True)
-        )
-
-sweep = sweeper.run_all(e)
-
-for (phase,), df in sweep.group_by('cfg:phase'):
-    if phase == 'forward':
-        fwd_conf = next(e.result2cfg(df))
-    elif phase == 'backward':
-        bwd_conf = next(e.result2cfg(df))
-
-print(fwd_conf)
-print(bwd_conf)
-
-fwd_spec = attention.concretize(fwd_conf)
-bwd_spec = attention.concretize(bwd_conf)
 
 @ct.function
 def embed(z, mu, g_z, g_mu):
@@ -90,7 +76,7 @@ def embed(z, mu, g_z, g_mu):
     return (
             z,
             g_z - ct.sum(mu * g_mu, 3),
-            g_mu,
+            g_mu.astype(ct.bfloat16),
             )
 
 LOG2E = math.log2(math.e)
@@ -257,21 +243,43 @@ def to_semantic(m, e, v):
 def to_output(z, v):
     return v
 
-query, key, value = [b.empty('cuda') for b in fwd_spec.input.values()]
+sweeper = Sweep.default
+#sweeper = sweeper.add_filters(
+#        pl.when(pl.col('cfg:phase') == 'backward').then(pl.col('cfg:g') == sizes['g']).otherwise(True),
+#        pl.when(pl.col('cfg:phase') == 'backward').then(pl.col('cfg:group') == 'l').otherwise(True),
+#        )
+
+sweep = sweeper.run_all(e)
+
+for (phase,), df in sweep.group_by('cfg:phase'):
+    if phase == 'forward':
+        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:')), 'estimated_time'))
+        fwd_confs = list(e.result2cfg(df))
+    elif phase == 'backward':
+        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:')), 'estimated_time'))
+        bwd_confs = list(e.result2cfg(df))
+
+fwd_specs = [attention.concretize(conf) for conf in fwd_confs]
+bwd_specs = [attention.concretize(conf) for conf in bwd_confs]
+
+query, key, value = [b.empty('cuda') for b in fwd_specs[0].input.values()]
+
+with torch.no_grad():
+    query.normal_()
+    key.normal_()
+    value.normal_()
+
 f = mk_autograd(
-        fwd_spec,
-        bwd_spec,
+        fwd_specs,
+        bwd_specs,
         map_reduce,
         combine,
         to_semantic,
         to_output,
         map_finalize,
         embed,
+        mock_input=(query, key, value)
         )
-with torch.no_grad():
-    query.normal_()
-    key.normal_()
-    value.normal_()
     
 a = f(query, key, value)
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Self
+from copy import replace
 import math
 
 from .buffer import Buffer
@@ -9,6 +10,7 @@ import cuda.tile as ct
 import torch
 
 from .base import Phase
+from cutilereduce.util.tune import exhaustive_search
 
 def ceil_pow2(x: int):
     return 1 << (x-1).bit_length()
@@ -338,7 +340,7 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     assert spec.groups == 1
     gsize, init, set_gix, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'tid_info']
 
-    load_order = tuple(b.program_index for b in spec.batch_buffers + spec.fold_buffers)
+    load_order = tuple(b.program_index for b in spec.batch_read_buffers + spec.fold_read_buffers)
     inv_load_order = inverse_p(load_order)
 
     load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
@@ -346,11 +348,11 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     store_output = make_buffer_helper(spec.output_buffers)['store']
     init_execution = make_buffer_helper(spec.execution_buffers)['init']
 
-    print('FWD')
-    print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
-    print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
-    print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
-    print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
+    #print('FWD')
+    #print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
+    #print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
+    #print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
+    #print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
 
     @ct.function
     def load_map_reduce(tid, batch_tiles, fold_view):
@@ -387,18 +389,18 @@ def mk_bwd_kernel(spec, map_finalize, embed):
     grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
     grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
     inv_grad_order = inverse_p(grad_order)
-    print('BWD')
-    print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
-    print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
-    print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
-    print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
-    print('GRAD LOAD STUFF')
-    print(inv_grad_order)
-    print(' '.join([(spec.batch_grad_buffers + spec.fold_grad_buffers)[i].name for i in inv_grad_order]))
-    print(' '.join([spec.grad_buffers[i].name for i in grad_batch_buffer_index]), ',', ' '.join([spec.grad_buffers[i].name for i in grad_fold_buffer_index]))
-    print('INPUT LOAD STUFF')
-    print(inv_load_order)
-    print(' '.join([(spec.batch_input_buffers + spec.fold_input_buffers)[i].name for i in inv_load_order]))
+    #print('BWD')
+    #print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
+    #print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
+    #print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
+    #print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
+    #print('GRAD LOAD STUFF')
+    #print(inv_grad_order)
+    #print(' '.join([(spec.batch_grad_buffers + spec.fold_grad_buffers)[i].name for i in inv_grad_order]))
+    #print(' '.join([spec.grad_buffers[i].name for i in grad_batch_buffer_index]), ',', ' '.join([spec.grad_buffers[i].name for i in grad_fold_buffer_index]))
+    #print('INPUT LOAD STUFF')
+    #print(inv_load_order)
+    #print(' '.join([(spec.batch_input_buffers + spec.fold_input_buffers)[i].name for i in inv_load_order]))
 
 
 
@@ -489,13 +491,10 @@ def mk_autograd(
         to_semantic,
         to_output,
         map_finalize,
-        embed,):
+        embed,
+        mock_input=None,
+        mock_output=None,):
 
-    fwd_kernel = mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
-    bwd_kernel = mk_bwd_kernel(bwd_spec, map_finalize, embed)
-
-    num_inputs = len(fwd_spec.input_buffers)
-    
     def batch_fold_split(spec, inputs):
         batch = []
         fold = []
@@ -506,11 +505,11 @@ def mk_autograd(
                 batch.append(array)
         return tuple(batch), tuple(fold)
 
-    def mk_ret_batch_fold_grads():
+    def mk_ret_batch_fold_grads(spec):
         batch = []
         fold =  []
         ret = []
-        for b in bwd_spec.input_buffers:
+        for b in spec.input_buffers:
             if b.req_grad:
                 arr = b.grad_buffer.zeros(device='cuda')
                 if b.is_grouped:
@@ -522,22 +521,72 @@ def mk_autograd(
                 ret.append(None)
         return tuple(ret), tuple(batch), tuple(fold)
 
-    def bundlestr(bundle):
-        return ','.join([str(x.shape) for x in bundle])
-            
+    def grid_fn(spec):
+        return (spec.grid.tasks, 1, 1)
+
+    def kernel_fn(spec):
+        match spec.phase:
+            case Phase.fwd:
+                return mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic)
+            case Phase.bwd:
+                return mk_bwd_kernel(spec, map_finalize, embed)
+
+    def args_fn(spec):
+        match spec.phase:
+            case Phase.fwd:
+                batch, fold = batch_fold_split(spec, mock_input)
+                output = tuple(b.empty('cuda') for b in spec.output_buffers)
+                return (batch, fold, output)
+            case Phase.bwd:
+                batch, fold = batch_fold_split(spec, mock_input)
+                _, batch_grad, fold_grad = mk_ret_batch_fold_grads(spec)
+                output = mock_output
+                grad_output = mock_grad_output
+                return (batch, fold, batch_grad, fold_grad, output, grad_output)
+
+    if isinstance(fwd_spec, list):
+        measurements = exhaustive_search(
+                fwd_spec,
+                torch.cuda.current_stream(),
+                grid_fn = grid_fn,
+                kernel_fn = kernel_fn,
+                args_fn = args_fn,
+                )
+        fwd_spec = measurements.best.config
+        print(replace(measurements.best, config = measurements.best.config.grid.config))
+
+    fwd_kernel = kernel_fn(fwd_spec) #mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
+
+    def fwd_f(*inputs):
+        batch, fold, output = args_fn(fwd_spec)
+        stream = torch.cuda.current_stream()
+        grid = grid_fn(fwd_spec)
+        args = (batch, fold, output)
+        ct.launch(stream, grid, fwd_kernel, args)
+        return output
+
+    mock_output = fwd_f(*args_fn(fwd_spec))
+    mock_grad_output = tuple(b.new_empty(b.shape).normal_() for b in mock_output)
+
+    if isinstance(bwd_spec, list):
+        measurements = exhaustive_search(
+                bwd_spec,
+                torch.cuda.current_stream(),
+                grid_fn = grid_fn,
+                kernel_fn = kernel_fn,
+                args_fn = args_fn,
+                )
+        bwd_spec = measurements.best.config
+        print(replace(measurements.best, config = measurements.best.config.grid.config))
+
+    bwd_kernel = kernel_fn(bwd_spec)
+
+    num_inputs = len(fwd_spec.input_buffers)
+
     class CutileReduceFn(torch.autograd.Function):
         @staticmethod
         def forward(*inputs):
-            outputs = tuple(b.empty('cuda') for b in fwd_spec.output_buffers)
-            batch, fold = batch_fold_split(fwd_spec, inputs)
-            stream = torch.cuda.current_stream()
-            grid = (fwd_spec.grid.tasks, 1, 1)
-            args = (batch, fold, outputs)
-            #print('batch', bundlestr(batch))
-            #print('fold', bundlestr(fold))
-            #print('outputs', bundlestr(outputs))
-            ct.launch(stream, grid, fwd_kernel, args)
-            return outputs
+            return fwd_f(*inputs)
 
         @staticmethod
         def setup_context(ctx, inputs, outputs):
@@ -550,19 +599,11 @@ def mk_autograd(
             outputs = saved[num_inputs:]
 
             batch, fold = batch_fold_split(bwd_spec, inputs)
-            grad_storage, batch_grads, fold_grads = mk_ret_batch_fold_grads()
+            grad_storage, batch_grads, fold_grads = mk_ret_batch_fold_grads(bwd_spec)
 
             stream = torch.cuda.current_stream()
-            launch_grid = (bwd_spec.grid.tasks, 1, 1)
-            #print('BWD GRID', bwd_spec.grid.dims, bwd_spec.grid.task_grid)
+            launch_grid = grid_fn(bwd_spec)
             args = (batch, fold, batch_grads, fold_grads, outputs, grad_outputs)
-
-            #print('batch', bundlestr(batch))
-            #print(' grads', bundlestr(batch_grads))
-            #print('fold', bundlestr(fold))
-            #print(' grads', bundlestr(fold_grads))
-            #print('outputs', bundlestr(outputs))
-            #print(' grads', bundlestr(grad_outputs))
 
             ct.launch(stream, launch_grid, bwd_kernel, args)
             return grad_storage

@@ -162,6 +162,8 @@ class BaseBuffer[D: Dim]:
     def target_tiles(self):
         return self.spec.total_prod / self.spec.span_prod
 
+
+
     #def is_write(self, phase):
     #    match phase:
     #        case Phase.fwd: return self.is_output              # noqa: E701
@@ -225,10 +227,6 @@ class ConcreteBuffer(BaseBuffer[ConcreteDim]):
     def zeros(self, device=None):
         return torch.zeros(self.buffer_shape, device=device)
 
-
-    #xs = tuple((i, b.grid_index, b.tile_shape, b.padding_mode) for i, b in enumerate(buffer_specs))
-    #def fun(tid, buffers, i, grid_index, tile_shape, padding_mode):
-    #    return View(buffers[i].tiled_view(tile_shape, padding_mode=padding_mode), grid_index).load(tid)
     @property
     def is_grouped(self):
         return any(d.grouped for d in self.dims)

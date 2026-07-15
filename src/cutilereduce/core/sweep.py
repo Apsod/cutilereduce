@@ -60,8 +60,11 @@ def pareto_mask(metrics):
 class Sweep:
     attributes: list[str]
     filters: list[pl.Expr]
-    paretos: list[pl.Expr]
-    sort: list[pl.Expr]
+    #paretos: list[pl.Expr]
+    #sort: list[pl.Expr]
+    key: pl.Expr
+    top_k: int
+    threshold: float
 
     default: ClassVar[Sweep]
 
@@ -97,14 +100,21 @@ class Sweep:
         else:
             return self.pareto(pl.concat((a, b)))
 
+    def sort_combine(self, a, b=None):
+        if b is None:
+            ab = a.sort(self.key).head(self.top_k)
+        else:
+            ab = pl.concat((a, b)).sort(self.key).head(self.top_k)
+        ab = ab.filter(pl.col(self.key) < pl.col(self.key).min() * self.threshold)
+        return ab
+            
+
     def apply(self, estimator: Estimator):
         frontier = None
         for df in estimator.chunked_eval(self.attributes, *estimator.generate_configs()):
             df = self.filter(df)
-            df = self.pareto(df)
-            frontier = self.pareto_combine(df, frontier)
-        if self.sort:
-            frontier = frontier.sort(self.sort)
+            #df = self.pareto(df)
+            frontier = self.sort_combine(df, frontier)
         return frontier
 
     def run_all(self, estimator: Estimator):
@@ -119,18 +129,21 @@ Sweep.default = Sweep(
                 'excess_storage_ratio', 'effective_tile_work',
                 'mma_efficiency', 'resident_programs_per_sm', 'group_size', 
                 'residency_bytes', 'groups', 'atomic_add_penalty',
-                'SM_utilization', 'contention',
+                'SM_utilization', 'contention'
                 ],
             filters = [
                 pl.col('resident_programs_per_sm') >= 1,
                 pl.col('group_size') >= 1,
-                pl.col('mma_efficiency') == 1,
+                pl.col('mma_efficiency') >= 0.5,
                 pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1),
                 ],
-            paretos = [
-                'compute_time', 'traffic_time',
-                ],
-            sort = ['estimated_time', pl.col('SM_utilization').neg(), 'contention', 'atomic_add_penalty', 'residency_bytes', pl.col('effective_tile_work').neg()]
+            key = 'estimated_time',
+            top_k = 100,
+            threshold= 3,
+            #paretos = [
+            #    'compute_time', 'traffic_time',
+            #    ],
+            #sort = ['estimated_time', pl.col('SM_utilization').neg(), 'contention', 'residency_bytes', pl.col('effective_tile_work').neg()]
             )
 
 
@@ -235,7 +248,7 @@ class Estimator:
         for g in i2g:
             yield from chunk_inner(g)
 
-    def generate_configs(self, max_tile=1024, max_groups=1):
+    def generate_configs(self, max_tile=1024, max_groups=16):
         groups = {}
         for k in self.meta.contention_dims:
             groups[k] = list(range(1, max_groups + 1))

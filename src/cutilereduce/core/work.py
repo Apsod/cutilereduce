@@ -64,7 +64,15 @@ class BaseMatMul[D: Dim]:
 
     @property
     def tile_efficiency(self):
-        return prod([Min(1, getattr(self, n).tile_prod / 16) for n in 'mnk'])
+        return (
+                Min(1, self.m.tile_prod * self.n.tile_prod * self.m.tile_prod / 16384) *
+                Min(1, self.k.tile_prod / 16) * 
+                Min(1, self.m.tile_prod / 16) * 
+                Min(1, self.n.tile_prod / 16) 
+                )
+    #@property
+    #def tile_efficiency(self):
+    #    return prod([Min(1, getattr(self, n).tile_prod / 16) for n in 'mnk'])
 
 @dataclass(frozen=True)
 class BoundMatMul(BaseMatMul[Dim]):
@@ -81,7 +89,7 @@ class ConcreteMatMul(BaseMatMul[ConcreteDim]):
 @dataclass(frozen=True)
 class Work:
     forward: list[MatMul] = field(default_factory=list)
-    recompute: list[MatMul] = field(default_factory=list)
+    backward: list[MatMul] = field(default_factory=list)
 
 def bind_work(grid, work):
     if isinstance(grid, ConcreteGrid):
@@ -101,7 +109,7 @@ class BaseWork[D: Dim]:
     def mmas(self, phase):
         match phase:
             case Phase.fwd: return self.forward
-            case Phase.bwd: return self.forward + self.forward + self.recompute
+            case Phase.bwd: return self.backward
             case _: assert False
 
 

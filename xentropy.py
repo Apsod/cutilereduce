@@ -1,5 +1,6 @@
 import math
 
+import polars as pl
 import cuda.tile as ct
 import torch
 import torch.utils.benchmark as benchmark
@@ -36,8 +37,10 @@ xentropy = Spec.make(
             forward=[
                 MatMul.make(M='b', N='v', K='d'),
                 ],
-            recompute=[
+            backward=[
                 MatMul.make(M='b', N='v', K='d'),
+                MatMul.make(M='b', N='d', K='v'),
+                MatMul.make(M='v', N='d', K='b'),
                 ],
             ),
         batch = Dims.parse('b'),
@@ -56,19 +59,6 @@ e = Estimator.make(
         symbols=l4,
         )
 
-sweep = Sweep.default.run_all(e)
-
-for (phase,), df in sweep.group_by('cfg:phase'):
-    if phase == 'forward':
-        fwd_conf = next(e.result2cfg(df))
-    elif phase == 'backward':
-        bwd_conf = next(e.result2cfg(df))
-
-print(fwd_conf)
-print(bwd_conf)
-
-fwd_spec = xentropy.concretize(fwd_conf)
-bwd_spec = xentropy.concretize(bwd_conf)
 
 LOG2E = math.log2(math.e)
 LN2 = math.log(2)
@@ -139,28 +129,46 @@ def to_semantic(m, e, v):
 def to_output(z, v):
     return z - v
 
-ctx, trg, targets = [b.empty('cuda') for b in fwd_spec.input.values()]
+sweep = Sweep.default.run_all(e)
+
+for (phase,), df in sweep.group_by('cfg:phase'):
+    if phase == 'forward':
+        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:'))), 'estimated_time')
+        fwd_confs = list(e.result2cfg(df))
+    elif phase == 'backward':
+        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:'))), 'estimated_time')
+        bwd_confs = list(e.result2cfg(df))
+
+#print(fwd_conf)
+#print(bwd_conf)
+
+
+fwd_specs = [xentropy.concretize(conf) for conf in fwd_confs]
+bwd_specs = [xentropy.concretize(conf) for conf in bwd_confs]
+
+
+ctx, trg, targets = [b.empty('cuda') for b in fwd_specs[0].input.values()]
+with torch.no_grad():
+    ctx.normal_(std=ctx.shape[1]**-.5)
+    trg.normal_(std=trg.shape[1]**-.5)
+targets.random_(0, trg.shape[0])
+
+def pytorch_xentropy(ctx, trg, targets):
+    return torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")
+
 f = mk_autograd(
-        fwd_spec,
-        bwd_spec,
+        fwd_specs,
+        bwd_specs,
         map_reduce,
         combine,
         to_semantic,
         to_output,
         map_finalize,
         embed,
+        mock_input = (ctx, trg, targets),
         )
-with torch.no_grad():
-    ctx.normal_(std=ctx.shape[1]**-.5)
-    trg.normal_(std=trg.shape[1]**-.5)
-
-targets.random_(0, trg.shape[0])
 
 out_cutile = f(ctx, trg, targets)
-
-def pytorch_xentropy(ctx, trg, targets):
-    return torch.nn.functional.cross_entropy(ctx @ trg.t(), targets.to(torch.long), reduction="none")
-
 out_pytorch = pytorch_xentropy(ctx, trg, targets)
 
 print(out_cutile)

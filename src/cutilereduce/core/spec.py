@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from copy import replace
 
 import sympy
-from sympy import Max, Min
+from sympy import Max, Min, Piecewise
 
 import cuda.tile as ct
 
@@ -63,6 +63,10 @@ class BaseSpec[D: Dim]:
         return (*self.execution.values(),)
 
     @property
+    def grad_accumulator_buffers(self):
+        return (*self.grad_accumulator.values(),)
+
+    @property
     def intermediate_buffers(self):
         match self.phase:
             case Phase.fwd:
@@ -92,9 +96,6 @@ class BaseSpec[D: Dim]:
     def grad_buffers(self):
         return tuple(replace(b, dtype=ct.float32, default=0) for b in self.input_buffers if b.req_grad)
 
-    #@property
-    #def io_buffers(self):
-    #    return (*self.input_buffers, *self.output_buffers)
 
     @property
     def read_buffers(self):
@@ -103,7 +104,15 @@ class BaseSpec[D: Dim]:
             buffers += self.output_buffers
             buffers += self.output_buffers # output_grad, assumed to have same dtype as output
         return buffers
-    
+
+    @property
+    def batch_read_buffers(self):
+        return tuple(b for b in self.read_buffers if self.group_dim in b.absent)
+
+    @property
+    def fold_read_buffers(self):
+        return tuple(b for b in self.read_buffers if self.group_dim in b.dims)
+
     @property
     def write_buffers(self):
         buffers = ()
@@ -151,20 +160,60 @@ class BaseSpec[D: Dim]:
         return tuple(b for b in self.grad_buffers if self.group_dim in b.dims)
 
     @property
-    def batch_buffers(self):
+    def loop_buffers(self):
+        match self.phase:
+            case Phase.fwd:
+                return self.execution_buffers
+            case Phase.bwd:
+                return self.grad_accumulator_buffers
+
+    @property
+    def batch_loop_buffers(self):
+        return tuple(b for b in self.loop_buffers if self.group_dim in b.absent)
+
+    @property
+    def fold_loop_buffers(self):
+        return tuple(b for b in self.loop_buffers if self.group_dim in b.dims)
+
+    @property
+    def batch_output_buffers(self):
+        return tuple(b for b in self.output_buffers if self.group_dim in b.absent)
+
+    @property
+    def fold_output_buffers(self):
+        return tuple(b for b in self.output_buffers if self.group_dim in b.dims)
+
+    @property
+    def batch_read_buffers(self):
         return tuple(b for b in self.read_buffers if self.group_dim in b.absent)
 
     @property
-    def fold_buffers(self):
+    def fold_read_buffers(self):
         return tuple(b for b in self.read_buffers if self.group_dim in b.dims)
 
     @property
-    def residency_buffers(self):
-        buffers = self.intermediate_buffers + self.batch_input_buffers + self.fold_input_buffers
-        if self.phase == Phase.bwd:
-            buffers += self.batch_grad_buffers
-            buffers += self.fold_grad_buffers
+    def streamed_read_buffers(self):
+        return self.fold_read_buffers
+
+    @property
+    def streamed_resident_buffers(self):
+        buffers = self.fold_input_buffers + self.fold_loop_buffers
+        match self.phase:
+            case Phase.bwd:
+                buffers += self.fold_grad_buffers
         return buffers
+
+    @property
+    def persistent_resident_buffers(self):
+        buffers = self.batch_input_buffers + self.batch_loop_buffers + self.intermediate
+        match self.phase:
+            case Phase.bwd:
+                buffers += self.batch_grad_buffers
+        return buffers
+
+    @property
+    def resident_buffers(self):
+        return self.persistent_resident_buffers + self.streamed_resident_buffers
 
     ################# QUANTITIES #################
 
@@ -195,7 +244,10 @@ class BaseSpec[D: Dim]:
             case Phase.fwd:
                 return self.ATOMIC_ADD * 0 # sympy hack
             case Phase.bwd:
-                return self.ATOMIC_ADD * sum(b.accessed_bytes * (b.residual_multiplicity-1) for b in self.write_buffers)
+                return self.ATOMIC_ADD * sum(
+                        b.accessed_bytes * Piecewise((0, b.residual_multiplicity <= 1), (1, True))
+                        for b in self.write_buffers
+                        )
     
     @property
     def atomic_ops(self):
@@ -211,11 +263,28 @@ class BaseSpec[D: Dim]:
 
     @property
     def effective_traffic(self):
-        return self.traffic + self.contention
+        return self.traffic + self.atomic_add_penalty #+ self.contention
 
     @property
     def residency_bytes(self):
-        return sum(b.tile_bytes for b in self.residency_buffers)
+        return sum(b.tile_bytes for b in self.resident_buffers)
+
+    @property
+    def pipeline_bytes(self):
+        return sum(b.tile_bytes for b in self.streamed_resident_buffers)
+
+    @property
+    def pipeline_stage_capacity(self):
+        spare = self.SMEM_PER_SM - self.resident_programs_per_sm * self.residency_bytes
+        denom = self.resident_programs_per_sm * self.pipeline_bytes
+        slack = spare / denom
+        return Piecewise(
+                (0, self.pipeline_bytes <= 0),
+                (slack, True),
+                )
+    @property
+    def pipeline_factor(self):
+        return Min(1, self.pipeline_stage_capacity * self.stream_compute_cover)
 
     @property
     def contention(self):
@@ -247,16 +316,32 @@ class BaseSpec[D: Dim]:
         return self.effective_total_work / self.effective_peak_flops
 
     @property
+    def nonhiding_traffic(self):
+        traffic = 0
+        traffic += self.READ * sum(b.accessed_bytes for b in self.batch_read_buffers)
+        traffic += self.WRITE * sum(b.accessed_bytes for b in self.write_buffers)
+        traffic += self.contention
+        return traffic
+
+    @property
+    def streamed_traffic(self):
+        return self.READ * sum(b.accessed_bytes for b in self.fold_read_buffers)
+
+    @property
+    def streamed_bytes_per_tile(self):
+        return sum(b.tile_bytes for b in self.fold_read_buffers)
+    
+    @property
+    def stream_compute_cover(self):
+        return (self.effective_tile_work / Max(1, self.streamed_bytes_per_tile)) / self.ridge
+
+    @property
     def traffic_time(self):
         return self.effective_traffic / self.effective_bandwidth
 
     @property
     def mma_efficiency(self):
         return self.total_work / self.effective_total_work
-
-    @property
-    def mma_penalty(self):
-        return 1 / self.mma_efficiency
 
     @property
     def tile_work(self):
@@ -284,7 +369,9 @@ class BaseSpec[D: Dim]:
 
     @property
     def estimated_time(self):
-        return Max(self.compute_time, self.traffic_time)
+        nonh_time = (self.nonhiding_traffic + self.contention + self.atomic_add_penalty) / self.effective_bandwidth
+        stream_time = self.streamed_traffic / self.effective_bandwidth
+        return nonh_time + stream_time + Max(0, self.compute_time - stream_time * self.pipeline_factor)
 
     @property
     def ridge(self):
@@ -297,6 +384,10 @@ class BaseSpec[D: Dim]:
     @property
     def resident_programs_per_sm(self):
         return Min(self.MAX_PROGRAMS_PER_SM, self.SMEM_PER_SM // self.residency_bytes)
+
+    @property
+    def smem_budget(self):
+        return self.SMEM_PER_SM / self.resident_programs_per_sm
 
     @property
     def active_programs(self):
