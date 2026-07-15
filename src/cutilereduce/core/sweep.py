@@ -60,10 +60,8 @@ def pareto_mask(metrics):
 class Sweep:
     attributes: list[str]
     filters: list[pl.Expr]
-    #paretos: list[pl.Expr]
-    #sort: list[pl.Expr]
-    key: pl.Expr
-    top_k: int
+    key: pl.Expr | str
+    top_group: int
     threshold: float
 
     default: ClassVar[Sweep]
@@ -74,38 +72,27 @@ class Sweep:
     def add_filters(self, *filters):
         return replace(self, filters=self.filters + list(filters))
 
-    def add_paretos(self, *paretos):
-        return replace(self, paretos=self.paretos + list(paretos))
-
-    def add_sorts(self, *sorts):
-        return replace(self, sorts=self.sorts + list(sorts))
-
-
     def filter(self, df):
         if self.filters:
             return df.filter(self.filters)
         else:
             return df
 
-    def pareto(self, df):
-        if self.paretos:
-            mask = pareto_mask(df.select(*self.paretos).cast(pl.Float64).to_numpy())
-            return df.filter(mask)
+    @property
+    def key_expr(self):
+        if isinstance(self.key, pl.Expr):
+            return self.key
         else:
-            return df
-
-    def pareto_combine(self, a, b=None):
-        if b is None:
-            return a
-        else:
-            return self.pareto(pl.concat((a, b)))
+            return pl.col(self.key)
 
     def sort_combine(self, a, b=None):
         if b is None:
-            ab = a.sort(self.key).head(self.top_k)
+            ab = a
         else:
-            ab = pl.concat((a, b)).sort(self.key).head(self.top_k)
-        ab = ab.filter(pl.col(self.key) < pl.col(self.key).min() * self.threshold)
+            ab = pl.concat((a, b))
+        ab = ab.select(pl.all().top_k_by(self.key_expr, k=self.top_group, reverse=True).over('cfg:group', mapping_strategy='explode'))
+        ab = ab.filter(self.key_expr < self.key_expr.min() * self.threshold)
+        ab = ab.sort(self.key_expr)
         return ab
             
 
@@ -113,7 +100,6 @@ class Sweep:
         frontier = None
         for df in estimator.chunked_eval(self.attributes, *estimator.generate_configs()):
             df = self.filter(df)
-            #df = self.pareto(df)
             frontier = self.sort_combine(df, frontier)
         return frontier
 
@@ -138,12 +124,8 @@ Sweep.default = Sweep(
                 pl.when(pl.col('cfg:phase') == 'forward').then(pl.col('groups') == 1).otherwise(pl.col('groups') >= 1),
                 ],
             key = 'estimated_time',
-            top_k = 100,
-            threshold= 3,
-            #paretos = [
-            #    'compute_time', 'traffic_time',
-            #    ],
-            #sort = ['estimated_time', pl.col('SM_utilization').neg(), 'contention', 'residency_bytes', pl.col('effective_tile_work').neg()]
+            top_group = 20,
+            threshold= 10,
             )
 
 
@@ -248,7 +230,7 @@ class Estimator:
         for g in i2g:
             yield from chunk_inner(g)
 
-    def generate_configs(self, max_tile=1024, max_groups=16):
+    def generate_configs(self, max_tile=1024, max_groups=4):
         groups = {}
         for k in self.meta.contention_dims:
             groups[k] = list(range(1, max_groups + 1))

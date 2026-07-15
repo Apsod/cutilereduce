@@ -133,10 +133,10 @@ sweep = Sweep.default.run_all(e)
 
 for (phase,), df in sweep.group_by('cfg:phase'):
     if phase == 'forward':
-        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:'))), 'estimated_time')
+        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:')), 'estimated_time'))
         fwd_confs = list(e.result2cfg(df))
     elif phase == 'backward':
-        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:'))), 'estimated_time')
+        print(df.select(pl.selectors.starts_with('cfg:').name.map(lambda c: c.removeprefix('cfg:')), 'estimated_time'))
         bwd_confs = list(e.result2cfg(df))
 
 #print(fwd_conf)

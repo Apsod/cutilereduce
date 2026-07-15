@@ -276,7 +276,7 @@ class BaseSpec[D: Dim]:
     @property
     def pipeline_stage_capacity(self):
         spare = self.SMEM_PER_SM - self.resident_programs_per_sm * self.residency_bytes
-        denom = self.resident_programs_per_sm * self.pipeline_bytes
+        denom = self.resident_programs_per_sm * Max(1, self.pipeline_bytes)
         slack = spare / denom
         return Piecewise(
                 (0, self.pipeline_bytes <= 0),
@@ -320,7 +320,7 @@ class BaseSpec[D: Dim]:
         traffic = 0
         traffic += self.READ * sum(b.accessed_bytes for b in self.batch_read_buffers)
         traffic += self.WRITE * sum(b.accessed_bytes for b in self.write_buffers)
-        traffic += self.contention
+        #traffic += self.contention
         return traffic
 
     @property
@@ -369,7 +369,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def estimated_time(self):
-        nonh_time = (self.nonhiding_traffic + self.contention + self.atomic_add_penalty) / self.effective_bandwidth
+        nonh_time = self.nonhiding_traffic / self.effective_bandwidth
         stream_time = self.streamed_traffic / self.effective_bandwidth
         return nonh_time + stream_time + Max(0, self.compute_time - stream_time * self.pipeline_factor)
 

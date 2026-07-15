@@ -306,3 +306,22 @@ class ConcreteGrid(BaseGrid[ConcreteDim]):
     @property
     def tasks(self) -> int:
         return prod(self.task_grid)
+    
+    @property
+    def pretty(self):
+        rows = []
+        rows.append([f'{d!s}' for d in self.dims])
+        rows.append(['!' if d.grouped else '' for d in self.dims])
+        rows.append([f'{d.total_var}' for d in self.dims])
+        rows.append([f'{d.tile_exp}' for d in self.dims])
+        rows.append([f'{d.span_exp}' for d in self.dims])
+        rows.append([f'{n}' for n in self.task_grid])
+
+        size = max(len(x) for xs in rows for x in xs)
+
+        rownames = ['dims', 'group', 'total', 'tile', 'span', 'tasks']
+        
+        lines = ['GRID']
+        for row, name in zip(rows, rownames):
+            lines.append(f'{name:<7}' + 'x'.join(f'{c:^{size+2}}' for c in row))
+        return '\n'.join(lines)

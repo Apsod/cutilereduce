@@ -348,11 +348,6 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     store_output = make_buffer_helper(spec.output_buffers)['store']
     init_execution = make_buffer_helper(spec.execution_buffers)['init']
 
-    #print('FWD')
-    #print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
-    #print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
-    #print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
-    #print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
 
     @ct.function
     def load_map_reduce(tid, batch_tiles, fold_view):
@@ -385,30 +380,25 @@ def mk_bwd_kernel(spec, map_finalize, embed):
 
     load_order = tuple(spec.input_buffers.index(b) for b in  spec.batch_input_buffers + spec.fold_input_buffers)
     inv_load_order = inverse_p(load_order)
+
     grad_batch_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.batch_grad_buffers)
     grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
     grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
     inv_grad_order = inverse_p(grad_order)
-    #print('BWD')
-    #print('dims', 'x'.join(f'{d!s:^6}' for d in spec.grid.dims))
-    #print('size', 'x'.join(f'{d.total_var:^6}' for d in spec.grid.dims))
-    #print('tile', 'x'.join(f'{d.tile_exp:^6}' for d in spec.grid.dims))
-    #print('grid', 'x'.join(f'{d.num_programs:^6}' for d in spec.grid.dims))
-    #print('GRAD LOAD STUFF')
-    #print(inv_grad_order)
-    #print(' '.join([(spec.batch_grad_buffers + spec.fold_grad_buffers)[i].name for i in inv_grad_order]))
-    #print(' '.join([spec.grad_buffers[i].name for i in grad_batch_buffer_index]), ',', ' '.join([spec.grad_buffers[i].name for i in grad_fold_buffer_index]))
-    #print('INPUT LOAD STUFF')
-    #print(inv_load_order)
-    #print(' '.join([(spec.batch_input_buffers + spec.fold_input_buffers)[i].name for i in inv_load_order]))
 
-
+    output_batch_buffer_index = tuple(spec.output_buffers.index(b) for b in spec.batch_output_buffers)
+    output_fold_buffer_index = tuple(spec.output_buffers.index(b) for b in spec.fold_output_buffers)
+    out_order = output_batch_buffer_index + output_fold_buffer_index 
+    inv_out_order = inverse_p(out_order)
 
     load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
     view_batch_grad, init_batch_grad, store_batch_grad = make_buffer_helper(spec.batch_grad_buffers)['view', 'init', 'store']
-    load_output = make_buffer_helper(spec.output_buffers)['load']
+    load_batch_output = make_buffer_helper(spec.batch_output_buffers)['load']
+    view_fold_output = make_buffer_helper(spec.fold_output_buffers)['view']
     view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
     view_fold_grad, init_fold_grad = make_buffer_helper(spec.fold_grad_buffers)['view', 'init']
+
+    loop_embed = len(spec.fold_output_buffers) > 0
 
     @ct.function
     def load_map_finalize(tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads):
@@ -421,65 +411,53 @@ def mk_bwd_kernel(spec, map_finalize, embed):
         return retile(grads, grad_batch_buffer_index), retile(grads, grad_fold_buffer_index)
 
     @ct.function
-    def load_embed(tid, output_buffers, grad_buffers):
-        out_tile = load_output(tid, output_buffers)
-        grad_tile = load_output(tid, grad_buffers)
+    def load_embed(tid, batch_out_tiles, fold_out_view, batch_out_grad_tiles, fold_out_grad_view):
+        fold_out_tiles = fold_out_view.load(tid)
+        out_tile = retile(batch_out_tiles + fold_out_tiles, inv_out_order)
+        fold_out_grad_tiles = fold_out_grad_view.load(tid)
+        grad_tile = retile(batch_out_grad_tiles + fold_out_grad_tiles, inv_out_order)
         return embed(*out_tile, *grad_tile)
 
-    if spec.groups == 1:
+    @ct.kernel
+    def bwd(batch_buffers, fold_buffers, 
+            batch_grad_buffers, fold_grad_buffers, 
+            batch_output_buffers, fold_output_buffers, 
+            batch_output_grad_buffers, fold_output_grad_buffers):
+        tid = init()
+        
+        batch_tiles = load_batch(tid, batch_buffers)
+        batch_out_tiles = load_batch_output(tid, batch_output_buffers)
+        batch_out_grad_tiles = load_batch_output(tid, batch_output_grad_buffers)
 
-        @ct.kernel
-        def bwd(batch_buffers, fold_buffers, batch_grad_buffers, fold_grad_buffers, output_buffers, grad_buffers):
-            tid = init()
-            
-            batch_tiles = load_batch(tid, batch_buffers)
-            
+        fold_view = view_fold(fold_buffers)
+        fold_grad_view = view_fold_grad(fold_grad_buffers)
+        fold_out_view = view_fold_output(fold_output_buffers)
+        fold_out_grad_view = view_fold_output(fold_output_grad_buffers)
 
-            fold_view = view_fold(fold_buffers)
-            fold_grad_view = view_fold_grad(fold_grad_buffers)
+        batch_grads = init_batch_grad()
 
-            batch_grads = init_batch_grad()
+        offset, extra = offset_and_extra(tid)
 
-            for i in range(gsize):
-                i_tid = set_gix(tid, i)
-                g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
-                fold_grads = init_fold_grad()
-                batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
-                fold_grad_view.store_add(i_tid, fold_grads)
-            
-            view_batch_grad(batch_grad_buffers).store_add(tid, batch_grads)
+        if not loop_embed:
+            g_embedded = load_embed(tid, batch_out_tiles, fold_out_view, batch_out_grad_tiles, fold_out_grad_view)
 
-    elif spec.groups >= 1:
+        for i in range(gsize):
+            i_tid = set_gix(tid, i+offset)
+            if loop_embed:
+                g_embedded = load_embed(i_tid, batch_out_tiles, fold_out_view, batch_out_grad_tiles, fold_out_grad_view)
+            fold_grads = init_fold_grad()
+            batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
+            fold_grad_view.store_add(i_tid, fold_grads)
+        
+        if extra:
+            i_tid = set_gix(tid, gsize+offset)
+            if loop_embed:
+                g_embedded = load_embed(i_tid, batch_out_tiles, fold_out_view, batch_out_grad_tiles, fold_out_grad_view)
+            fold_grads = init_fold_grad()
+            batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
+            fold_grad_view.store_add(i_tid, fold_grads)
 
-        @ct.kernel
-        def bwd(batch_buffers, fold_buffers, batch_grad_buffers, fold_grad_buffers, output_buffers, grad_buffers):
-            tid = init()
-            
-            batch_tiles = load_batch(tid, batch_buffers)
-            
-
-            fold_view = view_fold(fold_buffers)
-            fold_grad_view = view_fold_grad(fold_grad_buffers)
-
-            batch_grads = init_batch_grad()
-
-            offset, extra = offset_and_extra(tid)
-
-            for i in range(gsize):
-                i_tid = set_gix(tid, i+offset)
-                g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
-                fold_grads = init_fold_grad()
-                batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
-                fold_grad_view.store_add(i_tid, fold_grads)
-
-            if extra:
-                i_tid = set_gix(tid, gsize+offset)
-                g_embedded = load_embed(i_tid, output_buffers, grad_buffers)
-                fold_grads = init_fold_grad()
-                batch_grads, fold_grads = load_map_finalize(i_tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads)
-                fold_grad_view.store_add(i_tid, fold_grads)
-            
-            view_batch_grad(batch_grad_buffers).store_add(tid, batch_grads)
+        view_batch_grad(batch_grad_buffers).store_add(tid, batch_grads)
 
     return bwd
 
@@ -495,10 +473,20 @@ def mk_autograd(
         mock_input=None,
         mock_output=None,):
 
-    def batch_fold_split(spec, inputs):
+    def batch_fold_split_input(spec, inputs):
         batch = []
         fold = []
         for b, array in zip(spec.input_buffers, inputs):
+            if b.is_grouped:
+                fold.append(array)
+            else:
+                batch.append(array)
+        return tuple(batch), tuple(fold)
+
+    def batch_fold_split_output(spec, output):
+        batch = []
+        fold = []
+        for b, array in zip(spec.output_buffers, output):
             if b.is_grouped:
                 fold.append(array)
             else:
@@ -534,15 +522,15 @@ def mk_autograd(
     def args_fn(spec):
         match spec.phase:
             case Phase.fwd:
-                batch, fold = batch_fold_split(spec, mock_input)
+                batch, fold = batch_fold_split_input(spec, mock_input)
                 output = tuple(b.empty('cuda') for b in spec.output_buffers)
                 return (batch, fold, output)
             case Phase.bwd:
-                batch, fold = batch_fold_split(spec, mock_input)
+                batch_in, fold_in = batch_fold_split_input(spec, mock_input)
                 _, batch_grad, fold_grad = mk_ret_batch_fold_grads(spec)
-                output = mock_output
-                grad_output = mock_grad_output
-                return (batch, fold, batch_grad, fold_grad, output, grad_output)
+                batch_out, fold_out = batch_fold_split_output(spec, mock_output)
+                batch_out_grad, fold_out_grad = batch_fold_split_output(spec, mock_grad_output)
+                return (batch_in, fold_in, batch_grad, fold_grad, batch_out, fold_out, batch_out_grad, fold_out_grad)
 
     if isinstance(fwd_spec, list):
         measurements = exhaustive_search(
@@ -553,19 +541,23 @@ def mk_autograd(
                 args_fn = args_fn,
                 )
         fwd_spec = measurements.best.config
+        print(f'failures: {len(measurements.failures)}')
+        print(f'successes: {len(measurements.successes)}')
         print(replace(measurements.best, config = measurements.best.config.grid.config))
+    print(fwd_spec.grid.pretty)
 
     fwd_kernel = kernel_fn(fwd_spec) #mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
 
     def fwd_f(*inputs):
-        batch, fold, output = args_fn(fwd_spec)
+        batch, fold = batch_fold_split_input(fwd_spec, inputs)
+        output = tuple(b.empty('cuda') for b in fwd_spec.output_buffers)
         stream = torch.cuda.current_stream()
         grid = grid_fn(fwd_spec)
         args = (batch, fold, output)
         ct.launch(stream, grid, fwd_kernel, args)
         return output
 
-    mock_output = fwd_f(*args_fn(fwd_spec))
+    mock_output = fwd_f(*mock_input)
     mock_grad_output = tuple(b.new_empty(b.shape).normal_() for b in mock_output)
 
     if isinstance(bwd_spec, list):
@@ -577,7 +569,10 @@ def mk_autograd(
                 args_fn = args_fn,
                 )
         bwd_spec = measurements.best.config
+        print(f'failures: {len(measurements.failures)}')
+        print(f'successes: {len(measurements.successes)}')
         print(replace(measurements.best, config = measurements.best.config.grid.config))
+    print(bwd_spec.grid.pretty)
 
     bwd_kernel = kernel_fn(bwd_spec)
 
@@ -598,12 +593,14 @@ def mk_autograd(
             inputs = saved[:num_inputs]
             outputs = saved[num_inputs:]
 
-            batch, fold = batch_fold_split(bwd_spec, inputs)
+            batch_in, fold_in = batch_fold_split_input(bwd_spec, inputs)
             grad_storage, batch_grads, fold_grads = mk_ret_batch_fold_grads(bwd_spec)
+            batch_out, fold_out = batch_fold_split_output(bwd_spec, outputs)
+            batch_out_grad, fold_out_grad = batch_fold_split_output(bwd_spec, grad_outputs)
 
             stream = torch.cuda.current_stream()
             launch_grid = grid_fn(bwd_spec)
-            args = (batch, fold, batch_grads, fold_grads, outputs, grad_outputs)
+            args = (batch_in, fold_in, batch_grads, fold_grads, batch_out, fold_out, batch_out_grad, fold_out_grad)
 
             ct.launch(stream, launch_grid, bwd_kernel, args)
             return grad_storage
