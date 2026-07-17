@@ -182,39 +182,6 @@ def map_reduce(tile, query, key, value):
             )
 
 @ct.function
-def map_reduce_combine(tile, query, key, value, acc_m, acc_e, acc_u):
-    """
-    query: h l g dqk
-    key: h r dqk
-    value: h r dv
-    """
-
-    L, G, H, R, DV, DQK = tile.shape('l', 'g', 'h', 'r', 'dv', 'dqk')
-    
-    # logits: h (l g) r
-    logits = map(tile, query, key) * LOG2E
-
-    loc_m = ct.max(logits, 2).reshape((H, L, G)) # H L G 
-    key = acc_m > loc_m
-
-    acc_m = tl.where(key, acc_m, loc_m)
-
-    scaling = tl.where(key, 1, ct.exp2(loc_m - acc_m))
-    
-    logits = ct.exp2(logits - acc_m.reshape((H, L*G, 1)))
-
-    acc_e = acc_e * scaling + ct.sum(logits, 2).reshape((H, L, G)) # H LG
-
-    acc_u = scaling[:,:,:, None] * acc_u
-    acc_u = ct.mma(logits.astype(ct.bfloat16), value, acc_u.reshape((H, L*G, DV))).reshape((H, L, G, DV))
-
-    return (
-            acc_m,
-            acc_e,
-            acc_u,
-            )
-
-@ct.function
 def combine(am, ae, au, bm, be, bu):
     key = am > bm
     
@@ -261,6 +228,7 @@ for (phase,), df in sweep.group_by('cfg:phase'):
 
 fwd_specs = [attention.concretize(conf) for conf in fwd_confs]
 bwd_specs = [attention.concretize(conf) for conf in bwd_confs]
+print(fwd_specs[0].eval('resident_programs_per_sm'))
 
 query, key, value = [b.empty('cuda') for b in fwd_specs[0].input.values()]
 
@@ -320,9 +288,11 @@ mock.normal_()
 def cutile_pass(query, key, value):
     (f(query, key, value) * mock).sum().backward()
 
-def pytorch_pass(ctx, trg, targets):
+def sdpa_pass(ctx, trg, targets):
     (sdpa(ctx, trg, targets) * mock).sum().backward()
 
+def naive_pass(ctx, trg, targets):
+    (naive(ctx, trg, targets) * mock).sum().backward()
 
 print('cutile - sdpa ', (a - c).abs().mean().item())
 print('cutile - naive', (a - b).abs().mean().item())
@@ -365,11 +335,19 @@ cutile = benchmark.Timer(
         num_threads=1
 )
 
-pytorch_fwd_bwd = benchmark.Timer(
-        stmt='pytorch_pass(query, key, value)',
-        setup='pytorch_pass(query, key, value)',
-        globals = {'pytorch_pass': pytorch_pass, **args},
-        label = 'attention fwd-bwd', sub_label='pytorch', description='',
+sdpa_fwd_bwd = benchmark.Timer(
+        stmt='sdpa_pass(query, key, value)',
+        setup='sdpa_pass(query, key, value)',
+        globals = {'sdpa_pass': sdpa_pass, **args},
+        label = 'attention fwd-bwd', sub_label='pytorch sdpa', description='',
+        num_threads=1
+        )
+
+naive_fwd_bwd = benchmark.Timer(
+        stmt='naive_pass(query, key, value)',
+        setup='naive_pass(query, key, value)',
+        globals = {'naive_pass': naive_pass, **args},
+        label = 'attention fwd-bwd', sub_label='pytorch naive', description='',
         num_threads=1
         )
 
@@ -386,6 +364,7 @@ results.append(cutile.blocked_autorange(min_run_time=5))
 results.append(pytorch_naive.blocked_autorange(min_run_time=5))
 results.append(pytorch_sdpa.blocked_autorange(min_run_time=5))
 results.append(cutile_fwd_bwd.blocked_autorange(min_run_time=5))
-results.append(pytorch_fwd_bwd.blocked_autorange(min_run_time=5))
+results.append(naive_fwd_bwd.blocked_autorange(min_run_time=5))
+results.append(sdpa_fwd_bwd.blocked_autorange(min_run_time=5))
 comparison = benchmark.Compare(results)
 comparison.print()

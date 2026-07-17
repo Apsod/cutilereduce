@@ -7,7 +7,6 @@ from typing import Self, Any
 
 import torch
 
-from .base import Phase
 from .grid import BaseDims, Dims, D, Dim, BoundGrid, ConcreteDim, ConcreteGrid
 from .typestuff import DType, to_torch_dtype
 import cuda.tile as ct

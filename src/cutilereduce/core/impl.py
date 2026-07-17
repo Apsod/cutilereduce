@@ -152,7 +152,7 @@ class BufferInfo:
     padding_mode: ct.Constant[ct.PaddingMode]
     default: ct.Constant[Any]
     dtype: ct.Constant[ct.DType]
-    multiplicity: ct.Constnat[int]
+    multiplicity: ct.Constant[int]
 
     def __getitem__(self, key):
         if isinstance(key, tuple):
@@ -242,12 +242,17 @@ class Bundle:
         else:
             return getattr(self, key)
 
-def make_grid_helper(grid):
+def make_grid_helper(spec):
+    grid = spec.grid
     gix = grid.group_dim.grid_index
     groups = grid.group_dim.num_programs
     base = grid.group_dim.num_tiles // groups
     rem = grid.group_dim.num_tiles % groups
     size = len(grid.task_grid)
+    layout = spec.heuristic_layout
+
+    layout_order = tuple(d.grid_index for d in layout)
+    inv_layout_order = inverse_p(layout_order)
 
     assert base >= 1
 
@@ -303,11 +308,11 @@ def make_grid_helper(grid):
     def _init():
         pid = ct.bid(0)
         tid = ()
-        for s in ct.static_iter(grid.task_grid):
+        for s in ct.static_iter(d.num_programs for d in layout):
             lid = pid % s
             tid += (lid,)
             pid = pid // s
-        return tid
+        return retile(tid, inv_layout_order)
 
     @ct.function
     def _group_offset_and_extra(tid):
@@ -338,7 +343,7 @@ def make_grid_helper(grid):
 def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     assert spec.phase == Phase.fwd
     assert spec.groups == 1
-    gsize, init, set_gix, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'tid_info']
+    gsize, init, set_gix, tid_info = make_grid_helper(spec)['group_size', 'init', 'set_gix', 'tid_info']
 
     load_order = tuple(b.program_index for b in spec.batch_read_buffers + spec.fold_read_buffers)
     inv_load_order = inverse_p(load_order)
@@ -376,7 +381,7 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
 def mk_bwd_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
     
-    gsize, init, set_gix, offset_and_extra, tid_info = make_grid_helper(spec.grid)['group_size', 'init', 'set_gix', 'offset_and_extra', 'tid_info']
+    gsize, init, set_gix, offset_and_extra, tid_info = make_grid_helper(spec)['group_size', 'init', 'set_gix', 'offset_and_extra', 'tid_info']
 
     load_order = tuple(spec.input_buffers.index(b) for b in  spec.batch_input_buffers + spec.fold_input_buffers)
     inv_load_order = inverse_p(load_order)
@@ -511,7 +516,7 @@ def mk_autograd(
 
     def grid_fn(spec):
         return (spec.grid.tasks, 1, 1)
-
+    
     def kernel_fn(spec):
         match spec.phase:
             case Phase.fwd:
@@ -532,20 +537,24 @@ def mk_autograd(
                 batch_out_grad, fold_out_grad = batch_fold_split_output(spec, mock_grad_output)
                 return (batch_in, fold_in, batch_grad, fold_grad, batch_out, fold_out, batch_out_grad, fold_out_grad)
 
-    if isinstance(fwd_spec, list):
-        measurements = exhaustive_search(
-                fwd_spec,
-                torch.cuda.current_stream(),
-                grid_fn = grid_fn,
-                kernel_fn = kernel_fn,
-                args_fn = args_fn,
-                )
-        fwd_spec = measurements.best.config
-        print(f'failures: {len(measurements.failures)}')
-        print(f'successes: {len(measurements.successes)}')
-        print(replace(measurements.best, config = measurements.best.config.grid.config))
-    print(fwd_spec.grid.pretty)
-
+    def tune(spec):
+        if isinstance(spec, list):
+            measurements = exhaustive_search(
+                    spec,
+                    torch.cuda.current_stream(),
+                    grid_fn = grid_fn,
+                    kernel_fn = kernel_fn,
+                    args_fn = args_fn,
+                    )
+            spec = measurements.best.config
+            print(f'failures: {len(measurements.failures)}')
+            print(f'successes: {len(measurements.successes)}')
+            print(replace(measurements.best, config = 'see below'))
+            print(f'layout: {" ".join(str(d) for d in spec.heuristic_layout)}')
+        print(spec.grid.pretty)
+        return spec
+    
+    fwd_spec = tune(fwd_spec)
     fwd_kernel = kernel_fn(fwd_spec) #mk_fwd_no_group_kernel(fwd_spec, map_reduce, combine, to_semantic)
 
     def fwd_f(*inputs):
@@ -560,20 +569,7 @@ def mk_autograd(
     mock_output = fwd_f(*mock_input)
     mock_grad_output = tuple(b.new_empty(b.shape).normal_() for b in mock_output)
 
-    if isinstance(bwd_spec, list):
-        measurements = exhaustive_search(
-                bwd_spec,
-                torch.cuda.current_stream(),
-                grid_fn = grid_fn,
-                kernel_fn = kernel_fn,
-                args_fn = args_fn,
-                )
-        bwd_spec = measurements.best.config
-        print(f'failures: {len(measurements.failures)}')
-        print(f'successes: {len(measurements.successes)}')
-        print(replace(measurements.best, config = measurements.best.config.grid.config))
-    print(bwd_spec.grid.pretty)
-
+    bwd_spec = tune(bwd_spec)
     bwd_kernel = kernel_fn(bwd_spec)
 
     num_inputs = len(fwd_spec.input_buffers)

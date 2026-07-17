@@ -106,14 +106,6 @@ class BaseSpec[D: Dim]:
         return buffers
 
     @property
-    def batch_read_buffers(self):
-        return tuple(b for b in self.read_buffers if self.group_dim in b.absent)
-
-    @property
-    def fold_read_buffers(self):
-        return tuple(b for b in self.read_buffers if self.group_dim in b.dims)
-
-    @property
     def write_buffers(self):
         buffers = ()
         match self.phase:
@@ -617,3 +609,19 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
             return self._eval(value)
         else:
             return value
+
+    @property
+    def heuristic_layout(self):
+        read = {}
+        write = {}
+        for d in self.grid.outer:
+            read[d] = sum(b.accessed_bytes for b in self.read_buffers if d in b.absent)
+            write[d] = sum(b.accessed_bytes for b in self.write_buffers if d in b.absent and b.residual_multiplicity > 1)
+        alpha = 0.5
+        return tuple((*sorted(self.grid.outer, key=lambda d: read[d] - alpha * write[d]), *self.grid.inner))
+        #alphas = [0.5]
+        #for alpha in alphas:
+        #    optimals.add(tuple(str(d) for d in sorted(self.grid.outer, key=lambda d: read[d] - write[d]*alpha)))
+        #return optimals
+
+

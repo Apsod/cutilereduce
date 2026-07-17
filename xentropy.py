@@ -146,6 +146,7 @@ for (phase,), df in sweep.group_by('cfg:phase'):
 fwd_specs = [xentropy.concretize(conf) for conf in fwd_confs]
 bwd_specs = [xentropy.concretize(conf) for conf in bwd_confs]
 
+print(*(str(d) for d in fwd_specs[0].heuristic_layout))
 
 ctx, trg, targets = [b.empty('cuda') for b in fwd_specs[0].input.values()]
 with torch.no_grad():

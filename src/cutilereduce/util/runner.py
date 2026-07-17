@@ -1,4 +1,3 @@
-import torch
 
 def run_grad(*args, **functions):
     ret = {}
