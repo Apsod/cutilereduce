@@ -125,7 +125,7 @@ class BaseSpec[D: Dim]:
             bundle.check()
 
     @property
-    def loop_buffers(self):
+    def state(self):
         match self.phase:
             case Phase.fwd:
                 return self.execution
@@ -134,7 +134,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def streamed_resident_buffers(self):
-        buffers = self.input.fold + self.loop_buffers.fold
+        buffers = self.input.fold + self.state.fold
         match self.phase:
             case Phase.bwd:
                 buffers += self.grad.fold
@@ -142,7 +142,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def persistent_resident_buffers(self):
-        buffers = self.input.batch + self.loop_buffers.batch + self.intermediate
+        buffers = self.input.batch + self.state.batch + self.intermediate
         match self.phase:
             case Phase.bwd:
                 buffers += self.grad.batch
@@ -166,14 +166,6 @@ class BaseSpec[D: Dim]:
         active_writers_per_tile = self.active_programs / b.target_tiles
         active_multiplicity = Min(writers_per_tile, Max(1, active_writers_per_tile))
         return b.accessed_bytes * self.C(active_multiplicity)
-
-    def buffer_traffic(self, b):
-        kind = 0
-        if b.is_write(self.phase):
-            kind += self.WRITE
-        if b.is_read(self.phase):
-            kind += self.READ
-        return kind * b.accessed_bytes
 
     @property
     def atomic_add_penalty(self):
@@ -200,7 +192,7 @@ class BaseSpec[D: Dim]:
 
     @property
     def effective_traffic(self):
-        return self.traffic + self.atomic_add_penalty #+ self.contention
+        return self.traffic + self.atomic_add_penalty + self.contention
 
     @property
     def residency_bytes(self):

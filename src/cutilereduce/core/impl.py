@@ -345,7 +345,7 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     assert spec.groups == 1
     gsize, init, set_gix, tid_info = make_grid_helper(spec)['group_size', 'init', 'set_gix', 'tid_info']
 
-    load_order = tuple(spec.input.index(b) for b in spec.input.batch + spec.input.fold)
+    load_order = spec.input.load_order.total
     inv_load_order = inverse_p(load_order)
 
     load_batch = make_buffer_helper(spec.input.batch)['load']
@@ -382,19 +382,15 @@ def mk_bwd_kernel(spec, map_finalize, embed):
     assert spec.phase == Phase.bwd
     
     gsize, init, set_gix, offset_and_extra, tid_info = make_grid_helper(spec)['group_size', 'init', 'set_gix', 'offset_and_extra', 'tid_info']
+    
+    inv_load_order = inverse_p(spec.input.load_order.total)
 
-    load_order = tuple(spec.input.index(b) for b in  spec.input.batch + spec.input.fold)
-    inv_load_order = inverse_p(load_order)
+    _grad_order = spec.grad.load_order
+    grad_batch_buffer_index = _grad_order.batch
+    grad_fold_buffer_index = _grad_order.fold
+    inv_grad_order = inverse_p(_grad_order.total)
 
-    grad_batch_buffer_index = tuple(spec.grad.index(b) for b in spec.grad.batch)
-    grad_fold_buffer_index = tuple(spec.grad.index(b) for b in spec.grad.fold)
-    grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
-    inv_grad_order = inverse_p(grad_order)
-
-    output_batch_buffer_index = tuple(spec.output.index(b) for b in spec.output.batch)
-    output_fold_buffer_index = tuple(spec.output.index(b) for b in spec.output.fold)
-    out_order = output_batch_buffer_index + output_fold_buffer_index 
-    inv_out_order = inverse_p(out_order)
+    inv_out_order = inverse_p(spec.output.load_order.total)
 
     load_batch = make_buffer_helper(spec.input.batch)['load']
     view_batch_grad, init_batch_grad, store_batch_grad = make_buffer_helper(spec.input.batch.grad)['view', 'init', 'store']

@@ -4,6 +4,7 @@ from enum import Enum
 from fractions import Fraction
 from copy import replace
 from typing import Self, Any
+from types import SimpleNamespace
 
 import torch
 
@@ -166,21 +167,6 @@ class BaseBuffer[D: Dim]:
     def target_tiles(self):
         return self.spec.total_prod / self.spec.span_prod
 
-
-
-
-
-
-    #def is_write(self, phase):
-    #    match phase:
-    #        case Phase.fwd: return self.is_output              # noqa: E701
-    #        case Phase.bwd: return self.req_grad               # noqa: E701
-
-    #def is_read(self, phase):
-    #    match phase:
-    #        case Phase.fwd: return self.is_input                     # noqa: E701
-    #        case Phase.bwd: return self.is_input | self.is_output    # noqa: E701
-
     @property
     def numel(self):
         return self.spec.total_prod
@@ -217,6 +203,12 @@ class BaseBuffer[D: Dim]:
     def grad_buffer(self):
         assert self.req_grad
         return replace(self, dtype=ct.float32)
+
+    @property
+    def checkpoint_buffer(self):
+        assert not self.in_loop
+        checkpoint_spec = self.grid.CTYPE((self.grid.group_dim, *self.spec))
+        return replace(self, spec=checkpoint_spec)
 
 @dataclass(frozen=True)
 class BoundBuffer(BaseBuffer[Dim]):
@@ -273,8 +265,15 @@ class BufferBundle[D: Dim]:
 
     @property
     def grad(self):
+        assert all(b.is_input for b in self.values)
         return BufferBundle(tuple(
             b.grad_buffer for b in self.values if b.req_grad
+        ))
+
+    @property
+    def checkpoint(self):
+        return BufferBundle(tuple(
+            b.checkpoint_buffer for b in self.values
         ))
     
     @property
@@ -288,6 +287,12 @@ class BufferBundle[D: Dim]:
         return BufferBundle(tuple(
             b for b in self.values if b.in_loop
         ))
+    
+    @property
+    def load_order(self):
+        batch_order = tuple(self.index(b) for b in self.batch)
+        fold_order = tuple(self.index(b) for b in self.fold)
+        return SimpleNamespace(total=batch_order+fold_order, batch=batch_order, fold=fold_order)
 
     def without(self, d):
         return BufferBundle(tuple(
