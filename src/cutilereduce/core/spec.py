@@ -4,11 +4,10 @@ from copy import replace
 import sympy
 from sympy import Max, Min, Piecewise
 
-import cuda.tile as ct
 
 from .base import Phase
 from .grid import BaseGrid, Dims, Grid, Dim, ConcreteDim
-from .buffer import BaseBuffer, Buffer, BufferRole
+from .buffer import Buffer, BufferRole, BufferBundle
 from .work import BaseWork, Work, bind_work
 from .config import Config
 from .variables import READ, WRITE, GROUPS, PEAK_FLOPS, BANDWIDTH, FWD_CONTENTION, BWD_CONTENTION, SM_COUNT, MAX_PROGRAMS_PER_SM, SMEM_PER_SM, ATOMIC_ADD
@@ -16,11 +15,11 @@ from .variables import READ, WRITE, GROUPS, PEAK_FLOPS, BANDWIDTH, FWD_CONTENTIO
 @dataclass(frozen=True, kw_only=True)
 class BaseSpec[D: Dim]:
     grid: BaseGrid[D]
-    input: dict[str, BaseBuffer[D]]
-    execution: dict[str, BaseBuffer[D]]
-    output: dict[str, BaseBuffer[D]]
-    grad_accumulator : dict[str, BaseBuffer[D]]
-    intermediate: tuple[BaseBuffer[D]]
+    input: BufferBundle[D]
+    execution: BufferBundle[D]
+    output: BufferBundle[D]
+    grad_accumulator : BufferBundle[D]
+    intermediate: BufferBundle[D]
     work: BaseWork[D]
     phase: Phase
 
@@ -34,11 +33,32 @@ class BaseSpec[D: Dim]:
             grad_accumulator: dict[str, Buffer],
             work: Work, 
             intermediate: list[Buffer] = None):
-        input = {k: v.generic_bind(k, i, grid, BufferRole.Input) for (i, (k, v)) in enumerate(input.items())}
-        execution = {k: v.generic_bind(k, i, grid, BufferRole.Intermediate) for (i, (k, v)) in enumerate(execution.items())}
-        output = {k: v.generic_bind(k, i, grid, BufferRole.Output) for (i, (k, v)) in enumerate(output.items())}
-        grad_accumulator = {k: v.generic_bind(k, i, grid, BufferRole.Intermediate) for (i, (k, v)) in enumerate(grad_accumulator.items())}
-        intermediate = tuple(v.generic_bind(f'intermediate:{i}', i, grid, BufferRole.Intermediate) for i, v in enumerate(intermediate))
+        input = BufferBundle(tuple(
+            v.generic_bind(k, i, grid, BufferRole.Input) 
+            for (i, (k, v)) 
+            in enumerate(input.items())
+            ))
+        execution = BufferBundle(tuple(
+            v.generic_bind(k, i, grid, BufferRole.State) 
+            for (i, (k, v)) 
+            in enumerate(execution.items())
+            ))
+        output = BufferBundle(tuple(
+            v.generic_bind(k, i, grid, BufferRole.Output) 
+            for (i, (k, v)) 
+            in enumerate(output.items())
+            ))
+        grad_accumulator = BufferBundle(tuple(
+            v.generic_bind(k, i, grid, BufferRole.State) 
+            for (i, (k, v)) 
+            in enumerate(grad_accumulator.items())
+            ))
+
+        intermediate = BufferBundle(tuple(
+            v.generic_bind(f'intermediate:{i}', i, grid, BufferRole.Intermediate)
+            for i, v 
+            in enumerate(intermediate)
+            ))
 
         return dict(
                 input=input,
@@ -49,42 +69,21 @@ class BaseSpec[D: Dim]:
                 intermediate=intermediate
                 )
 
-
     @property
-    def output_buffers(self):
-        return (*self.output.values(),)
-
-    @property
-    def input_buffers(self):
-        return (*self.input.values(),)
-
-    @property
-    def execution_buffers(self):
-        return (*self.execution.values(),)
-
-    @property
-    def grad_accumulator_buffers(self):
-        return (*self.grad_accumulator.values(),)
-
-    @property
-    def intermediate_buffers(self):
-        match self.phase:
-            case Phase.fwd:
-                return (*self.intermediate, *self.execution.values())
-            case Phase.bwd:
-                return (*self.intermediate, *self.grad_accumulator.values())
+    def group_dim(self):
+        return self.grid.group_dim
 
     @property
     def output_storage(self):
-        return sum(b.total_bytes for b in self.output_buffers)
+        return self.output.total_bytes
 
     @property
     def checkpoint_storage(self):
-        return sum((self.groups - 1) * b.total_bytes for b in self.output_buffers)
+        return self.output.total_bytes * (self.groups - 1)
 
     @property
     def input_storage(self):
-        return sum(b.total_bytes for b in self.input_buffers)
+        return self.input.total_bytes
 
     @property
     def excess_storage_ratio(self):
@@ -93,27 +92,23 @@ class BaseSpec[D: Dim]:
         return extra / base
 
     @property
-    def grad_buffers(self):
-        return tuple(replace(b, dtype=ct.float32, default=0) for b in self.input_buffers if b.req_grad)
-
+    def grad(self):
+        return self.input.grad
 
     @property
     def read_buffers(self):
-        buffers = self.input_buffers
+        read = self.input
         if self.phase == Phase.bwd:
-            buffers += self.output_buffers
-            buffers += self.output_buffers # output_grad, assumed to have same dtype as output
-        return buffers
+            read = read + self.output + self.output
+        return read
 
     @property
     def write_buffers(self):
-        buffers = ()
         match self.phase:
             case Phase.fwd:
-                buffers += self.output_buffers
+                return self.output
             case Phase.bwd:
-                buffers += self.grad_buffers
-        return buffers
+                return self.grad
 
     @property
     def mmas(self):
@@ -125,82 +120,32 @@ class BaseSpec[D: Dim]:
 
     def check(self):
         self.grid.check()
-        for b in self.intermediate:
-            b.check()
-        for bundle in (self.input, self.output, self.execution, self.grad_accumulator):
-            for b in bundle.values():
-                b.check()
-
-    @property
-    def grouped_buffers(self):
-        return tuple(b for b in self.write_buffers if self.group_dim in b.absent)
-
-    @property
-    def batch_input_buffers(self):
-        return tuple(b for b in self.input_buffers if self.group_dim in b.absent)
-
-    @property
-    def fold_input_buffers(self):
-        return tuple(b for b in self.input_buffers if self.group_dim in b.dims)
-
-    @property
-    def batch_grad_buffers(self):
-        return tuple(b for b in self.grad_buffers if self.group_dim in b.absent)
-
-    @property
-    def fold_grad_buffers(self):
-        return tuple(b for b in self.grad_buffers if self.group_dim in b.dims)
+        bundles = [self.intermediate, self.output, self.execution, self.grad_accumulator]
+        for bundle in bundles:
+            bundle.check()
 
     @property
     def loop_buffers(self):
         match self.phase:
             case Phase.fwd:
-                return self.execution_buffers
+                return self.execution
             case Phase.bwd:
-                return self.grad_accumulator_buffers
-
-    @property
-    def batch_loop_buffers(self):
-        return tuple(b for b in self.loop_buffers if self.group_dim in b.absent)
-
-    @property
-    def fold_loop_buffers(self):
-        return tuple(b for b in self.loop_buffers if self.group_dim in b.dims)
-
-    @property
-    def batch_output_buffers(self):
-        return tuple(b for b in self.output_buffers if self.group_dim in b.absent)
-
-    @property
-    def fold_output_buffers(self):
-        return tuple(b for b in self.output_buffers if self.group_dim in b.dims)
-
-    @property
-    def batch_read_buffers(self):
-        return tuple(b for b in self.read_buffers if self.group_dim in b.absent)
-
-    @property
-    def fold_read_buffers(self):
-        return tuple(b for b in self.read_buffers if self.group_dim in b.dims)
-
-    @property
-    def streamed_read_buffers(self):
-        return self.fold_read_buffers
+                return self.grad_accumulator
 
     @property
     def streamed_resident_buffers(self):
-        buffers = self.fold_input_buffers + self.fold_loop_buffers
+        buffers = self.input.fold + self.loop_buffers.fold
         match self.phase:
             case Phase.bwd:
-                buffers += self.fold_grad_buffers
+                buffers += self.grad.fold
         return buffers
 
     @property
     def persistent_resident_buffers(self):
-        buffers = self.batch_input_buffers + self.batch_loop_buffers + self.intermediate
+        buffers = self.input.batch + self.loop_buffers.batch + self.intermediate
         match self.phase:
             case Phase.bwd:
-                buffers += self.batch_grad_buffers
+                buffers += self.grad.batch
         return buffers
 
     @property
@@ -310,18 +255,18 @@ class BaseSpec[D: Dim]:
     @property
     def nonhiding_traffic(self):
         traffic = 0
-        traffic += self.READ * sum(b.accessed_bytes for b in self.batch_read_buffers)
-        traffic += self.WRITE * sum(b.accessed_bytes for b in self.write_buffers)
+        traffic += self.READ * self.read_buffers.batch.accessed_bytes
+        traffic += self.WRITE * self.write_buffers.accessed_bytes
         #traffic += self.contention
         return traffic
 
     @property
     def streamed_traffic(self):
-        return self.READ * sum(b.accessed_bytes for b in self.fold_read_buffers)
+        return self.READ * self.read_buffers.fold.accessed_bytes
 
     @property
     def streamed_bytes_per_tile(self):
-        return sum(b.tile_bytes for b in self.fold_read_buffers)
+        return self.read_buffers.fold.tile_bytes
     
     @property
     def stream_compute_cover(self):
@@ -455,8 +400,6 @@ class BaseSpec[D: Dim]:
 
 @dataclass(frozen=True, kw_only=True)
 class Spec(BaseSpec[Dim]):
-    group_dim: Dim
-
     @classmethod
     def make(cls, 
              input: dict[str, Buffer], 
@@ -476,6 +419,7 @@ class Spec(BaseSpec[Dim]):
                 output = output,
                 batch = batch,
                 fold = fold,
+                scan = Dims.empty()
                 )
 
         kwargs = cls._mkhelp(grid=grid, input=input, execution=execution, output=output, grad_accumulator=grad_accumulator, intermediate=intermediate, work=work)
@@ -483,7 +427,6 @@ class Spec(BaseSpec[Dim]):
         ret = cls(
                 grid=grid,
                 phase = Phase.fwd,
-                group_dim = grid.fold[0],
                 **kwargs
                 )
 
@@ -491,10 +434,10 @@ class Spec(BaseSpec[Dim]):
         return ret
 
     def concretize(self, config: Config):
-        input = {k: v.base for k, v in self.input.items()}
-        execution = {k: v.base for k, v in self.execution.items()}
-        output = {k: v.base for k, v in self.output.items()}
-        grad_accumulator = {k: v.base for k, v in self.grad_accumulator.items()}
+        input = self.input.base
+        execution = self.execution.base
+        output = self.output.base
+        grad_accumulator = self.grad_accumulator.base
         batch = self.grid.base.batch
         fold = self.grid.base.fold
         work = self.work.base
@@ -517,7 +460,7 @@ class Spec(BaseSpec[Dim]):
             dim = self.contention_dims[0]
         else:
             dim = self.contention_dims.get(dim)
-        return replace(self, group_dim=dim)
+        return replace(self, grid=self.grid.group(dim))
 
     @property
     def fwd(self):
@@ -577,6 +520,7 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
                 output = output,
                 batch = batch,
                 fold = fold,
+                scan = Dims.empty(),
                 config = config,
                 )
 
@@ -595,9 +539,6 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
     def _eval(self, expr):
         return self.config._eval(expr)
 
-    @property
-    def group_dim(self):
-        return self.grid.group_dim
 
     @property
     def groups(self):
@@ -615,8 +556,12 @@ class ConcreteSpec(BaseSpec[ConcreteDim]):
         read = {}
         write = {}
         for d in self.grid.outer:
-            read[d] = sum(b.accessed_bytes for b in self.read_buffers if d in b.absent)
-            write[d] = sum(b.accessed_bytes for b in self.write_buffers if d in b.absent and b.residual_multiplicity > 1)
+            read[d] = self.read_buffers.without(d).accessed_bytes
+            write[d] = (
+                self.write_buffers.without(d)
+                .filter(lambda b: b.residual_multiplicity > 1)
+                .accessed_bytes
+            )
         alpha = 0.5
         return tuple((*sorted(self.grid.outer, key=lambda d: read[d] - alpha * write[d]), *self.grid.inner))
         #alphas = [0.5]

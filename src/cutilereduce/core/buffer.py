@@ -21,6 +21,7 @@ class BufferRole(Enum):
     Input = 'input'
     Output = 'output'
     Intermediate = 'intermediate'
+    State = 'state'
 
 @dataclass(frozen=True, kw_only=True)
 class Buffer:
@@ -142,6 +143,10 @@ class BaseBuffer[D: Dim]:
         return self.contribution - self.spec
 
     @property
+    def in_loop(self):
+        return self.grid.group_dim not in self.absent
+
+    @property
     def bsize(self):
         return Fraction(self.dtype.bitwidth, 8)
 
@@ -160,6 +165,9 @@ class BaseBuffer[D: Dim]:
     @property
     def target_tiles(self):
         return self.spec.total_prod / self.spec.span_prod
+
+
+
 
 
 
@@ -229,3 +237,92 @@ class ConcreteBuffer(BaseBuffer[ConcreteDim]):
     @property
     def is_grouped(self):
         return any(d.grouped for d in self.dims)
+
+@dataclass(frozen=True)
+class BufferBundle[D: Dim]:
+    values: tuple[BaseBuffer[D], ...]
+
+    def index(self, b):
+        return self.values.index(b)
+    
+    @property
+    def base(self):
+        return {
+            b.name: b.base
+            for b
+            in self.values
+         }
+
+    def empty(self, device=None):
+        return tuple(
+                b.empty(device=device) for b in self.values
+        )
+
+    def default(self, device=None):
+        return tuple(
+                b.full(device=device) for b in self.values
+        )
+
+    def zeros(self, device=None):
+        return tuple(
+                b.zeros(device=device) for b in self.values
+        )
+
+    def __add__(self, other):
+        return BufferBundle(self.values + other.values)
+
+    @property
+    def grad(self):
+        return BufferBundle(tuple(
+            b.grad_buffer for b in self.values if b.req_grad
+        ))
+    
+    @property
+    def batch(self):
+        return BufferBundle(tuple(
+            b for b in self.values if not b.in_loop
+        ))
+
+    @property
+    def fold(self):
+        return BufferBundle(tuple(
+            b for b in self.values if b.in_loop
+        ))
+
+    def without(self, d):
+        return BufferBundle(tuple(
+            b for b in self.values if d in b.absent
+        ))
+
+    def filter(self, fun):
+        return BufferBundle(tuple(
+            b for b in self.values if fun(b)
+        ))
+
+    def check(self):
+        for b in self.values:
+            b.check()
+
+    @property
+    def total_bytes(self):
+        return sum(b.total_bytes for b in self.values)
+
+    @property
+    def tile_bytes(self):
+        return sum(b.tile_bytes for b in self.values)
+
+    @property
+    def accessed_bytes(self):
+        return sum(b.accessed_bytes for b in self.values)
+
+    def __len__(self) -> int:
+        return len(self.values)
+
+    def __contains__(self, val: T) -> bool:
+        return val in self.values
+
+    def __iter__(self):
+        return iter(self.values)
+
+
+

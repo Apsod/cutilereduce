@@ -54,6 +54,10 @@ class TupleSet[T]:
         assert len(values) == len(set(values))
         return cls(tuple(values))
 
+    @classmethod
+    def empty(cls) -> TupleSet[T]:
+        return cls(())
+
     @property
     def set(self) -> set[T]:
         return set(self.value)

@@ -345,13 +345,13 @@ def mk_fwd_no_group_kernel(spec, map_reduce, combine, to_semantic):
     assert spec.groups == 1
     gsize, init, set_gix, tid_info = make_grid_helper(spec)['group_size', 'init', 'set_gix', 'tid_info']
 
-    load_order = tuple(b.program_index for b in spec.batch_read_buffers + spec.fold_read_buffers)
+    load_order = tuple(spec.input.index(b) for b in spec.input.batch + spec.input.fold)
     inv_load_order = inverse_p(load_order)
 
-    load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
-    view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
-    store_output = make_buffer_helper(spec.output_buffers)['store']
-    init_execution = make_buffer_helper(spec.execution_buffers)['init']
+    load_batch = make_buffer_helper(spec.input.batch)['load']
+    view_fold = make_buffer_helper(spec.input.fold)['view']
+    store_output = make_buffer_helper(spec.output)['store']
+    init_execution = make_buffer_helper(spec.execution)['init']
 
 
     @ct.function
@@ -383,27 +383,29 @@ def mk_bwd_kernel(spec, map_finalize, embed):
     
     gsize, init, set_gix, offset_and_extra, tid_info = make_grid_helper(spec)['group_size', 'init', 'set_gix', 'offset_and_extra', 'tid_info']
 
-    load_order = tuple(spec.input_buffers.index(b) for b in  spec.batch_input_buffers + spec.fold_input_buffers)
+    load_order = tuple(spec.input.index(b) for b in  spec.input.batch + spec.input.fold)
     inv_load_order = inverse_p(load_order)
 
-    grad_batch_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.batch_grad_buffers)
-    grad_fold_buffer_index = tuple(spec.grad_buffers.index(b) for b in spec.fold_grad_buffers)
+    grad_batch_buffer_index = tuple(spec.grad.index(b) for b in spec.grad.batch)
+    grad_fold_buffer_index = tuple(spec.grad.index(b) for b in spec.grad.fold)
     grad_order = grad_batch_buffer_index + grad_fold_buffer_index 
     inv_grad_order = inverse_p(grad_order)
 
-    output_batch_buffer_index = tuple(spec.output_buffers.index(b) for b in spec.batch_output_buffers)
-    output_fold_buffer_index = tuple(spec.output_buffers.index(b) for b in spec.fold_output_buffers)
+    output_batch_buffer_index = tuple(spec.output.index(b) for b in spec.output.batch)
+    output_fold_buffer_index = tuple(spec.output.index(b) for b in spec.output.fold)
     out_order = output_batch_buffer_index + output_fold_buffer_index 
     inv_out_order = inverse_p(out_order)
 
-    load_batch = make_buffer_helper(spec.batch_input_buffers)['load']
-    view_batch_grad, init_batch_grad, store_batch_grad = make_buffer_helper(spec.batch_grad_buffers)['view', 'init', 'store']
-    load_batch_output = make_buffer_helper(spec.batch_output_buffers)['load']
-    view_fold_output = make_buffer_helper(spec.fold_output_buffers)['view']
-    view_fold = make_buffer_helper(spec.fold_input_buffers)['view']
-    view_fold_grad, init_fold_grad = make_buffer_helper(spec.fold_grad_buffers)['view', 'init']
+    load_batch = make_buffer_helper(spec.input.batch)['load']
+    view_batch_grad, init_batch_grad, store_batch_grad = make_buffer_helper(spec.input.batch.grad)['view', 'init', 'store']
 
-    loop_embed = len(spec.fold_output_buffers) > 0
+    view_fold = make_buffer_helper(spec.input.fold)['view']
+    view_fold_grad, init_fold_grad = make_buffer_helper(spec.input.fold.grad)['view', 'init']
+
+    load_batch_output = make_buffer_helper(spec.output.batch)['load']
+    view_fold_output = make_buffer_helper(spec.output.fold)['view']
+
+    loop_embed = len(spec.output.fold) > 0
 
     @ct.function
     def load_map_finalize(tid, g_embedded, batch_tiles, fold_view, batch_grads, fold_grads):
@@ -481,7 +483,7 @@ def mk_autograd(
     def batch_fold_split_input(spec, inputs):
         batch = []
         fold = []
-        for b, array in zip(spec.input_buffers, inputs):
+        for b, array in zip(spec.input, inputs):
             if b.is_grouped:
                 fold.append(array)
             else:
@@ -491,7 +493,7 @@ def mk_autograd(
     def batch_fold_split_output(spec, output):
         batch = []
         fold = []
-        for b, array in zip(spec.output_buffers, output):
+        for b, array in zip(spec.output, output):
             if b.is_grouped:
                 fold.append(array)
             else:
@@ -502,7 +504,7 @@ def mk_autograd(
         batch = []
         fold =  []
         ret = []
-        for b in spec.input_buffers:
+        for b in spec.input:
             if b.req_grad:
                 arr = b.grad_buffer.zeros(device='cuda')
                 if b.is_grouped:
@@ -528,7 +530,7 @@ def mk_autograd(
         match spec.phase:
             case Phase.fwd:
                 batch, fold = batch_fold_split_input(spec, mock_input)
-                output = tuple(b.empty('cuda') for b in spec.output_buffers)
+                output = spec.output.empty('cuda')
                 return (batch, fold, output)
             case Phase.bwd:
                 batch_in, fold_in = batch_fold_split_input(spec, mock_input)
@@ -559,7 +561,7 @@ def mk_autograd(
 
     def fwd_f(*inputs):
         batch, fold = batch_fold_split_input(fwd_spec, inputs)
-        output = tuple(b.empty('cuda') for b in fwd_spec.output_buffers)
+        output = fwd_spec.output.empty('cuda')
         stream = torch.cuda.current_stream()
         grid = grid_fn(fwd_spec)
         args = (batch, fold, output)
@@ -572,7 +574,7 @@ def mk_autograd(
     bwd_spec = tune(bwd_spec)
     bwd_kernel = kernel_fn(bwd_spec)
 
-    num_inputs = len(fwd_spec.input_buffers)
+    num_inputs = len(fwd_spec.input)
 
     class CutileReduceFn(torch.autograd.Function):
         @staticmethod

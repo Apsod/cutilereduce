@@ -230,7 +230,7 @@ fwd_specs = [attention.concretize(conf) for conf in fwd_confs]
 bwd_specs = [attention.concretize(conf) for conf in bwd_confs]
 print(fwd_specs[0].eval('resident_programs_per_sm'))
 
-query, key, value = [b.empty('cuda') for b in fwd_specs[0].input.values()]
+query, key, value = fwd_specs[0].input.empty('cuda')
 
 with torch.no_grad():
     query.normal_()

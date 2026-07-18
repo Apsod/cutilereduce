@@ -4,6 +4,7 @@ from functools import cached_property
 from math import prod, ceil
 from fractions import Fraction
 from typing import TypeVar, ClassVar
+from copy import replace
 
 import sympy
 
@@ -45,6 +46,10 @@ class Dim(str):
         return self in self.grid.outer
 
     @property
+    def grouped(self):
+        return self.grid.group_dim == self
+
+    @property
     def tiled(self):
         return self.outer
 
@@ -59,6 +64,10 @@ class Dim(str):
     @property
     def fold(self):
         return self in self.grid.fold
+
+    @property
+    def scan(self):
+        return self in self.grid.scan
 
     @property
     def tile_var(self):
@@ -92,6 +101,10 @@ class Dim(str):
     def tile_exp(self):
         return self.tile_var if self.outer else self.total_var
 
+    @property
+    def base(self):
+        return str(self)
+
     def __repr__(self):
         return f"{self.__class__.__name__}({super().__repr__()}, grid={self.grid})"
 
@@ -120,10 +133,6 @@ class ConcreteDim(Dim):
     @property
     def group_var(self):
         return self._config.get_grouping(self)
-
-    @property
-    def grouped(self):
-        return self == self._config.group_dim
 
     @property
     def num_programs(self):
@@ -217,22 +226,27 @@ class Grid:
     output: Dims
     batch: Dims
     fold: Dims
+    scan: Dims 
+    group_dim: str
 
     @staticmethod
     def make(input: dict[str, Buffer], 
              output: dict[str, Buffer],
              batch: Dims,
              fold: Dims,
+             scan: Dims,
              config: Config = None,
              ):
+
+        group_dim = (scan + fold)[0]
         if config is None:
             input = Dims.union(*(v.spec for v in input.values()))
             output = Dims.union(*(v.spec for v in output.values()))
-            return BoundGrid(grid=Grid(input, output, batch, fold))
+            return BoundGrid(grid=Grid(input, output, batch, fold, scan, group_dim=group_dim))
         else:
             input = Dims.union(*(v.spec for v in input.values()))
             output = Dims.union(*(v.spec for v in output.values()))
-            return ConcreteGrid(grid=Grid(input, output, batch, fold), config=config)
+            return ConcreteGrid(grid=Grid(input, output, batch, fold, scan, group_dim=group_dim), config=config)
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -241,10 +255,19 @@ class BaseGrid[D: Dim]:
     CTYPE: ClassVar = None
 
     def __getattr__(self, name: str) -> BaseDims[D]:
+        if name == 'group_dim': 
+            return self.bind_dim(self.grid.group_dim)
         if name in field_names(self.grid):
             return self.bind_dims(getattr(self.grid, name))
         else:
             raise AttributeError(f'name {name} not in {field_names(self.grid)}')
+
+    def group(self, dim):
+        return replace(self, grid=replace(self.grid, group_dim=dim))
+
+    @cached_property
+    def dims(self) -> BaseDims[D]:
+        return self.input | self.output
 
     @cached_property
     def dim_map(self) -> dict[D, D]:
@@ -252,11 +275,7 @@ class BaseGrid[D: Dim]:
 
     @cached_property
     def outer(self) -> BaseDims[D]:
-        return self.batch | self.fold
-
-    @cached_property
-    def dims(self) -> BaseDims[D]:
-        return self.input | self.output
+        return self.batch | self.fold | self.scan
 
     @cached_property
     def inner(self) -> BaseDims[D]:
@@ -272,6 +291,9 @@ class BaseGrid[D: Dim]:
     def bind_dims(self, dims : Dims) -> BaseDims[D]:
         raise NotImplementedError()
 
+    def bind_dim(self, dim: Dim) -> D:
+        raise NotImplementedError()
+
     @property
     def base(self) -> Grid:
         return self.grid
@@ -284,6 +306,9 @@ class BoundGrid(BaseGrid[Dim]):
     def bind_dims(self, dims : Dims) -> BoundDims:
         return dims.bind(self)
 
+    def bind_dim(self, dim):
+        return Dim(dim, self)
+
     def concretize(self, config: Config) -> ConcreteGrid:
         return ConcreteGrid(grid=self.grid, config=config)
 
@@ -294,6 +319,9 @@ class ConcreteGrid(BaseGrid[ConcreteDim]):
 
     def bind_dims(self, dims: Dims) -> ConcreteDims:
         return dims.concretize(self, self.config)
+
+    def bind_dim(self, dim: str) -> ConcreteDim:
+        return ConcreteDim(dim, self, self.config)
     
     @property
     def group_dim(self) -> ConcreteDim:

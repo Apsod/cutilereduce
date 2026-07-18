@@ -148,7 +148,7 @@ bwd_specs = [xentropy.concretize(conf) for conf in bwd_confs]
 
 print(*(str(d) for d in fwd_specs[0].heuristic_layout))
 
-ctx, trg, targets = [b.empty('cuda') for b in fwd_specs[0].input.values()]
+ctx, trg, targets = fwd_specs[0].input.empty('cuda')#[b.empty('cuda') for b in fwd_specs[0].input.values()]
 with torch.no_grad():
     ctx.normal_(std=ctx.shape[1]**-.5)
     trg.normal_(std=trg.shape[1]**-.5)
