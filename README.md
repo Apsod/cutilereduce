@@ -37,19 +37,28 @@ Not yet landed:
 - backward kernels. The backward path is actively in progress, but it is not
   part of the usable API yet.
 
-## Early Forward Benchmarks
+## Early Benchmarks
 
-The current forward path has only been tried with one-shot configurations chosen
-from the sweep estimator. There is no autotuning yet, and these numbers should
-be read as early local measurements rather than portable performance claims.
+The current benchmark paths use the built-in sweep to generate and evaluate
+candidate configurations. These numbers should still be read as early local
+measurements rather than portable performance claims.
 
 All timings below are wall-clock CUDA timings reported by
 `torch.utils.benchmark`, in milliseconds, with `num_threads=1`.
 
-| Example | Shape | CutileReduce | PyTorch baseline |
-| --- | --- | ---: | ---: |
-| Cross entropy | `b=32768`, `v=32768`, `d=128`, bf16 inputs | 10.0 ms | 27.4 ms |
-| Attention | `l=4096`, `r=4096`, `h=4`, `g=8`, `dqk=128`, `dv=128`, bf16 inputs | 17.7 ms | 65.2 ms naive, 4.8 ms SDPA |
+### Cross Entropy
+
+| Mode | CutileReduce | PyTorch |
+| --- | ---: | ---: |
+| Forward | 2.0 ms | 6.8 ms |
+| Forward + backward | 18.6 ms | 20.6 ms |
+
+### Attention
+
+| Mode | CutileReduce | PyTorch naive | PyTorch SDPA |
+| --- | ---: | ---: | ---: |
+| Forward | 7.7 ms | 56.7 ms | 5.0 ms |
+| Forward + backward | 75.2 ms | 179.9 ms | 22.7 ms |
 
 The attention result is mostly a sanity check against an already excellent
 hand-tuned kernel. PyTorch SDPA/FlashAttention is a very strong target for
