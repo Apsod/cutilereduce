@@ -1,85 +1,59 @@
-from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from fractions import Fraction
-from copy import replace
 from typing import Self, Any
-from types import SimpleNamespace
+from copy import replace
+from fractions import Fraction
 
-import torch
-
-from .grid import BaseDims, Dims, D, Dim, BoundGrid, ConcreteDim, ConcreteGrid
+from .axis import Axis, AxisId, Axes, axis_id
 from .typestuff import DType, to_torch_dtype
-import cuda.tile as ct
+from .utilities import TupleSet, prod
 
-class BufferDep(Enum):
-    Batch = 'batch'
-    Fold = 'fold'
-    Batch_Fold = 'batch_fold'
-    Constant = 'constant'
+import cuda.tile as ct
+import sympy
 
 class BufferRole(Enum):
-    Input = 'input'
-    Output = 'output'
-    Intermediate = 'intermediate'
-    State = 'state'
+    Input = "input"
+    Output = "output"
+    GradStorage = "grad_storage"
+    Execution = "execution"
+    GradAccumulator = "grad_accumulator"
 
-@dataclass(frozen=True, kw_only=True)
+@dataclass(frozen=True)
+class ShapeData:
+    bytes_per_elem: Fraction
+    shape: tuple[int | sympy.Expr,...]
+
+    @property
+    def numel(self):
+        return prod(self.shape)
+
+    @property
+    def bytes(self):
+        return self.numel * self.bytes_per_elem
+
+@dataclass(frozen=True)
 class Buffer:
-    spec: Dims
+    name: str
+    axes: Axes
     dtype: DType
-    req_grad: bool
+    req_grad: bool = False
     default: Any = None
 
-
-    @classmethod
-    def make(cls, string: str, dtype: DType, req_grad=False, default=None) -> Self:
-        return cls(
-                spec=Dims.parse(string), 
-                dtype=dtype, 
-                req_grad=req_grad,
-                default=default,
+    def with_prefix_axes(self, group:str, axes: Axes) -> Self:
+        return replace(
+                self,
+                name=f"{group}:{self.name}",
+                axes=axes | self.axes,
+                req_grad=False
                 )
 
-    def generic_bind(self, name: str, index: int, grid: BoundGrid | ConcreteGrid, role: BufferRole):
-        if isinstance(grid, BoundGrid):
-            return self.bind(name, index, grid, role)
-        elif isinstance(grid, ConcreteGrid):
-            return self.concretize(name, index, grid, role)
+    @property
+    def torch_dtype(self):
+        return to_torch_dtype(self.dtype)
 
-
-    def bind(self, name: str, index: int, grid: BoundGrid, role: BufferRole) -> BoundBuffer:
-        return BoundBuffer(
-                name=name,
-                program_index=index,
-                spec=grid.bind_dims(self.spec),
-                role=role,
-                dtype=self.dtype,
-                req_grad=self.req_grad,
-                default=self.default,
-                )
-
-    def concretize(self, name: str, index: int, grid: ConcreteGrid, role: BufferRole) -> ConcreteBuffer:
-        return ConcreteBuffer(
-                name=name,
-                program_index=index,
-                spec=grid.bind_dims(self.spec),
-                role=role,
-                dtype=self.dtype,
-                req_grad=self.req_grad,
-                default=self.default,
-                )
-
-
-@dataclass(frozen=True, kw_only=True)
-class BaseBuffer[D: Dim]:
-    name: str
-    program_index: int
-    spec: BaseDims[D]
-    role: BufferRole
-    dtype: DType
-    default: None
-    req_grad: bool
+    @property
+    def bytes_per_elem(self):
+        return Fraction(self.dtype.bitwidth, 8)
 
     @property
     def padding_mode(self):
@@ -90,244 +64,31 @@ class BaseBuffer[D: Dim]:
             case float('-inf'): return ct.PaddingMode.NEG_INF       # noqa: E701
             case _: return ct.PaddingMode.UNDETERMINED              # noqa: E701
 
-    @property
-    def dims(self):
-        return self.spec
+@dataclass(frozen=True, kw_only=True)
+class BufferBundle(TupleSet[Buffer]):
+    role: BufferRole
 
-    @property
-    def torch_dtype(self):
-        return to_torch_dtype(self.dtype)
-
-    @property
-    def base(self):
-        return Buffer(
-                spec=self.spec.base, 
-                dtype=self.dtype, 
-                req_grad=self.req_grad,
-                default=self.default,
-                )
-
-    @property
-    def grid(self):
-        return self.spec[0].grid
-    
-    @property
-    def is_output(self):
-        return self.role == BufferRole.Output
-
-    @property
-    def is_input(self):
-        return self.role == BufferRole.Input
-
-    @property
-    def is_intermediate(self):
-        return self.role == BufferRole.Intermediate
-
-    @property
-    def batch_load(self):
-        return self.dependency == BufferDep.Batch_Fold
-
-    @property
-    def dependency(self):
-        match (bool(self.spec.batch), bool(self.spec.fold)): 
-            case (True, True): return BufferDep.Batch_Fold     # noqa: E701
-            case (True, False): return BufferDep.Batch         # noqa: E701
-            case (False, True): return BufferDep.Fold          # noqa: E701
-            case (False, False): return BufferDep.Constant     # noqa: E701
-
-    @property
-    def contribution(self):
-        return self.grid.outer | self.spec.inner
-
-    @property
-    def absent(self):
-        return self.contribution - self.spec
-
-    @property
-    def in_loop(self):
-        return self.grid.group_dim not in self.absent
-
-    @property
-    def bsize(self):
-        return Fraction(self.dtype.bitwidth, 8)
-
-    @property
-    def accessed_elems(self):
-        return self.contribution.total_prod / self.absent.span_prod
-
-    @property
-    def accessed_bytes(self):
-        return self.bsize * self.accessed_elems
-
-    @property
-    def residual_multiplicity(self):
-        return self.absent.total_prod / self.absent.span_prod
-
-    @property
-    def target_tiles(self):
-        return self.spec.total_prod / self.spec.span_prod
-
-    @property
-    def numel(self):
-        return self.spec.total_prod
-
-    @property
-    def total_bytes(self):
-        return self.numel * self.bsize
-
-    @property
-    def tile_bytes(self):
-        tile = self.spec.outer.tile_prod
-        full = self.spec.inner.total_prod
-        return self.bsize * tile * full
-
-    @property
-    def grid_index(self):
-        return self.spec.grid_index
-
-    @property
-    def buffer_shape(self):
-        return self.spec.shape
-
-    @property
-    def tile_shape(self):
-        return self.spec.tile_shape
-
-    def check(self):
-        assert self.grid.dims.is_superset(self.spec)
-        if self.is_output:
-            assert not self.req_grad
-            assert self.spec.is_superset(self.grid.batch)
-    
-    @property
-    def grad_buffer(self):
-        assert self.req_grad
-        return replace(self, dtype=ct.float32)
-
-    @property
-    def checkpoint_buffer(self):
-        assert not self.in_loop
-        checkpoint_spec = self.grid.CTYPE((self.grid.group_dim, *self.spec))
-        return replace(self, spec=checkpoint_spec)
-
-@dataclass(frozen=True)
-class BoundBuffer(BaseBuffer[Dim]):
-    pass
-
-@dataclass(frozen=True)
-class ConcreteBuffer(BaseBuffer[ConcreteDim]):
-
-    def empty(self, device=None):
-        return torch.empty(self.buffer_shape, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
-
-    def default(self, device=None):
-        return torch.full(self.buffer_shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
-
-    def zeros(self, device=None):
-        return torch.zeros(self.buffer_shape, device=device)
-
-    @property
-    def is_grouped(self):
-        return any(d.grouped for d in self.dims)
-
-@dataclass(frozen=True)
-class BufferBundle[D: Dim]:
-    values: tuple[BaseBuffer[D], ...]
-
-    def index(self, b):
-        return self.values.index(b)
-    
-    @property
-    def base(self):
-        return {
-            b.name: b.base
-            for b
-            in self.values
-         }
-
-    def empty(self, device=None):
-        return tuple(
-                b.empty(device=device) for b in self.values
+    def mk_grad_bundle(self, dtype=ct.Float32) -> Self:
+        assert self.role == BufferRole.Input
+        return (
+                replace(self, role=BufferRole.GradStorage)
+                .subset(lambda x: x.req_grad)
+                .map(lambda x: replace(x, dtype=dtype, default=0))
         )
 
-    def default(self, device=None):
-        return tuple(
-                b.full(device=device) for b in self.values
-        )
+    def with_prefix_axes(self, group: str, axes: Axes) -> Self:
+        return self.map(lambda x: x.with_prefix_axes(group, axes))
 
-    def zeros(self, device=None):
-        return tuple(
-                b.zeros(device=device) for b in self.values
-        )
-
-    def __add__(self, other):
-        return BufferBundle(self.values + other.values)
-
-    @property
-    def grad(self):
-        assert all(b.is_input for b in self.values)
-        return BufferBundle(tuple(
-            b.grad_buffer for b in self.values if b.req_grad
-        ))
-
-    @property
-    def checkpoint(self):
-        return BufferBundle(tuple(
-            b.checkpoint_buffer for b in self.values
-        ))
+    @staticmethod
+    def key(x):
+        match x:
+            case Buffer():
+                return x.name
+            case str():
+                return x
+            case _:
+                raise KeyError(f'{type(x)} not in Buffer | str')
     
     @property
-    def batch(self):
-        return BufferBundle(tuple(
-            b for b in self.values if not b.in_loop
-        ))
-
-    @property
-    def fold(self):
-        return BufferBundle(tuple(
-            b for b in self.values if b.in_loop
-        ))
-    
-    @property
-    def load_order(self):
-        batch_order = tuple(self.index(b) for b in self.batch)
-        fold_order = tuple(self.index(b) for b in self.fold)
-        return SimpleNamespace(total=batch_order+fold_order, batch=batch_order, fold=fold_order)
-
-    def without(self, d):
-        return BufferBundle(tuple(
-            b for b in self.values if d in b.absent
-        ))
-
-    def filter(self, fun):
-        return BufferBundle(tuple(
-            b for b in self.values if fun(b)
-        ))
-
-    def check(self):
-        for b in self.values:
-            b.check()
-
-    @property
-    def total_bytes(self):
-        return sum(b.total_bytes for b in self.values)
-
-    @property
-    def tile_bytes(self):
-        return sum(b.tile_bytes for b in self.values)
-
-    @property
-    def accessed_bytes(self):
-        return sum(b.accessed_bytes for b in self.values)
-
-    def __len__(self) -> int:
-        return len(self.values)
-
-    def __contains__(self, val: T) -> bool:
-        return val in self.values
-
-    def __iter__(self):
-        return iter(self.values)
-
-
-
+    def buffers(self) -> tuple[Buffer, ...]:
+        return self.values
