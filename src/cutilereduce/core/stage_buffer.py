@@ -5,9 +5,10 @@ from types import MappingProxyType
 from collections.abc import Iterable, Mapping
 from typing import Self
 from copy import replace
+from enum import Flag, Enum, auto
 
 from .axis import AxisId, Axis, axis_id
-from .buffer import Buffer, BufferBundle, BufferRole, ShapeData
+from .buffer import Buffer, BufferBundle, BufferId, BufferRole, ShapeData
 from .stage_domain import StageDomain, StageAxis, StageAxes
 from .utilities import TupleSet, ceil_div, forward, prod
 
@@ -30,8 +31,17 @@ class StageAccess(Flag):
         return bool(self & WRITE)
 
     @property
+    def is_io(self):
+        return bool(self & (READ | WRITE))
+
+    @property
     def is_resident(self):
         return bool(self & RESIDENT)
+
+READ = StageAccess.READ
+WRITE = StageAccess.WRITE
+RESIDENT = StageAccess.RESIDENT
+NONE = StageAccess.NONE
 
 class BufferStorage(Enum):
     Ordinary = "ordinary"
@@ -50,20 +60,16 @@ class BufferStorage(Enum):
     def is_intermediate(self):
         return self == BufferStorage.Intermediate
 
-READ = StageAccess.READ
-WRITE = StageAccess.WRITE
-RESIDENT = StageAccess.RESIDENT
-NONE = StageAccess.NONE
-
 @dataclass(frozen=True)
 class StageBuffer:
     buffer: Buffer
     domain: StageDomain
-    axis_map: Mapping[AxisId, AxisId] = MappingProxyType({})
-    role: BufferRole
     storage: BufferStorage
     access: StageAccess
+    axis_map: Mapping[AxisId, AxisId] = MappingProxyType({})
     
+    role = forward('buffer', 'id', 'role')
+    id = forward('buffer', 'id')
     physical_axes = forward('buffer', 'axes')
     dtype = forward('buffer', 'dtype')
     torch_dtype = forward('buffer', 'torch_dtype')
@@ -81,17 +87,15 @@ class StageBuffer:
     is_intermediate = forward('storage', 'is_intermediate')
 
     @property
-    def name(self) -> str:
-        return f'{self.role}:{self.buffer.name}'
-
-    @property
     def stage_axes(self) -> StageAxes:
-        return StageAxes(values=tuple(
-            self.domain.get(
-                self.axis_map.get(axis.id, axis.id)
-            ) 
-            for axis in self.buffer.axes
-            ))
+        return StageAxes(
+            values=tuple(
+                self.domain.get(
+                    self.axis_map.get(axis.id, axis.id)
+                ) 
+                for axis in self.buffer.axes
+            )
+        )
 
     @property
     def stage_index(self) -> tuple[int, ...]:
@@ -178,25 +182,32 @@ class StageBufferBundle(TupleSet[StageBuffer]):
             cls,
             bundle: BufferBundle,
             domain: StageDomain,
+            access: StageAccess,
+            storage: BufferStorage,
             axis_map: Mapping[AxisId, AxisId] = MappingProxyType({}),
-            access: StageAccess | None = None
             ):
-        role=bundle.role,
-        access=access or domain.access_map.get(bundle.role, StageAccess.NONE)
-        storage=storage or domain.storage_map.get(bundle.role, BufferStorage.Ordinary)
         return cls(
-            values=tuple(StageBuffer(b, domain, axis_map, role, access) for b in bundle)
+            values=tuple(
+                StageBuffer(
+                    buffer=b, 
+                    domain=domain, 
+                    axis_map=axis_map, 
+                    storage=storage,
+                    access=access,
+                ) for b in bundle)
             )
 
     @staticmethod
     def key(x):
         match x:
-            case StageBuffer():
-                return x.name
-            case str():
+            case BufferId():
                 return x
+            case Buffer():
+                return x.id
+            case StageBuffer():
+                return x.id
             case _:
-                raise KeyError(f'{type(x)} not in StageBuffer | str')
+                raise KeyError(f'{type(x)} not BufferId')
 
     @property
     def buffers(self):

@@ -58,6 +58,10 @@ def axis_id(key: Axis | AxisId) -> AxisId:
 
 @dataclass(frozen=True)
 class Axes(TupleSet[Axis]):
+    @classmethod
+    def make(cls, spec: str):
+        return cls(values=tuple(LogicalAxis.make(d) for d in spec.split()))
+
     @staticmethod
     def key(x):
         return axis_id(x)
@@ -65,3 +69,4 @@ class Axes(TupleSet[Axis]):
     @property
     def ids(self) -> tuple[AxisId, ...]:
         return self.keys
+
