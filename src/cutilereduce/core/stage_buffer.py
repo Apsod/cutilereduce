@@ -2,17 +2,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from collections.abc import Iterable, Mapping
-from typing import Self
-from copy import replace
+from collections.abc import Mapping
 from enum import Flag, Enum, auto
 
-from .axis import AxisId, Axis, axis_id
-from .buffer import Buffer, BufferBundle, BufferId, BufferRole, ShapeData
-from .stage_domain import StageDomain, StageAxis, StageAxes
-from .utilities import TupleSet, ceil_div, forward, prod
+from .axis import AxisId
+from .buffer import Buffer, BufferBundle, BufferId, ShapeData
+from .stage_domain import ComputeAxis, ProgramAxis, StageDomain, StageAxes
+from .utilities import TupleSet, forward, prod
 
-import sympy
 import torch
 
 
@@ -67,6 +64,7 @@ class StageBuffer:
     storage: BufferStorage
     access: StageAccess
     axis_map: Mapping[AxisId, AxisId] = MappingProxyType({})
+    storage_axis_map: Mapping[AxisId, AxisId] = MappingProxyType({})
     
     role = forward('buffer', 'id', 'role')
     id = forward('buffer', 'id')
@@ -87,7 +85,7 @@ class StageBuffer:
     is_intermediate = forward('storage', 'is_intermediate')
 
     @property
-    def stage_axes(self) -> StageAxes:
+    def compute_axes(self) -> StageAxes:
         return StageAxes(
             values=tuple(
                 self.domain.get(
@@ -98,19 +96,34 @@ class StageBuffer:
         )
 
     @property
+    def storage_axes(self) -> tuple[ComputeAxis | ProgramAxis, ...]:
+        return self.domain.resolve_storage(
+            self.storage_axis_map.get(axis.id, axis.id)
+            for axis in self.buffer.axes
+        )
+
+    @property
+    def stage_axes(self) -> StageAxes:
+        return self.compute_axes
+
+    @property
     def stage_index(self) -> tuple[int, ...]:
-        return tuple(self.domain.index(a) for a in self.stage_axes)
+        return tuple(self.domain.index(a) for a in self.compute_axes)
+
+    @property
+    def storage_index(self) -> tuple[int, ...]:
+        return tuple(self.domain.storage_index(a) for a in self.storage_axes)
 
     @property
     def inner_axes(self) -> StageAxes:
-        return self.stage_axes.inner
+        return self.compute_axes.inner
 
     @property
     def contribution_axes(self) -> StageAxes:
         return self.domain.outer_axes | self.inner_axes
 
     def depends_on(self, axes: StageAxes) -> bool:
-        return bool(self.stage_axes & axes)
+        return bool(self.compute_axes & axes)
 
     @property
     def is_streamed(self):
@@ -122,7 +135,7 @@ class StageBuffer:
 
     @property
     def absent_axes(self) -> StageAxes:
-        return self.contribution_axes - self.stage_axes
+        return self.contribution_axes - self.compute_axes
 
     @property
     def accessed_elems(self):
@@ -134,35 +147,60 @@ class StageBuffer:
 
     @property
     def residual_multiplicity(self):
-        return prod(a.programs for a in self.absent_axes)
+        absent = self.absent_axes.ids
+        return prod(
+            a.programs
+            for a in self.domain.program_axes
+            if a.source in absent
+        )
 
     @property
     def logical_tiles(self):
-        return prod(a.num_tiles for a in self.stage_axes)
+        return prod(self.storage_num_tiles(a) for a in self.storage_axes)
 
     @property
     def target_partitions(self):
-        return prod(a.programs for a in self.stage_axes)
+        storage_ids = {a.id for a in self.storage_axes}
+        return prod(
+            a.programs
+            for a in self.domain.program_axes
+            if a.id in storage_ids or a.source in storage_ids
+        )
+
+    def storage_tile_extent(self, axis: ComputeAxis | ProgramAxis):
+        if isinstance(axis, ComputeAxis):
+            return axis.tile
+        return 1
+
+    def storage_num_tiles(self, axis: ComputeAxis | ProgramAxis):
+        if isinstance(axis, ComputeAxis):
+            return axis.num_tiles
+        return axis.programs
+
+    def storage_span_extent(self, axis: ComputeAxis | ProgramAxis):
+        if isinstance(axis, ComputeAxis):
+            return self.domain.max_span(axis)
+        return 1
 
     @property
     def total(self):
         return ShapeData(
             self.bytes_per_elem, 
-            tuple(a.extent for a in self.stage_axes),
+            tuple(a.extent for a in self.storage_axes),
         )
 
     @property
     def tile(self):
         return ShapeData(
             self.bytes_per_elem, 
-            tuple(a.tile for a in self.stage_axes),
+            tuple(self.storage_tile_extent(a) for a in self.storage_axes),
         )
 
     @property
     def span(self):
         return ShapeData(
             self.bytes_per_elem, 
-            tuple(a.max_span for a in self.stage_axes),
+            tuple(self.storage_span_extent(a) for a in self.storage_axes),
         )
 
     def mk_empty(self, device=None):
@@ -175,7 +213,7 @@ class StageBuffer:
         return torch.zeros(self.total.shape, device=device)
 
 @dataclass(frozen=True, kw_only=True)
-class StageBufferBundle(TupleSet[StageBuffer]):
+class KernelBuffers(TupleSet[StageBuffer]):
 
     @classmethod
     def make(
@@ -185,6 +223,7 @@ class StageBufferBundle(TupleSet[StageBuffer]):
             access: StageAccess,
             storage: BufferStorage,
             axis_map: Mapping[AxisId, AxisId] = MappingProxyType({}),
+            storage_axis_map: Mapping[AxisId, AxisId] = MappingProxyType({}),
             ):
         return cls(
             values=tuple(
@@ -192,6 +231,7 @@ class StageBufferBundle(TupleSet[StageBuffer]):
                     buffer=b, 
                     domain=domain, 
                     axis_map=axis_map, 
+                    storage_axis_map=storage_axis_map,
                     storage=storage,
                     access=access,
                 ) for b in bundle)
@@ -224,6 +264,18 @@ class StageBufferBundle(TupleSet[StageBuffer]):
     @property
     def resident(self):
         return self.subset(lambda x: x.is_resident)
+
+    @property
+    def ordinary(self):
+        return self.subset(lambda x: x.is_ordinary)
+
+    @property
+    def materialized(self):
+        return self.subset(lambda x: x.is_materialized)
+
+    @property
+    def intermediate(self):
+        return self.subset(lambda x: x.is_intermediate)
 
     @property
     def streamed(self):

@@ -5,7 +5,7 @@ from typing import Self, Any
 from copy import replace
 from fractions import Fraction
 
-from .axis import Axis, AxisId, Axes, axis_id
+from .axis import Axes
 from .typestuff import DType, to_torch_dtype
 from .utilities import TupleSet, prod, forward
 
@@ -113,8 +113,8 @@ class BufferBundle(TupleSet[Buffer]):
         return self.subset(lambda b: b.req_grad).map(lambda b: b.as_grad(dtype))
 
     @classmethod
-    def make(cls, role: BufferRole, **buffers: BufferSpec) -> Self:
-        return BufferBundle(
+    def make(cls, role: BufferRole | Internal, **buffers: BufferSpec) -> Self:
+        return cls(
             values=tuple(
                 spec.bind(BufferId(role, name)) for name, spec in buffers.items()
             )
