@@ -14,7 +14,7 @@ from cutilereduce.core.buffer import (
     bundle_spec,
 )
 from cutilereduce.core.work import WorkModel
-from cutilereduce.stages import BuiltStage, StageKind, StageSchedule, resolve_axis_id
+from cutilereduce.stages import BuiltStage, StageSchedule, resolve_axis_id
 
 
 class AlgebraKind(Enum):
@@ -114,7 +114,6 @@ __all__ = [
     "FoldSchedule",
     "FoldSpec",
     "FoldStage",
-    "StageKind",
     "StageSchedule",
     "make_fold_spec",
 ]

@@ -15,13 +15,7 @@ from cutilereduce.stages import StageFunctions
 
 @dataclass(frozen=True)
 class FoldFunctions(StageFunctions):
-    map_reduce: Any = None
-    combine: Any = None
-    to_semantic: Any = None
-    to_output: Any = None
-    embed: Any = None
-    finalize: Any = None
-    map_backward: Any = None
+    pass
 
 
 def fold_functions(
@@ -80,14 +74,6 @@ def compile_fold_forward(plan: FoldPlan, functions: FoldFunctions) -> tuple[Comp
     )
 
 
-def mk_map_fold_stage_kernel(stage: FoldStage, map_reduce, combine):
-    return stage.compile(FoldFunctions(map_reduce=map_reduce, combine=combine))
-
-
-def mk_carrier_fold_kernel(stage: FoldStage, combine, to_semantic):
-    return stage.compile(FoldFunctions(combine=combine, to_semantic=to_semantic))
-
-
 def mk_fold_forward(
         plan: FoldPlan,
         functions: FoldFunctions,
@@ -128,8 +114,6 @@ __all__ = [
     "FoldFunctions",
     "compile_fold_forward",
     "fold_functions",
-    "mk_carrier_fold_kernel",
     "mk_fold_autograd",
     "mk_fold_forward",
-    "mk_map_fold_stage_kernel",
 ]

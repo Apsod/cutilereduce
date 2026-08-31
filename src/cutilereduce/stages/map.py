@@ -8,7 +8,7 @@ from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_domain import AxisRole, ProgramAxis, ProgramAxes, StageAxis, StageAxes, StageDomain
 from cutilereduce.core.utilities import ceil_div
 from cutilereduce.core.work import WorkModel
-from cutilereduce.stages.base import BufferUse, BuiltStage, StageKind, StageSchedule, bind_buffer_uses
+from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 
 
 @dataclass(frozen=True)
@@ -46,15 +46,12 @@ class Map:
             loop=None,
         )
         return BuiltStage(
-            kind=StageKind.Map,
             stage=KernelStage(self.name, domain, bind_buffer_uses(domain, self.buffer_uses), self.work),
             compiler=compile_map_stage,
         )
 
 
 def compile_map_stage(stage: BuiltStage, functions):
-    if stage.kind != StageKind.Map:
-        raise ValueError(f"expected map stage, got {stage.kind}")
     raise NotImplementedError("cutile map codegen is not implemented for the new stage core yet")
 
 

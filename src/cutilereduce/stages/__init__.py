@@ -1,7 +1,6 @@
 from .base import (
     BufferUse,
     BuiltStage,
-    StageKind,
     StageSchedule,
     bind_buffer_uses,
     normalize_axis_mapping,
@@ -11,7 +10,6 @@ from .codegen import (
     StageFunctions,
 )
 from .fold import Fold, compile_fold_stage
-from .impl import compile_stage
 from .map import Map, compile_map_stage
 from .map_fold import (
     MapFold,
@@ -40,7 +38,6 @@ __all__ = [
     "RecomputeFinalizeGradWrite",
     "RecomputeFoldFinalizeGradWrite",
     "Scan",
-    "StageKind",
     "StageFunctions",
     "StageSchedule",
     "bind_buffer_uses",
@@ -51,7 +48,6 @@ __all__ = [
     "compile_recompute_finalize_grad_write_stage",
     "compile_recompute_fold_finalize_grad_write_stage",
     "compile_scan_stage",
-    "compile_stage",
     "fold_compute_axes",
     "normalize_axis_mapping",
     "partial_buffers",

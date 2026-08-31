@@ -17,8 +17,8 @@ from cutilereduce.core.stage_domain import (
     StageDomain,
 )
 from cutilereduce.core.utilities import ceil_div
-from cutilereduce.stages.base import BufferUse, BuiltStage, StageKind, StageSchedule, bind_buffer_uses
-from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, stage_grid_info
+from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
+from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, make_buffer_split, stage_grid_info
 
 
 def stage_axis(schedule: StageSchedule, axis: Axis, role: AxisRole) -> StageAxis:
@@ -97,7 +97,6 @@ class MapFold:
             BufferUse.write(self.spec.output),
         ))
         return BuiltStage(
-            kind=StageKind.MapFold,
             stage=KernelStage("map_fold", domain, buffers, self.spec.map_fold_work),
             compiler=compile_map_fold_stage,
         )
@@ -160,19 +159,15 @@ class MapFoldPartial:
             ),
         ))
         return BuiltStage(
-            kind=StageKind.MapFoldPartial,
             stage=KernelStage("map_fold_partial", domain, buffers, self.spec.map_fold_work),
             partials=self.partials,
             partition_axis=self.partition_axis,
-            compiler=compile_map_fold_stage,
+            compiler=compile_map_fold_partial_stage,
         )
 
 
-def compile_map_fold_stage(stage: BuiltStage, functions: StageFunctions):
-    if stage.kind not in {StageKind.MapFold, StageKind.MapFoldPartial}:
-        raise ValueError(f"expected map-fold stage, got {stage.kind}")
+def _compile_map_fold_like_stage(stage: BuiltStage, functions: StageFunctions, *, write_carrier: bool):
     grid = stage_grid_info(stage)
-    read = make_buffer_helper(stage.stage.read_buffers)
     write = make_buffer_helper(stage.stage.write_buffers)
     execution = make_buffer_helper(stage.stage.resident_buffers.intermediate)
     map_reduce = functions.map_reduce
@@ -181,23 +176,49 @@ def compile_map_fold_stage(stage: BuiltStage, functions: StageFunctions):
     to_output = functions.to_output or identity
     if map_reduce is None or combine is None:
         raise ValueError("map-fold stage requires map_reduce and combine functions")
+    read_split = make_buffer_split(
+        stage.stage.read_buffers,
+        stage.stage.read_buffers.persistent,
+        stage.stage.read_buffers.streamed,
+    )
+    read_persistent = make_buffer_helper(read_split.left_buffers)
+    read_streamed = make_buffer_helper(read_split.right_buffers)
+
+    @ct.function
+    def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
+        streamed_inputs = streamed_views.load(loop_stage_tid)
+        inputs = read_split.merge(persistent_inputs, streamed_inputs)
+        local = map_reduce(grid.tid_info(loop_tid), *inputs)
+        return combine(*acc, *local)
+
+    loop = grid.loop_with_tail(loop_body)
 
     @ct.kernel
     def kernel(read_buffers, write_buffers):
         tid, program_tid = grid.init()
         stage_tid = tid + program_tid
-        loop_offset, loop_size = grid.loop_offset_and_size(program_tid)
+
+        persistent_buffers = read_split.left(read_buffers)
+        streamed_buffers = read_split.right(read_buffers)
+
+        persistent_inputs = read_persistent.load(stage_tid, persistent_buffers)
+        streamed_views = read_streamed.view(streamed_buffers)
+
         acc = execution.init()
-        for i in range(loop_size):
-            loop_tid = grid.set_loop_index(tid, loop_offset + i)
-            loop_stage_tid = loop_tid + program_tid
-            inputs = read.load(loop_stage_tid, read_buffers)
-            local = map_reduce(grid.tid_info(loop_tid), *inputs)
-            acc = combine(*acc, *local)
-        out = acc if stage.kind == StageKind.MapFoldPartial else to_output(*to_semantic(*acc))
+        acc = loop(tid, program_tid, acc, persistent_inputs, streamed_views)
+
+        out = acc if write_carrier else to_output(*to_semantic(*acc))
         write.store(stage_tid, write_buffers, out)
 
     return kernel
+
+
+def compile_map_fold_stage(stage: BuiltStage, functions: StageFunctions):
+    return _compile_map_fold_like_stage(stage, functions, write_carrier=False)
+
+
+def compile_map_fold_partial_stage(stage: BuiltStage, functions: StageFunctions):
+    return _compile_map_fold_like_stage(stage, functions, write_carrier=True)
 
 
 __all__ = [
@@ -205,6 +226,7 @@ __all__ = [
     "MapFoldPartial",
     "batch_program_axes",
     "compile_map_fold_stage",
+    "compile_map_fold_partial_stage",
     "fold_compute_axes",
     "partial_buffers",
     "stage_axis",

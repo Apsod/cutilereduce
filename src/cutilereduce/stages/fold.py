@@ -9,7 +9,7 @@ from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
 from cutilereduce.core.stage_domain import ProgramAxis, ProgramAxes, StageDomain
-from cutilereduce.stages.base import BufferUse, BuiltStage, StageKind, StageSchedule, bind_buffer_uses
+from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, stage_grid_info
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
@@ -46,7 +46,6 @@ class Fold:
             BufferUse.write(self.spec.output),
         ))
         return BuiltStage(
-            kind=StageKind.Fold,
             stage=KernelStage("fold", domain, buffers, self.spec.combine_work),
             partials=self.partials,
             partition_axis=self.partition_axis,
@@ -55,8 +54,6 @@ class Fold:
 
 
 def compile_fold_stage(stage: BuiltStage, functions: StageFunctions):
-    if stage.kind != StageKind.Fold:
-        raise ValueError(f"expected fold stage, got {stage.kind}")
     grid = stage_grid_info(stage)
     read = make_buffer_helper(stage.stage.read_buffers)
     write = make_buffer_helper(stage.stage.write_buffers)
@@ -66,16 +63,21 @@ def compile_fold_stage(stage: BuiltStage, functions: StageFunctions):
     if combine is None:
         raise ValueError("fold stage requires combine function")
 
+    @ct.function
+    def loop_body(tid, program_tid, loop_i, acc, read_buffers):
+        loop_tid = grid.set_loop_index(tid, loop_i)
+        return combine(*acc, *read.load(loop_tid + program_tid, read_buffers))
+
+    loop = grid.loop_with_tail(loop_body)
+
     @ct.kernel
     def kernel(read_buffers, write_buffers):
         tid, program_tid = grid.init()
         stage_tid = tid + program_tid
-        loop_offset, loop_size = grid.loop_offset_and_size(program_tid)
+        loop_offset, loop_size, loop_extra = grid.loop_offset_and_size(program_tid)
         loop_tid = grid.set_loop_index(tid, loop_offset)
         acc = read.load(loop_tid + program_tid, read_buffers)
-        for i in range(1, loop_size):
-            loop_tid = grid.set_loop_index(tid, loop_offset + i)
-            acc = combine(*acc, *read.load(loop_tid + program_tid, read_buffers))
+        acc = loop(tid, program_tid, loop_offset + 1, loop_size - 1, loop_extra, acc, read_buffers)
         out = to_output(*to_semantic(*acc))
         write.store(stage_tid, write_buffers, out)
 

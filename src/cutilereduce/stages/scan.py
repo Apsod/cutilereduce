@@ -8,7 +8,7 @@ from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
 from cutilereduce.core.stage_domain import AxisRole, ProgramAxis, ProgramAxes, StageDomain
-from cutilereduce.stages.base import BufferUse, BuiltStage, StageKind, StageSchedule, bind_buffer_uses
+from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
 
@@ -75,7 +75,6 @@ class Scan:
             uses.append(BufferUse.write(self.checkpoints, BufferStorage.Materialized))
         buffers = bind_buffer_uses(domain, tuple(uses))
         return BuiltStage(
-            kind=StageKind.Scan,
             stage=KernelStage("scan", domain, buffers, self.spec.combine_work),
             partials=self.inputs,
             partition_axis=self.scan_axis,
@@ -85,8 +84,6 @@ class Scan:
 
 
 def compile_scan_stage(stage: BuiltStage, functions):
-    if stage.kind != StageKind.Scan:
-        raise ValueError(f"expected scan stage, got {stage.kind}")
     raise NotImplementedError("cutile scan codegen is not implemented for the new stage core yet")
 
 

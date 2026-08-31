@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass
-from enum import Enum
 from types import MappingProxyType
 from typing import Any, Callable
 
@@ -13,16 +12,6 @@ from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage, KernelBuffers, READ, RESIDENT, WRITE, StageAccess
 from cutilereduce.core.stage_domain import StageDomain
-
-
-class StageKind(Enum):
-    Map = "map"
-    MapFold = "map_fold"
-    MapFoldPartial = "map_fold_partial"
-    Fold = "fold"
-    Scan = "scan"
-    RecomputeFinalizeGradWrite = "recompute_finalize_grad_write"
-    RecomputeFoldFinalizeGradWrite = "recompute_fold_finalize_grad_write"
 
 
 def resolve_axis_id(space, key: str | Axis | AxisId) -> AxisId:
@@ -126,7 +115,6 @@ class StageSchedule:
 
 @dataclass(frozen=True)
 class BuiltStage:
-    kind: StageKind
     stage: KernelStage
     partials: BufferBundle | None = None
     partition_axis: Axis | None = None
@@ -139,14 +127,13 @@ class BuiltStage:
 
     def compile(self, functions):
         if self.compiler is None:
-            raise NotImplementedError(f"no compiler registered for stage kind {self.kind}")
+            raise NotImplementedError(f"no compiler registered for stage {self.stage.name}")
         return self.compiler(self, functions)
 
 
 __all__ = [
     "BufferUse",
     "BuiltStage",
-    "StageKind",
     "StageSchedule",
     "bind_buffer_uses",
     "normalize_axis_mapping",

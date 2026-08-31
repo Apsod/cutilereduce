@@ -6,6 +6,7 @@ from typing import Any
 
 import cuda.tile as ct
 
+from cutilereduce.core.buffer import BufferId
 from cutilereduce.core.stage_buffer import StageBuffer
 from cutilereduce.stages.base import BuiltStage
 
@@ -37,6 +38,35 @@ def retile(original, index: ct.Constant[tuple[int, ...]]):
     ret = ()
     for i in ct.static_iter(index):
         ret += (original[i],)
+    return ret
+
+@ct.function
+def scatter_tuple(source, target, source_to_target: ct.Constant[tuple[int, ...]]):
+    ret = target
+    for source_i, target_i in ct.static_iter(enumerate(source_to_target)):
+        ret = set_at(ret, target_i, source[source_i])
+    return ret
+
+@ct.function
+def full_tuple(val, n: ct.Constant[int]):
+    ret = ()
+    for _ in ct.static_iter(range(n)):
+        ret += (val,)
+    return ret
+
+@ct.function
+def merge_tuples(
+        left,
+        right,
+        origin: ct.Constant[tuple[int, ...]],
+        index: ct.Constant[tuple[int, ...]],
+        ):
+    ret = ()
+    for side, i in ct.static_iter(zip(origin, index, strict=True)):
+        if side == 0:
+            ret += (left[i],)
+        else:
+            ret += (right[i],)
     return ret
 
 
@@ -173,9 +203,62 @@ def make_buffer_helper(buffers):
     )
 
 
+def _buffer_index(buffers: tuple[StageBuffer, ...]) -> dict[BufferId, int]:
+    return {buffer.id: i for i, buffer in enumerate(buffers)}
+
+
+def _buffer_indices(all_buffers: tuple[StageBuffer, ...], selected_buffers: tuple[StageBuffer, ...]) -> tuple[int, ...]:
+    index = _buffer_index(all_buffers)
+    return tuple(index[buffer.id] for buffer in selected_buffers)
+
+
+def make_buffer_split(
+        all_buffers,
+        left_buffers,
+        right_buffers,
+        ):
+    all_buffers = tuple(all_buffers)
+    left_buffers = tuple(left_buffers)
+    right_buffers = tuple(right_buffers)
+    all_ids = tuple(buffer.id for buffer in all_buffers)
+    left_index = _buffer_index(left_buffers)
+    right_index = _buffer_index(right_buffers)
+    left_arg_index = _buffer_indices(all_buffers, left_buffers)
+    right_arg_index = _buffer_indices(all_buffers, right_buffers)
+    origin = []
+    index = []
+    for buffer_id in all_ids:
+        if buffer_id in left_index:
+            origin.append(0)
+            index.append(left_index[buffer_id])
+        elif buffer_id in right_index:
+            origin.append(1)
+            index.append(right_index[buffer_id])
+        else:
+            raise KeyError(f"buffer {buffer_id} is not covered by split")
+
+    def _left(raw_buffers):
+        return retile(raw_buffers, left_arg_index)
+
+    def _right(raw_buffers):
+        return retile(raw_buffers, right_arg_index)
+
+    def _merge(left_tiles, right_tiles):
+        return merge_tuples(left_tiles, right_tiles, tuple(origin), tuple(index))
+
+    return Bundle(
+        left=_left,
+        right=_right,
+        merge=_merge,
+        left_buffers=left_buffers,
+        right_buffers=right_buffers,
+    )
+
+
 @dataclass(frozen=True)
 class StageGridInfo:
     task_grid: ct.Constant[tuple[int, ...]]
+    axis_names: ct.Constant[tuple[str, ...]]
     program_to_compute: ct.Constant[tuple[int, ...]]
     loop_compute_index: ct.Constant[int]
     loop_program_index: ct.Constant[int]
@@ -200,6 +283,7 @@ class StageGridInfo:
         )
         return cls(
             task_grid=as_int_tuple(domain.task_grid),
+            axis_names=tuple(axis.name for axis in domain.compute_axes),
             program_to_compute=tuple(
                 domain.index(axis.source)
                 for axis in domain.program_axes
@@ -215,49 +299,94 @@ class StageGridInfo:
     @ct.function
     def init(self):
         pid = ct.bid(0)
-        compute_tid = ()
         program_tid = ()
-        for _ in ct.static_iter(range(self.compute_rank)):
-            compute_tid += (0,)
         for programs in ct.static_iter(self.task_grid):
             coord = pid % programs
             program_tid += (coord,)
             pid = pid // programs
-        for i, compute_index in ct.static_iter(enumerate(self.program_to_compute)):
-            compute_tid = set_at(compute_tid, compute_index, program_tid[i])
+        compute_tid = scatter_tuple(
+            program_tid,
+            full_tuple(0, self.compute_rank),
+            self.program_to_compute
+        )
         return compute_tid, program_tid
 
     @ct.function
     def loop_offset_and_size(self, program_tid):
         gid = 0 if self.loop_program_index < 0 else program_tid[self.loop_program_index]
         offset = self.loop_span_base * gid + ct.minimum(gid, self.loop_span_remainder)
-        size = self.loop_span_base + (gid < self.loop_span_remainder)
-        return offset, size
+        size = self.loop_span_base
+        extra = (gid < self.loop_span_remainder)
+        return offset, size, extra
 
     @ct.function
     def set_loop_index(self, tid, value):
         return set_at(tid, self.loop_compute_index, value)
 
+    def loop_with_tail(self, body, static=True: ct.Constant[bool]):
+        @ct.function
+        def _loop(tid, program_tid, carry, *args):
+            loop_offset, loop_size, extra = self.loop_offset_and_size(program_tid)
+            if static:
+                for i in ct.static_iter(range(loop_size)):
+                    loop_tid = self.set_loop_index(tid, loop_offset + i)
+                    loop_stage_tid = loop_tid + program_tid
+                    carry = body(loop_tid, loop_stage_tid, carry, *args)
+            else:
+                for i in range(loop_size):
+                    loop_tid = self.set_loop_index(tid, loop_offset + i)
+                    loop_stage_tid = loop_tid + program_tid
+                    carry = body(loop_tid, loop_stage_tid, carry, *args)
+            if extra:
+                loop_tid = self.set_loop_index(tid, loop_offset + loop_size)
+                loop_stage_tid = loop_tid + program_tid
+                carry = body(loop_tid, loop_stage_tid, carry, *args)
+            return carry
+        return _loop
+
     @dataclass(frozen=True)
     class TidInfo:
         tid: tuple[int, ...]
+        axis_names: ct.Constant[tuple[str, ...]]
         tile_shapes: ct.Constant[tuple[int, ...]]
         totals: ct.Constant[tuple[int, ...]]
 
-        def offset(self, axis: ct.Constant[int]):
+        def axis_index(self, axis: ct.Constant[str | int]):
+            if isinstance(axis, str):
+                return self.axis_names.index(axis)
+            return axis
+
+        def shape(self, axis: ct.Constant[str | int], *more):
+            ret = (self.tile_shapes[self.axis_index(axis)],)
+            for current in ct.static_iter(more):
+                ret += (self.tile_shapes[self.axis_index(current)],)
+            if more:
+                return ret
+            return ret[0]
+
+        def offset(self, axis: ct.Constant[str | int]):
+            axis = self.axis_index(axis)
             return self.tid[axis] * self.tile_shapes[axis]
 
-        def indices(self, axis: ct.Constant[int]):
+        def indices(self, axis: ct.Constant[str | int]):
+            axis = self.axis_index(axis)
             tile = self.tile_shapes[axis]
             return self.offset(axis) + ct.arange(tile, dtype=ct.int32)
 
-        def mask(self, axis: ct.Constant[int]):
-            return self.indices(axis) < self.totals[axis]
+        def mask(self, axis: ct.Constant[str | int], *more):
+            ix = self.axis_index(axis)
+            ret = self.indices(ix) < self.totals[ix]
+            for current in ct.static_iter(more):
+                ix = self.axis_index(current)
+                ret = ct.expand_dims(ret, -1)
+                ret &= self.indices(ix) < self.totals[ix]
+            return ret
 
     def tid_info(self, tid):
         compute_axes = self._compute_axes
         return StageGridInfo.TidInfo(
             tid=tid,
+            axis_names=self.axis_names,
             tile_shapes=tuple(int(a.tile) for a in compute_axes),
             totals=tuple(int(a.extent) for a in compute_axes),
         )
@@ -284,7 +413,9 @@ __all__ = [
     "ctzipmap",
     "identity",
     "inverse_p",
+    "make_buffer_split",
     "make_buffer_helper",
+    "merge_tuples",
     "require_resolved",
     "retile",
     "set_at",

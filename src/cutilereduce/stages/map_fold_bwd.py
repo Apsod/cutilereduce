@@ -8,7 +8,7 @@ from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
 from cutilereduce.core.stage_domain import ProgramAxis, ProgramAxes, StageDomain
 from cutilereduce.core.variables import atomic_add_write
-from cutilereduce.stages.base import BufferUse, BuiltStage, StageKind, StageSchedule, bind_buffer_uses
+from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
 
@@ -51,7 +51,6 @@ class RecomputeFinalizeGradWrite:
             BufferUse.write(grad_storage),
         ))
         return BuiltStage(
-            kind=StageKind.RecomputeFinalizeGradWrite,
             stage=KernelStage(
                 "recompute_finalize_grad_write",
                 domain,
@@ -111,7 +110,6 @@ class RecomputeFoldFinalizeGradWrite:
             ))
         buffers = bind_buffer_uses(domain, tuple(uses))
         return BuiltStage(
-            kind=StageKind.RecomputeFoldFinalizeGradWrite,
             stage=KernelStage(
                 "recompute_fold_finalize_grad_write",
                 domain,
@@ -126,14 +124,10 @@ class RecomputeFoldFinalizeGradWrite:
 
 
 def compile_recompute_finalize_grad_write_stage(stage: BuiltStage, functions):
-    if stage.kind != StageKind.RecomputeFinalizeGradWrite:
-        raise ValueError(f"expected recompute-finalize-grad-write stage, got {stage.kind}")
     raise NotImplementedError("cutile recompute-finalize-grad-write codegen is not implemented yet")
 
 
 def compile_recompute_fold_finalize_grad_write_stage(stage: BuiltStage, functions):
-    if stage.kind != StageKind.RecomputeFoldFinalizeGradWrite:
-        raise ValueError(f"expected recompute-fold-finalize-grad-write stage, got {stage.kind}")
     raise NotImplementedError("cutile recompute-fold-finalize-grad-write codegen is not implemented yet")
 
 

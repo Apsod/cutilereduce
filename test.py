@@ -14,7 +14,7 @@ from cutilereduce.core import (
 )
 from cutilereduce.core.stage_buffer import KernelBuffers, WRITE, BufferStorage
 from cutilereduce.core.buffer import buffer_spec, bundle_spec, Internal, Input, Output
-from cutilereduce.fold import AlgebraKind, fold_functions, mk_carrier_fold_kernel, mk_fold_forward, mk_map_fold_stage_kernel, StageSchedule, make_fold_spec
+from cutilereduce.fold import AlgebraKind, fold_functions, mk_fold_forward, StageSchedule, make_fold_spec
 from cutilereduce.fold.commutative import full_fold_plan, partial_fold_plan, sweep_commutative_fold
 from cutilereduce.stages import (
     BufferUse,
@@ -42,8 +42,20 @@ def add_map_reduce_sum(tid, x):
 
 
 @ct.function
+def add_map_reduce_sum_with_named_tid(tid, x):
+    v = tid.indices("v")
+    mask = tid.mask("v")
+    return (ct.sum(ct.where(mask[None, :], x + v[None, :] * 0, 0), axis=1),)
+
+
+@ct.function
 def add_combine(a, b):
     return (a + b,)
+
+
+@ct.function
+def scaled_add_map_reduce_sum(tid, x, scale):
+    return (ct.sum(x * scale[:, None], axis=1),)
 
 input = bundle_spec(
     Input,
@@ -236,8 +248,10 @@ add_schedule = StageSchedule.make(
     loop=add_spec.fold,
 )
 add_fwd = MapFold(add_spec, add_schedule).build()
-add_kernel = mk_map_fold_stage_kernel(add_fwd, add_map_reduce, add_combine)
+add_kernel = add_fwd.compile(fold_functions(add_map_reduce, add_combine))
 assert add_kernel is not None
+add_named_tid_kernel = add_fwd.compile(fold_functions(add_map_reduce_sum_with_named_tid, add_combine))
+assert add_named_tid_kernel is not None
 
 add_partition_axis = add_spec.fold.partition_axis
 add_partial_schedule = StageSchedule.make(
@@ -249,7 +263,7 @@ add_partial_schedule = StageSchedule.make(
 )
 add_partial = MapFoldPartial.make(add_spec, add_partial_schedule)
 add_partial_stage = add_partial.build()
-add_partial_kernel = mk_map_fold_stage_kernel(add_partial_stage, add_map_reduce, add_combine)
+add_partial_kernel = add_partial_stage.compile(fold_functions(add_map_reduce, add_combine))
 assert add_partial_kernel is not None
 
 add_combine_schedule = StageSchedule.make(
@@ -260,10 +274,52 @@ add_combine_schedule = StageSchedule.make(
     loop=add_partition_axis,
 )
 add_fold_stage = Fold(add_spec, add_combine_schedule, add_partition_axis, add_partial.partials).build()
-add_fold_kernel = mk_carrier_fold_kernel(add_fold_stage, add_combine, None)
+add_fold_kernel = add_fold_stage.compile(fold_functions(combine=add_combine))
 assert add_fold_kernel is not None
 
+scaled_add_spec = make_fold_spec(
+    input={
+        "x": buffer_spec("b v", ct.float32, req_grad=True, default=0),
+        "scale": buffer_spec("b", ct.float32, req_grad=True, default=0),
+    },
+    execution={
+        "acc": buffer_spec("b", ct.float32, default=0),
+    },
+    output={
+        "y": buffer_spec("b", ct.float32, default=0),
+    },
+    batch="b",
+    fold="v",
+)
+scaled_add_schedule = StageSchedule.make(
+    scaled_add_spec,
+    extents={"b": 4, "v": 8},
+    tiles={"b": 2, "v": 4},
+    loop=scaled_add_spec.fold,
+)
+scaled_add_stage = MapFold(scaled_add_spec, scaled_add_schedule).build()
+assert tuple(b.id.name for b in scaled_add_stage.stage.read_buffers.streamed) == ("x",)
+assert tuple(b.id.name for b in scaled_add_stage.stage.read_buffers.persistent) == ("scale",)
+scaled_add_kernel = scaled_add_stage.compile(fold_functions(scaled_add_map_reduce_sum, add_combine))
+assert scaled_add_kernel is not None
+scaled_add_partition_axis = scaled_add_spec.fold.partition_axis
+scaled_add_partial_schedule = StageSchedule.make(
+    scaled_add_spec,
+    extents={"b": 4, "v": 8},
+    tiles={"b": 2, "v": 2},
+    programs={scaled_add_partition_axis: 2},
+    loop=scaled_add_spec.fold,
+)
+scaled_add_combine_schedule = StageSchedule.make(
+    scaled_add_spec,
+    extents={"b": 4, "v": 8, scaled_add_partition_axis: 2},
+    tiles={"b": 2, scaled_add_partition_axis: 2},
+    programs={scaled_add_partition_axis: 1},
+    loop=scaled_add_partition_axis,
+)
+
 if torch.cuda.is_available():
+    print('cuda is available')
     x = torch.randn(4, 8, device="cuda")
     add_functions = fold_functions(add_map_reduce_sum, add_combine)
 
@@ -273,11 +329,32 @@ if torch.cuda.is_available():
     torch.cuda.synchronize()
     torch.testing.assert_close(y_full, x.sum(dim=1))
 
+    add_named_tid_forward = mk_fold_forward(add_full_plan, fold_functions(add_map_reduce_sum_with_named_tid, add_combine))
+    y_named_tid, = add_named_tid_forward(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y_named_tid, x.sum(dim=1))
+
     add_partial_plan = partial_fold_plan(add_spec, add_partial_schedule, add_combine_schedule)
     add_partial_forward = mk_fold_forward(add_partial_plan, add_functions)
     y_partial, = add_partial_forward(x)
     torch.cuda.synchronize()
     torch.testing.assert_close(y_partial, x.sum(dim=1))
+
+    scale = torch.randn(4, device="cuda")
+    scaled_add_forward = mk_fold_forward(full_fold_plan(scaled_add_spec, scaled_add_schedule), fold_functions(scaled_add_map_reduce_sum, add_combine))
+    y_scaled, = scaled_add_forward(x, scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y_scaled, (x * scale[:, None]).sum(dim=1))
+
+    scaled_add_partial_forward = mk_fold_forward(
+        partial_fold_plan(scaled_add_spec, scaled_add_partial_schedule, scaled_add_combine_schedule),
+        fold_functions(scaled_add_map_reduce_sum, add_combine),
+    )
+    y_scaled_partial, = scaled_add_partial_forward(x, scale)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y_scaled_partial, (x * scale[:, None]).sum(dim=1))
+else:
+    print('cuda is not available')
 
 print(fwd_fold.stage.domain.task_grid)
 print(fwd_fold.stage.cost.traffic)

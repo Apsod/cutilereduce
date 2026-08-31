@@ -21,10 +21,8 @@ from .impl import (
     FoldFunctions,
     compile_fold_forward,
     fold_functions,
-    mk_carrier_fold_kernel,
     mk_fold_autograd,
     mk_fold_forward,
-    mk_map_fold_stage_kernel,
 )
 from .plan import (
     AlgebraKind,
@@ -32,7 +30,6 @@ from .plan import (
     FoldSchedule,
     FoldSpec,
     FoldStage,
-    StageKind,
     StageSchedule,
     make_fold_spec,
 )
@@ -51,7 +48,6 @@ __all__ = [
     "FoldFunctions",
     "FullFold",
     "PartialFold",
-    "StageKind",
     "StageSchedule",
     "compile_fold_forward",
     "estimate_fold_forward",
@@ -61,10 +57,8 @@ __all__ = [
     "full_fold_plan",
     "generate_commutative_fold_configs",
     "make_fold_spec",
-    "mk_carrier_fold_kernel",
     "mk_fold_autograd",
     "mk_fold_forward",
-    "mk_map_fold_stage_kernel",
     "partial_fold_plan",
     "powers_of_two",
     "sweep_commutative_fold",
