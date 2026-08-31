@@ -117,6 +117,7 @@ class StageSchedule:
 class BuiltStage:
     stage: KernelStage
     partials: BufferBundle | None = None
+    carriers: BufferBundle | None = None
     partition_axis: Axis | None = None
     checkpoints: BufferBundle | None = None
     compiler: Callable[[BuiltStage, Any], Any] | None = None
@@ -125,7 +126,7 @@ class BuiltStage:
     def domain(self) -> StageDomain:
         return self.stage.domain
 
-    def compile(self, functions):
+    def compile(self, functions=None):
         if self.compiler is None:
             raise NotImplementedError(f"no compiler registered for stage {self.stage.name}")
         return self.compiler(self, functions)

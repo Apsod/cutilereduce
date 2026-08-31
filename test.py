@@ -14,8 +14,8 @@ from cutilereduce.core import (
 )
 from cutilereduce.core.stage_buffer import KernelBuffers, WRITE, BufferStorage
 from cutilereduce.core.buffer import buffer_spec, bundle_spec, Internal, Input, Output
-from cutilereduce.fold import AlgebraKind, fold_functions, mk_fold_forward, StageSchedule, make_fold_spec
-from cutilereduce.fold.commutative import full_fold_plan, partial_fold_plan, sweep_commutative_fold
+from cutilereduce.fold import AlgebraKind, fold_functions, mk_fold_autograd, mk_fold_forward, StageSchedule, make_fold_spec
+from cutilereduce.fold.commutative import commutative_backward_stage, full_fold_plan, partial_fold_plan, sweep_commutative_fold
 from cutilereduce.stages import (
     BufferUse,
     Fold,
@@ -24,6 +24,7 @@ from cutilereduce.stages import (
     MapFoldPartial,
     RecomputeFinalizeGradWrite,
     RecomputeFoldFinalizeGradWrite,
+    RecomputePrefixFoldFinalizeGradWrite,
     Scan,
     bind_buffer_uses,
 )
@@ -57,6 +58,36 @@ def add_combine(a, b):
 def scaled_add_map_reduce_sum(tid, x, scale):
     return (ct.sum(x * scale[:, None], axis=1),)
 
+
+@ct.function
+def add_embed(y, g_y):
+    return (g_y,)
+
+
+@ct.function
+def add_finalize(tid, x, g_x, g_y):
+    return (g_x + g_y[:, None],)
+
+
+@ct.function
+def add_map_reduce_backward(tid, x, g_x, g_y, prefix):
+    return (
+        (g_x + g_y[:, None],),
+        (prefix + ct.sum(x, axis=1),),
+    )
+
+
+@ct.function
+def scaled_add_finalize(tid, x, scale, g_x, g_scale, g_y):
+    return (
+        g_x + scale[:, None] * g_y[:, None],
+        g_scale + ct.sum(x * g_y[:, None], axis=1),
+    )
+
+
+def double_output(y):
+    return y * 2
+
 input = bundle_spec(
     Input,
     ctx=buffer_spec("b d", ct.bfloat16, req_grad=True, default=0),
@@ -70,11 +101,7 @@ output = bundle_spec(
     l = buffer_spec('b', ct.float32, default=0),
 )
 
-output_grad = bundle_spec(
-    Internal("output_grad"),
-    z=buffer_spec("b", ct.float32, default=0),
-    l=buffer_spec("b", ct.float32, default=0),
-)
+output_grad = output.as_output_grad()
 
 grad_storage = input.as_grad()
 
@@ -196,7 +223,7 @@ scan_stage = Scan.make(
     inputs=partial.partials,
 ).build()
 assert scan_stage.stage.name == "scan"
-assert scan_stage.checkpoints is not None
+assert scan_stage.carriers is not None
 assert scan_stage.stage.cost.materialized_storage_bytes > 0
 
 bwd_full = RecomputeFinalizeGradWrite(
@@ -217,16 +244,26 @@ bwd_partitioned = RecomputeFinalizeGradWrite(
 ).build()
 assert bwd_partitioned.partition_axis == partition_axis
 
-bwd_general = RecomputeFoldFinalizeGradWrite(
+bwd_general_full = RecomputeFoldFinalizeGradWrite(
+    general_spec,
+    full_schedule,
+    global_buffers=general_spec.output,
+    output_grad=general_spec.output.as_output_grad(),
+).build()
+assert bwd_general_full.stage.name == "recompute_fold_finalize_grad_write"
+assert bwd_general_full.checkpoints is None
+
+bwd_general = RecomputePrefixFoldFinalizeGradWrite(
     general_spec,
     partial_schedule,
     global_buffers=general_spec.output,
-    output_grad=output_grad,
-    prefix=scan_stage.checkpoints,
+    output_grad=general_spec.output.as_output_grad(),
+    prefix=scan_stage.carriers,
     prefix_axis=partition_axis,
 ).build()
-assert bwd_general.stage.name == "recompute_fold_finalize_grad_write"
-assert bwd_general.checkpoints == scan_stage.checkpoints
+assert bwd_general.stage.name == "recompute_prefix_fold_finalize_grad_write"
+assert bwd_general.checkpoints == scan_stage.carriers
+assert bwd_general.stage.read_buffers.materialized
 
 add_spec = make_fold_spec(
     input={
@@ -276,6 +313,38 @@ add_combine_schedule = StageSchedule.make(
 add_fold_stage = Fold(add_spec, add_combine_schedule, add_partition_axis, add_partial.partials).build()
 add_fold_kernel = add_fold_stage.compile(fold_functions(combine=add_combine))
 assert add_fold_kernel is not None
+add_bwd_stage = commutative_backward_stage(add_spec, add_schedule)
+add_bwd_kernel = add_bwd_stage.compile(fold_functions(embed=add_embed, finalize=add_finalize))
+assert add_bwd_kernel is not None
+add_general_bwd_stage = RecomputeFoldFinalizeGradWrite(
+    add_spec,
+    add_schedule,
+    global_buffers=add_spec.output,
+    output_grad=add_spec.output.as_output_grad(),
+).build()
+add_general_bwd_kernel = add_general_bwd_stage.compile(
+    fold_functions(embed=add_embed, map_reduce_backward=add_map_reduce_backward)
+)
+assert add_general_bwd_kernel is not None
+add_scan_stage = Scan.make(
+    add_spec,
+    add_combine_schedule,
+    scan_axis=add_partition_axis,
+    inputs=add_partial.partials,
+).build()
+add_general_prefix_bwd_stage = RecomputePrefixFoldFinalizeGradWrite(
+    add_spec,
+    add_partial_schedule,
+    global_buffers=add_spec.output,
+    output_grad=add_spec.output.as_output_grad(),
+    prefix=add_scan_stage.carriers,
+    prefix_axis=add_partition_axis,
+).build()
+assert add_general_prefix_bwd_stage.stage.read_buffers.materialized
+add_general_prefix_bwd_kernel = add_general_prefix_bwd_stage.compile(
+    fold_functions(embed=add_embed, map_reduce_backward=add_map_reduce_backward)
+)
+assert add_general_prefix_bwd_kernel is not None
 
 scaled_add_spec = make_fold_spec(
     input={
@@ -302,6 +371,24 @@ assert tuple(b.id.name for b in scaled_add_stage.stage.read_buffers.streamed) ==
 assert tuple(b.id.name for b in scaled_add_stage.stage.read_buffers.persistent) == ("scale",)
 scaled_add_kernel = scaled_add_stage.compile(fold_functions(scaled_add_map_reduce_sum, add_combine))
 assert scaled_add_kernel is not None
+scaled_add_bwd_stage = commutative_backward_stage(scaled_add_spec, scaled_add_schedule)
+assert tuple(b.id.name for b in scaled_add_bwd_stage.stage.write_buffers.streamed) == ("x",)
+assert tuple(b.id.name for b in scaled_add_bwd_stage.stage.write_buffers.persistent) == ("scale",)
+scaled_add_bwd_kernel = scaled_add_bwd_stage.compile(fold_functions(embed=add_embed, finalize=scaled_add_finalize))
+assert scaled_add_bwd_kernel is not None
+scaled_add_bwd_batch_loop_schedule = StageSchedule.make(
+    scaled_add_spec,
+    extents={"b": 4, "v": 8},
+    tiles={"b": 2, "v": 4},
+    loop="b",
+)
+scaled_add_bwd_batch_loop_stage = commutative_backward_stage(scaled_add_spec, scaled_add_bwd_batch_loop_schedule)
+assert tuple(b.id.name for b in scaled_add_bwd_batch_loop_stage.stage.read_buffers.persistent) == ()
+assert tuple(b.id.name for b in scaled_add_bwd_batch_loop_stage.stage.write_buffers.persistent) == ()
+scaled_add_bwd_batch_loop_kernel = scaled_add_bwd_batch_loop_stage.compile(
+    fold_functions(embed=add_embed, finalize=scaled_add_finalize)
+)
+assert scaled_add_bwd_batch_loop_kernel is not None
 scaled_add_partition_axis = scaled_add_spec.fold.partition_axis
 scaled_add_partial_schedule = StageSchedule.make(
     scaled_add_spec,
@@ -329,6 +416,11 @@ if torch.cuda.is_available():
     torch.cuda.synchronize()
     torch.testing.assert_close(y_full, x.sum(dim=1))
 
+    add_double_forward = mk_fold_forward(add_full_plan, fold_functions(add_map_reduce_sum, add_combine, to_output=double_output))
+    y_double, = add_double_forward(x)
+    torch.cuda.synchronize()
+    torch.testing.assert_close(y_double, 2 * x.sum(dim=1))
+
     add_named_tid_forward = mk_fold_forward(add_full_plan, fold_functions(add_map_reduce_sum_with_named_tid, add_combine))
     y_named_tid, = add_named_tid_forward(x)
     torch.cuda.synchronize()
@@ -353,6 +445,43 @@ if torch.cuda.is_available():
     y_scaled_partial, = scaled_add_partial_forward(x, scale)
     torch.cuda.synchronize()
     torch.testing.assert_close(y_scaled_partial, (x * scale[:, None]).sum(dim=1))
+
+    x_for_grad = x.detach().clone().requires_grad_()
+    add_autograd = mk_fold_autograd(
+        full_fold_plan(add_spec, add_schedule, backward_schedule=add_schedule),
+        fold_functions(add_map_reduce_sum, add_combine, embed=add_embed, finalize=add_finalize),
+    )
+    y_add, = add_autograd(x_for_grad)
+    y_add.sum().backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(x_for_grad.grad, torch.ones_like(x_for_grad))
+
+    x_for_double_grad = x.detach().clone().requires_grad_()
+    add_double_autograd = mk_fold_autograd(
+        full_fold_plan(add_spec, add_schedule, backward_schedule=add_schedule),
+        fold_functions(add_map_reduce_sum, add_combine, to_output=double_output, embed=add_embed, finalize=add_finalize),
+    )
+    y_add_double, = add_double_autograd(x_for_double_grad)
+    y_add_double.sum().backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(x_for_double_grad.grad, 2 * torch.ones_like(x_for_double_grad))
+
+    x_for_scaled_grad = x.detach().clone().requires_grad_()
+    scale_for_grad = scale.detach().clone().requires_grad_()
+    scaled_add_autograd = mk_fold_autograd(
+        partial_fold_plan(
+            scaled_add_spec,
+            scaled_add_partial_schedule,
+            scaled_add_combine_schedule,
+            backward_schedule=scaled_add_schedule,
+        ),
+        fold_functions(scaled_add_map_reduce_sum, add_combine, embed=add_embed, finalize=scaled_add_finalize),
+    )
+    y_scaled_auto, = scaled_add_autograd(x_for_scaled_grad, scale_for_grad)
+    y_scaled_auto.sum().backward()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(x_for_scaled_grad.grad, scale_for_grad.detach()[:, None].expand_as(x_for_scaled_grad))
+    torch.testing.assert_close(scale_for_grad.grad, x_for_scaled_grad.detach().sum(dim=1))
 else:
     print('cuda is not available')
 

@@ -76,6 +76,10 @@ def partial_buffers(spec, partition_axis: Axis, partial_tag: str = "partial") ->
 class MapFold:
     spec: object
     schedule: StageSchedule
+    map_reduce: object | None = None
+    combine: object | None = None
+    initial: object | None = None
+    to_semantic: object | None = None
 
     def build(self) -> BuiltStage:
         compute_axes = fold_compute_axes(
@@ -98,7 +102,14 @@ class MapFold:
         ))
         return BuiltStage(
             stage=KernelStage("map_fold", domain, buffers, self.spec.map_fold_work),
-            compiler=compile_map_fold_stage,
+            compiler=lambda stage, functions: compile_map_fold_stage(
+                stage,
+                functions,
+                map_reduce=self.map_reduce,
+                combine=self.combine,
+                initial=self.initial,
+                to_semantic=self.to_semantic,
+            ),
         )
 
 
@@ -108,6 +119,9 @@ class MapFoldPartial:
     schedule: StageSchedule
     partition_axis: Axis
     partials: BufferBundle
+    map_reduce: object | None = None
+    combine: object | None = None
+    initial: object | None = None
 
     @classmethod
     def make(
@@ -116,6 +130,9 @@ class MapFoldPartial:
             schedule: StageSchedule,
             *,
             partial_tag: str = "partial",
+            map_reduce=None,
+            combine=None,
+            initial=None,
             ) -> MapFoldPartial:
         partition_axis = spec.fold.partition_axis
         return cls(
@@ -123,6 +140,9 @@ class MapFoldPartial:
             schedule=schedule,
             partition_axis=partition_axis,
             partials=partial_buffers(spec, partition_axis, partial_tag),
+            map_reduce=map_reduce,
+            combine=combine,
+            initial=initial,
         )
 
     @property
@@ -162,18 +182,19 @@ class MapFoldPartial:
             stage=KernelStage("map_fold_partial", domain, buffers, self.spec.map_fold_work),
             partials=self.partials,
             partition_axis=self.partition_axis,
-            compiler=compile_map_fold_partial_stage,
+            compiler=lambda stage, functions: compile_map_fold_partial_stage(
+                stage,
+                functions,
+                map_reduce=self.map_reduce,
+                combine=self.combine,
+                initial=self.initial,
+            ),
         )
 
 
-def _compile_map_fold_like_stage(stage: BuiltStage, functions: StageFunctions, *, write_carrier: bool):
+def make_map_fold_program(stage: BuiltStage, map_reduce, combine, initial=None):
     grid = stage_grid_info(stage)
-    write = make_buffer_helper(stage.stage.write_buffers)
     execution = make_buffer_helper(stage.stage.resident_buffers.intermediate)
-    map_reduce = functions.map_reduce
-    combine = functions.combine
-    to_semantic = functions.to_semantic or identity
-    to_output = functions.to_output or identity
     if map_reduce is None or combine is None:
         raise ValueError("map-fold stage requires map_reduce and combine functions")
     read_split = make_buffer_split(
@@ -193,32 +214,66 @@ def _compile_map_fold_like_stage(stage: BuiltStage, functions: StageFunctions, *
 
     loop = grid.loop_with_tail(loop_body)
 
+    @ct.function
+    def map_fold_program(tid, program_tid, read_buffers):
+        persistent_buffers = read_split.left(read_buffers)
+        streamed_buffers = read_split.right(read_buffers)
+
+        persistent_inputs = read_persistent.load(tid + program_tid, persistent_buffers)
+        streamed_views = read_streamed.view(streamed_buffers)
+
+        if initial is None:
+            acc = execution.init()
+        else:
+            acc = initial()
+        return loop(tid, program_tid, acc, persistent_inputs, streamed_views)
+
+    return map_fold_program
+
+
+def _compile_map_fold_like_stage(
+        stage: BuiltStage,
+        functions: StageFunctions | None,
+        *,
+        write_carrier: bool,
+        map_reduce=None,
+        combine=None,
+        initial=None,
+        to_semantic=None,
+        ):
+    grid = stage_grid_info(stage)
+    write = make_buffer_helper(stage.stage.write_buffers)
+    if functions is not None:
+        map_reduce = map_reduce or functions.map_reduce
+        combine = combine or functions.combine
+        to_semantic = to_semantic or functions.to_semantic
+    to_semantic = to_semantic or identity
+    map_fold_program = make_map_fold_program(
+        stage,
+        map_reduce,
+        combine,
+        initial,
+    )
+
     @ct.kernel
     def kernel(read_buffers, write_buffers):
         tid, program_tid = grid.init()
         stage_tid = tid + program_tid
 
-        persistent_buffers = read_split.left(read_buffers)
-        streamed_buffers = read_split.right(read_buffers)
+        acc = map_fold_program(tid, program_tid, read_buffers)
 
-        persistent_inputs = read_persistent.load(stage_tid, persistent_buffers)
-        streamed_views = read_streamed.view(streamed_buffers)
-
-        acc = execution.init()
-        acc = loop(tid, program_tid, acc, persistent_inputs, streamed_views)
-
-        out = acc if write_carrier else to_output(*to_semantic(*acc))
+        out = acc if write_carrier else to_semantic(*acc)
         write.store(stage_tid, write_buffers, out)
 
     return kernel
 
 
-def compile_map_fold_stage(stage: BuiltStage, functions: StageFunctions):
-    return _compile_map_fold_like_stage(stage, functions, write_carrier=False)
+def compile_map_fold_stage(stage: BuiltStage, functions=None, **kwargs):
+    return _compile_map_fold_like_stage(stage, functions, write_carrier=False, **kwargs)
 
 
-def compile_map_fold_partial_stage(stage: BuiltStage, functions: StageFunctions):
-    return _compile_map_fold_like_stage(stage, functions, write_carrier=True)
+def compile_map_fold_partial_stage(stage: BuiltStage, functions=None, **kwargs):
+    return _compile_map_fold_like_stage(stage, functions, write_carrier=True, **kwargs)
 
 
 __all__ = [
@@ -228,6 +283,7 @@ __all__ = [
     "compile_map_fold_stage",
     "compile_map_fold_partial_stage",
     "fold_compute_axes",
+    "make_map_fold_program",
     "partial_buffers",
     "stage_axis",
 ]

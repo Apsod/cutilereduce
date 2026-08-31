@@ -20,6 +20,7 @@ class StageFunctions:
     embed: Any = None
     finalize: Any = None
     map_backward: Any = None
+    map_reduce_backward: Any = None
 
 
 class Bundle:
@@ -255,6 +256,15 @@ def make_buffer_split(
     )
 
 
+def make_buffer_project(all_buffers, selected_buffers):
+    index = _buffer_indices(tuple(all_buffers), tuple(selected_buffers))
+
+    def _project(values):
+        return retile(values, index)
+
+    return _project
+
+
 @dataclass(frozen=True)
 class StageGridInfo:
     task_grid: ct.Constant[tuple[int, ...]]
@@ -323,17 +333,17 @@ class StageGridInfo:
     def set_loop_index(self, tid, value):
         return set_at(tid, self.loop_compute_index, value)
 
-    def loop_with_tail(self, body, static=True: ct.Constant[bool]):
+    def loop_with_tail(self, body, *, static: bool = True, start: int = 0):
         @ct.function
         def _loop(tid, program_tid, carry, *args):
             loop_offset, loop_size, extra = self.loop_offset_and_size(program_tid)
             if static:
-                for i in ct.static_iter(range(loop_size)):
+                for i in ct.static_iter(range(start, loop_size)):
                     loop_tid = self.set_loop_index(tid, loop_offset + i)
                     loop_stage_tid = loop_tid + program_tid
                     carry = body(loop_tid, loop_stage_tid, carry, *args)
             else:
-                for i in range(loop_size):
+                for i in range(start, loop_size):
                     loop_tid = self.set_loop_index(tid, loop_offset + i)
                     loop_stage_tid = loop_tid + program_tid
                     carry = body(loop_tid, loop_stage_tid, carry, *args)
@@ -413,11 +423,14 @@ __all__ = [
     "ctzipmap",
     "identity",
     "inverse_p",
+    "full_tuple",
+    "make_buffer_project",
     "make_buffer_split",
     "make_buffer_helper",
     "merge_tuples",
     "require_resolved",
     "retile",
+    "scatter_tuple",
     "set_at",
     "stage_grid_info",
 ]

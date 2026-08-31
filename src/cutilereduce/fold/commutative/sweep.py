@@ -181,7 +181,9 @@ def _single_configs(
         sizes,
         max_tile,
     )
-    return configs.with_columns(pl.lit(1).alias(f"cfg:{symbols.partition_count}"))
+    return configs.with_columns(
+        pl.lit(1, dtype=pl.Int64).alias(f"cfg:{symbols.partition_count}")
+    )
 
 
 def _partial_configs(
@@ -257,11 +259,12 @@ def _evaluate_partial_path(
         sweep: Sweep = Sweep.default,
         ):
     partition_axis = spec.fold.partition_axis
+    frontier_sweep = sweep.with_frontier_keys(f"cfg:{symbols.partition_count}")
     partial = MapFoldPartial.make(
         spec,
         _partial_schedule(spec, sizes, symbols, partition_axis),
     )
-    fold = sweep.apply(partial.build().stage, configs, symbols=hardware)
+    fold = frontier_sweep.apply(partial.build().stage, configs, symbols=hardware)
     if fold.is_empty():
         return fold
 
@@ -279,7 +282,7 @@ def _evaluate_partial_path(
         partition_axis=partition_axis,
         partials=partial.partials,
     ).build()
-    combine = sweep.apply(combine_stage.stage, combine_configs, symbols=hardware)
+    combine = frontier_sweep.apply(combine_stage.stage, combine_configs, symbols=hardware)
     if combine.is_empty():
         return combine
 

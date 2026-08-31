@@ -97,15 +97,25 @@ FoldStage = BuiltStage
 class FoldPlan:
     spec: FoldSpec
     stages: tuple[FoldStage, ...]
+    backward_stages: tuple[FoldStage, ...] = ()
 
     @classmethod
-    def make(cls, spec: FoldSpec, stages: tuple[FoldStage, ...]) -> FoldPlan:
+    def make(
+            cls,
+            spec: FoldSpec,
+            stages: tuple[FoldStage, ...],
+            backward_stages: tuple[FoldStage, ...] = (),
+            ) -> FoldPlan:
         spec.check()
-        return cls(spec=spec, stages=tuple(stages))
+        return cls(spec=spec, stages=tuple(stages), backward_stages=tuple(backward_stages))
 
     @property
     def forward(self) -> tuple[FoldStage, ...]:
         return self.stages
+
+    @property
+    def backward(self) -> tuple[FoldStage, ...]:
+        return self.backward_stages
 
 
 __all__ = [

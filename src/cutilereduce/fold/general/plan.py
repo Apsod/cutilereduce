@@ -14,8 +14,6 @@ def partial_fold_plan(
         scan_schedule: StageSchedule,
         *,
         partial_tag: str = "partial",
-        checkpoint_tag: str = "checkpoint",
-        write_checkpoints: bool = True,
         ) -> FoldPlan:
     partial = MapFoldPartial.make(spec, partial_schedule, partial_tag=partial_tag)
     scan = Scan.make(
@@ -23,8 +21,7 @@ def partial_fold_plan(
         scan_schedule,
         scan_axis=partial.partition_axis,
         inputs=partial.partials,
-        checkpoint_tag=checkpoint_tag,
-        write_checkpoints=write_checkpoints,
+        outputs=spec.output,
     )
     return FoldPlan.make(spec, (partial.build(), scan.build()))
 

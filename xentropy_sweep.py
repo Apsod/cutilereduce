@@ -32,7 +32,7 @@ def xentropy_spec():
 def main():
     result = sweep_commutative_fold(
         xentropy_spec(),
-        sizes={"b": 1024 * 16, "v": 1024 * 16, "d": 128},
+        sizes={"b": 128 * 1, "v": 128 * 128, "d": 128},
         hardware=l4,
     )
 

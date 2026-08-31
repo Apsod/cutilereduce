@@ -185,12 +185,16 @@ class Sweep:
     key: str | pl.Expr
     top_k: int = 20
     threshold: float = 10
+    frontier_keys: tuple[str, ...] = ()
 
     def add_attributes(self, *attributes: str):
         return replace(self, attributes=(*self.attributes, *attributes))
 
     def add_filters(self, *filters: pl.Expr):
         return replace(self, filters=(*self.filters, *filters))
+
+    def with_frontier_keys(self, *keys: str):
+        return replace(self, frontier_keys=tuple(keys))
 
     @property
     def key_expr(self):
@@ -207,9 +211,16 @@ class Sweep:
         frame = a if b is None else pl.concat((a, b))
         if frame.is_empty():
             return frame
-        frame = frame.sort(self.key_expr)
-        threshold = frame.select(self.key_expr.min()).item() * self.threshold
-        return frame.filter(self.key_expr <= threshold).head(self.top_k)
+        if not self.frontier_keys:
+            frame = frame.sort(self.key_expr)
+            threshold = frame.select(self.key_expr.min()).item() * self.threshold
+            return frame.filter(self.key_expr <= threshold).head(self.top_k)
+
+        columns = frame.columns
+        frame = frame.sort([*self.frontier_keys, self.key_expr])
+        frontier_min = self.key_expr.min().over(self.frontier_keys)
+        frame = frame.filter(self.key_expr <= frontier_min * self.threshold)
+        return frame.group_by(self.frontier_keys, maintain_order=True).head(self.top_k).select(columns)
 
     def apply(self, stage: KernelStage, configs, **eval_kwargs) -> pl.DataFrame:
         frontier = None
@@ -241,7 +252,6 @@ Sweep.default = Sweep(
     ),
     filters=(
         pl.col("resident_programs_per_sm") >= 1,
-        pl.col("work_efficiency") >= 0.5,
         pl.col("partial_storage_ratio") <= 1,
     ),
     key="estimated_time",

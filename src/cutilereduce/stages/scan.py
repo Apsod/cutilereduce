@@ -1,19 +1,23 @@
 from __future__ import annotations
 
-from copy import replace
 from dataclasses import dataclass
+
+import cuda.tile as ct
 
 from cutilereduce.core.axis import Axis
 from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.core.kernel_stage import KernelStage
-from cutilereduce.core.stage_buffer import BufferStorage
+from cutilereduce.core.stage_buffer import BufferStorage, StageAccess
 from cutilereduce.core.stage_domain import AxisRole, ProgramAxis, ProgramAxes, StageDomain
 from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
+from cutilereduce.stages.codegen import (
+    StageFunctions,
+    identity,
+    make_buffer_helper,
+    make_buffer_split,
+    stage_grid_info,
+)
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
-
-
-def tag_buffers(bundle: BufferBundle, tag: str) -> BufferBundle:
-    return bundle.map(lambda b: replace(b, id=b.id.tag(tag)))
 
 
 @dataclass(frozen=True)
@@ -22,8 +26,11 @@ class Scan:
     schedule: StageSchedule
     scan_axis: Axis
     inputs: BufferBundle
-    checkpoints: BufferBundle | None = None
-    write_checkpoints: bool = True
+    carriers: BufferBundle
+    outputs: BufferBundle | None = None
+    combine: object | None = None
+    initial: object | None = None
+    to_semantic: object | None = None
 
     @classmethod
     def make(
@@ -33,17 +40,21 @@ class Scan:
             *,
             scan_axis: Axis,
             inputs: BufferBundle,
-            checkpoint_tag: str = "checkpoint",
-            write_checkpoints: bool = True,
+            outputs: BufferBundle | None = None,
+            combine=None,
+            initial=None,
+            to_semantic=None,
             ) -> Scan:
-        checkpoints = tag_buffers(inputs, checkpoint_tag) if write_checkpoints else None
         return cls(
             spec=spec,
             schedule=schedule,
             scan_axis=scan_axis,
             inputs=inputs,
-            checkpoints=checkpoints,
-            write_checkpoints=write_checkpoints,
+            carriers=inputs,
+            outputs=outputs,
+            combine=combine,
+            initial=initial,
+            to_semantic=to_semantic,
         )
 
     def build(self) -> BuiltStage:
@@ -67,28 +78,108 @@ class Scan:
             program_axes=ProgramAxes(values=tuple(program_axes)),
             loop=self.schedule.loop or self.scan_axis.id,
         )
-        uses = [
-            BufferUse.read_resident(self.inputs, BufferStorage.Materialized),
-            BufferUse.write(self.spec.output),
-        ]
-        if self.checkpoints is not None:
-            uses.append(BufferUse.write(self.checkpoints, BufferStorage.Materialized))
+        uses = [BufferUse(
+            bundle=self.carriers,
+            access=StageAccess.READ | StageAccess.WRITE | StageAccess.RESIDENT,
+            storage=BufferStorage.Materialized,
+        )]
+        if self.outputs is not None:
+            uses.append(BufferUse.write(self.outputs))
         buffers = bind_buffer_uses(domain, tuple(uses))
         return BuiltStage(
             stage=KernelStage("scan", domain, buffers, self.spec.combine_work),
             partials=self.inputs,
+            carriers=self.carriers,
             partition_axis=self.scan_axis,
-            checkpoints=self.checkpoints,
-            compiler=compile_scan_stage,
+            compiler=lambda stage, functions: compile_scan_stage(
+                stage,
+                functions,
+                combine=self.combine,
+                initial=self.initial,
+                to_semantic=self.to_semantic,
+            ),
         )
 
 
-def compile_scan_stage(stage: BuiltStage, functions):
-    raise NotImplementedError("cutile scan codegen is not implemented for the new stage core yet")
+def make_scan_program(stage: BuiltStage, combine, carriers: BufferBundle, initial=None, to_semantic=None):
+    grid = stage_grid_info(stage)
+    read = make_buffer_helper(stage.stage.read_buffers)
+    all_writes = tuple(stage.stage.write_buffers)
+    carrier_writes = tuple(buffer for buffer in all_writes if buffer.id in carriers)
+    output_writes = tuple(buffer for buffer in all_writes if buffer.id not in carriers)
+    write_split = make_buffer_split(all_writes, carrier_writes, output_writes)
+    write_carrier = make_buffer_helper(carrier_writes)
+    write_output = make_buffer_helper(output_writes)
+    to_semantic = to_semantic or identity
+
+    @ct.function
+    def loop_body(loop_tid, loop_stage_tid, acc, read_buffers, carrier_buffers):
+        value = read.load(loop_stage_tid, read_buffers)
+        acc = combine(*acc, *value)
+        write_carrier.store(loop_stage_tid, carrier_buffers, acc)
+        return acc
+
+    if initial is None:
+        @ct.function
+        def scan_program(tid, program_tid, read_buffers, write_buffers):
+            carrier_buffers = write_split.left(write_buffers)
+            output_buffers = write_split.right(write_buffers)
+            loop_offset, _, _ = grid.loop_offset_and_size(program_tid)
+            loop_tid = grid.set_loop_index(tid, loop_offset)
+            acc = read.load(loop_tid + program_tid, read_buffers)
+            write_carrier.store(loop_tid + program_tid, carrier_buffers, acc)
+            loop = grid.loop_with_tail(loop_body, start=1)
+            acc = loop(tid, program_tid, acc, read_buffers, carrier_buffers)
+            if output_writes:
+                stage_tid = tid + program_tid
+                write_output.store(stage_tid, output_buffers, to_semantic(*acc))
+            return acc
+    else:
+        loop = grid.loop_with_tail(loop_body, start=0)
+
+        @ct.function
+        def scan_program(tid, program_tid, read_buffers, write_buffers):
+            carrier_buffers = write_split.left(write_buffers)
+            output_buffers = write_split.right(write_buffers)
+            acc = loop(tid, program_tid, initial(), read_buffers, carrier_buffers)
+            if output_writes:
+                stage_tid = tid + program_tid
+                write_output.store(stage_tid, output_buffers, to_semantic(*acc))
+            return acc
+
+    return scan_program
+
+
+def compile_scan_stage(
+        stage: BuiltStage,
+        functions: StageFunctions | None = None,
+        *,
+        combine=None,
+        initial=None,
+        to_semantic=None,
+        ):
+    grid = stage_grid_info(stage)
+    if functions is not None:
+        combine = combine or functions.combine
+        to_semantic = to_semantic or functions.to_semantic
+    scan_program = make_scan_program(
+        stage,
+        combine,
+        stage.carriers,
+        initial=initial,
+        to_semantic=to_semantic,
+    )
+
+    @ct.kernel
+    def kernel(read_buffers, write_buffers):
+        tid, program_tid = grid.init()
+        scan_program(tid, program_tid, read_buffers, write_buffers)
+
+    return kernel
 
 
 __all__ = [
     "Scan",
     "compile_scan_stage",
-    "tag_buffers",
+    "make_scan_program",
 ]

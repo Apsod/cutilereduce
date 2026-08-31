@@ -15,11 +15,13 @@ import sympy
 class BufferRole(Enum):
     Input = "input"
     Output = "output"
-    GradStorage = "grad_storage"
+    InputGrad = "input_grad"
+    OutputGrad = "output_grad"
 
 Input = BufferRole.Input
 Output = BufferRole.Output
-GradStorage = BufferRole.GradStorage
+InputGrad = BufferRole.InputGrad
+OutputGrad = BufferRole.OutputGrad
 
 @dataclass(frozen=True, order=True)
 class Internal:
@@ -42,9 +44,18 @@ class BufferId:
         return replace(self, role = self.role.tag(tag))
     
     @property
-    def as_grad(self):
+    def as_input_grad(self):
         assert self.role == BufferRole.Input
-        return replace(self, role=BufferRole.GradStorage)
+        return replace(self, role=BufferRole.InputGrad)
+
+    @property
+    def as_output_grad(self):
+        assert self.role == BufferRole.Output
+        return replace(self, role=BufferRole.OutputGrad)
+
+    @property
+    def as_grad(self):
+        return self.as_input_grad
 
 @dataclass(frozen=True)
 class ShapeData:
@@ -74,7 +85,17 @@ class Buffer:
         assert self.req_grad
         return replace(
             self,
-            id=self.id.as_grad,
+            id=self.id.as_input_grad,
+            dtype=dtype,
+            req_grad=False,
+            default=0,
+        )
+
+    def as_output_grad(self, dtype=ct.float32) -> Self:
+        assert self.role == BufferRole.Output
+        return replace(
+            self,
+            id=self.id.as_output_grad,
             dtype=dtype,
             req_grad=False,
             default=0,
@@ -111,6 +132,10 @@ class BufferBundle(TupleSet[Buffer]):
     def as_grad(self, dtype=ct.float32):
         assert all(b.role == Input for b in self)
         return self.subset(lambda b: b.req_grad).map(lambda b: b.as_grad(dtype))
+
+    def as_output_grad(self, dtype=ct.float32):
+        assert all(b.role == Output for b in self)
+        return self.map(lambda b: b.as_output_grad(dtype))
 
     @classmethod
     def make(cls, role: BufferRole | Internal, **buffers: BufferSpec) -> Self:

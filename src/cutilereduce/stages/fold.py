@@ -20,6 +20,9 @@ class Fold:
     schedule: StageSchedule
     partition_axis: Axis
     partials: BufferBundle
+    combine: object | None = None
+    initial: object | None = None
+    to_semantic: object | None = None
 
     def build(self) -> BuiltStage:
         compute_axes = fold_compute_axes(
@@ -49,36 +52,68 @@ class Fold:
             stage=KernelStage("fold", domain, buffers, self.spec.combine_work),
             partials=self.partials,
             partition_axis=self.partition_axis,
-            compiler=compile_fold_stage,
+            compiler=lambda stage, functions: compile_fold_stage(
+                stage,
+                functions,
+                combine=self.combine,
+                initial=self.initial,
+                to_semantic=self.to_semantic,
+            ),
         )
 
 
-def compile_fold_stage(stage: BuiltStage, functions: StageFunctions):
+def make_fold_program(stage: BuiltStage, combine, initial=None):
     grid = stage_grid_info(stage)
     read = make_buffer_helper(stage.stage.read_buffers)
-    write = make_buffer_helper(stage.stage.write_buffers)
-    combine = functions.combine
-    to_semantic = functions.to_semantic or identity
-    to_output = functions.to_output or identity
     if combine is None:
         raise ValueError("fold stage requires combine function")
 
     @ct.function
-    def loop_body(tid, program_tid, loop_i, acc, read_buffers):
-        loop_tid = grid.set_loop_index(tid, loop_i)
-        return combine(*acc, *read.load(loop_tid + program_tid, read_buffers))
+    def loop_body(loop_tid, loop_stage_tid, acc, read_buffers):
+        return combine(*acc, *read.load(loop_stage_tid, read_buffers))
 
-    loop = grid.loop_with_tail(loop_body)
+
+    if initial is None:
+        loop = grid.loop_with_tail(loop_body, start=1)
+        @ct.function
+        def fold_program(tid, program_tid, read_buffers):
+            loop_offset, _, _ = grid.loop_offset_and_size(program_tid)
+            loop_tid = grid.set_loop_index(tid, loop_offset)
+            acc = read.load(loop_tid + program_tid, read_buffers)
+            return loop(tid, program_tid, acc, read_buffers)
+    else:
+        loop = grid.loop_with_tail(loop_body, start=0)
+
+        @ct.function
+        def fold_program(tid, program_tid, read_buffers):
+            acc = initial()
+            return loop(tid, program_tid, acc, read_buffers)
+
+    return fold_program
+
+
+def compile_fold_stage(
+        stage: BuiltStage,
+        functions: StageFunctions | None = None,
+        *,
+        combine=None,
+        initial=None,
+        to_semantic=None,
+        ):
+    grid = stage_grid_info(stage)
+    write = make_buffer_helper(stage.stage.write_buffers)
+    if functions is not None:
+        combine = combine or functions.combine
+        to_semantic = to_semantic or functions.to_semantic
+    to_semantic = to_semantic or identity
+    fold_program = make_fold_program(stage, combine, initial)
 
     @ct.kernel
     def kernel(read_buffers, write_buffers):
         tid, program_tid = grid.init()
         stage_tid = tid + program_tid
-        loop_offset, loop_size, loop_extra = grid.loop_offset_and_size(program_tid)
-        loop_tid = grid.set_loop_index(tid, loop_offset)
-        acc = read.load(loop_tid + program_tid, read_buffers)
-        acc = loop(tid, program_tid, loop_offset + 1, loop_size - 1, loop_extra, acc, read_buffers)
-        out = to_output(*to_semantic(*acc))
+        acc = fold_program(tid, program_tid, read_buffers)
+        out = to_semantic(*acc)
         write.store(stage_tid, write_buffers, out)
 
     return kernel
@@ -87,4 +122,5 @@ def compile_fold_stage(stage: BuiltStage, functions: StageFunctions):
 __all__ = [
     "Fold",
     "compile_fold_stage",
+    "make_fold_program",
 ]

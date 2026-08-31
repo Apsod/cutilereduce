@@ -7,7 +7,7 @@ from typing import Any
 import cuda.tile as ct
 import torch
 
-from cutilereduce.core.buffer import BufferId
+from cutilereduce.core.buffer import BufferId, BufferRole
 from cutilereduce.core.stage_buffer import StageBuffer
 from cutilereduce.fold.plan import FoldPlan, FoldStage
 from cutilereduce.stages import StageFunctions
@@ -27,6 +27,7 @@ def fold_functions(
         embed=None,
         finalize=None,
         map_backward=None,
+        map_reduce_backward=None,
         ) -> FoldFunctions:
     return FoldFunctions(
         map_reduce=map_reduce,
@@ -36,6 +37,7 @@ def fold_functions(
         embed=embed,
         finalize=finalize,
         map_backward=map_backward,
+        map_reduce_backward=map_reduce_backward,
     )
 
 
@@ -59,6 +61,9 @@ class CompiledStage:
     def allocate_writes(self, device=None) -> tuple[torch.Tensor, ...]:
         return tuple(buffer.mk_empty(device=device) for buffer in self.write_buffers)
 
+    def allocate_zero_writes(self, device=None) -> tuple[torch.Tensor, ...]:
+        return tuple(buffer.mk_zeros(device=device) for buffer in self.write_buffers)
+
 
 def _lookup(buffer: StageBuffer, tensors: Mapping[BufferId, torch.Tensor]) -> torch.Tensor:
     try:
@@ -72,6 +77,23 @@ def compile_fold_forward(plan: FoldPlan, functions: FoldFunctions) -> tuple[Comp
         CompiledStage(stage=stage, kernel=stage.compile(functions))
         for stage in plan.forward
     )
+
+
+def compile_fold_backward(plan: FoldPlan, functions: FoldFunctions) -> tuple[CompiledStage, ...]:
+    return tuple(
+        CompiledStage(stage=stage, kernel=stage.compile(functions))
+        for stage in plan.backward
+    )
+
+
+def _as_tuple(outputs):
+    return outputs if isinstance(outputs, tuple) else (outputs,)
+
+
+def _apply_to_output(functions: FoldFunctions, semantic_outputs: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
+    if functions.to_output is None:
+        return semantic_outputs
+    return _as_tuple(functions.to_output(*semantic_outputs))
 
 
 def mk_fold_forward(
@@ -100,18 +122,101 @@ def mk_fold_forward(
             )
             for buffer, tensor in zip(compiled_stage.write_buffers, writes, strict=True):
                 tensors[buffer.id] = tensor
-        return tuple(tensors[output_id] for output_id in output_ids)
+        semantic_outputs = tuple(tensors[output_id] for output_id in output_ids)
+        return _apply_to_output(functions, semantic_outputs)
 
     return forward
 
 
-def mk_fold_autograd(plan: FoldPlan, map_reduce, combine, to_semantic, to_output, map_finalize, embed):
-    raise NotImplementedError("new-core fold autograd codegen is not implemented yet")
+def _is_output_grad(buffer: StageBuffer) -> bool:
+    return buffer.role == BufferRole.OutputGrad
+
+
+def mk_fold_autograd(
+        plan: FoldPlan,
+        functions: FoldFunctions,
+        *,
+        device="cuda",
+        ):
+    if not plan.backward:
+        raise ValueError("fold autograd requires a plan with backward stages")
+    forward_stages = compile_fold_forward(plan, functions)
+    backward_stages = compile_fold_backward(plan, functions)
+    input_ids = tuple(buffer.id for buffer in plan.spec.input)
+    output_ids = tuple(buffer.id for buffer in plan.spec.output)
+    output_grad_ids = tuple(
+        buffer.id
+        for buffer in backward_stages[0].read_buffers
+        if _is_output_grad(buffer)
+    )
+    grad_storage_ids = {
+        buffer.id.as_input_grad
+        for buffer in plan.spec.input
+        if buffer.req_grad
+    }
+
+    def _run_forward(inputs):
+        tensors = dict(zip(input_ids, inputs, strict=True))
+        for compiled_stage in forward_stages:
+            writes = compiled_stage.allocate_writes(device=device)
+            read_args = tuple(_lookup(buffer, tensors) for buffer in compiled_stage.read_buffers)
+            write_args = tuple(writes)
+            ct.launch(
+                torch.cuda.current_stream(),
+                compiled_stage.launch_grid,
+                compiled_stage.kernel,
+                (read_args, write_args),
+            )
+            for buffer, tensor in zip(compiled_stage.write_buffers, writes, strict=True):
+                tensors[buffer.id] = tensor
+        semantic_outputs = tuple(tensors[output_id] for output_id in output_ids)
+        return tensors, semantic_outputs
+
+    class CutileFoldFunction(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, *inputs):
+            if len(inputs) != len(input_ids):
+                raise ValueError(f"expected {len(input_ids)} inputs, got {len(inputs)}")
+            tensors, semantic_outputs = _run_forward(inputs)
+            ctx.save_for_backward(*inputs, *semantic_outputs)
+            return semantic_outputs
+
+        @staticmethod
+        def backward(ctx, *grad_outputs):
+            saved = ctx.saved_tensors
+            inputs = saved[:len(input_ids)]
+            outputs = saved[len(input_ids):]
+            tensors = dict(zip(input_ids, inputs, strict=True))
+            tensors.update(zip(output_ids, outputs, strict=True))
+            tensors.update(zip(output_grad_ids, grad_outputs, strict=True))
+            for compiled_stage in backward_stages:
+                writes = compiled_stage.allocate_zero_writes(device=device)
+                read_args = tuple(_lookup(buffer, tensors) for buffer in compiled_stage.read_buffers)
+                write_args = tuple(writes)
+                ct.launch(
+                    torch.cuda.current_stream(),
+                    compiled_stage.launch_grid,
+                    compiled_stage.kernel,
+                    (read_args, write_args),
+                )
+                for buffer, tensor in zip(compiled_stage.write_buffers, writes, strict=True):
+                    tensors[buffer.id] = tensor
+            return tuple(
+                tensors[input_id.as_input_grad] if input_id.as_input_grad in grad_storage_ids else None
+                for input_id in input_ids
+            )
+
+    def apply(*inputs):
+        semantic_outputs = _as_tuple(CutileFoldFunction.apply(*inputs))
+        return _apply_to_output(functions, semantic_outputs)
+
+    return apply
 
 
 __all__ = [
     "CompiledStage",
     "FoldFunctions",
+    "compile_fold_backward",
     "compile_fold_forward",
     "fold_functions",
     "mk_fold_autograd",
