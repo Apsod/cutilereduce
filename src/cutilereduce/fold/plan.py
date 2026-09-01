@@ -33,7 +33,8 @@ class FoldSpec:
     input: BufferBundle
     execution: BufferBundle
     output: BufferBundle
-    intermediate: BufferBundle
+    map_intermediate: BufferBundle
+    finalize_intermediate: BufferBundle
     batch: Axes
     fold: Axis
     map_fold_work: WorkModel = WorkModel()
@@ -48,7 +49,13 @@ class FoldSpec:
     @property
     def axes(self) -> Axes:
         ret = self.batch | Axes(values=(self.fold,))
-        for bundle in (self.input, self.execution, self.output, self.intermediate):
+        for bundle in (
+            self.input,
+            self.execution,
+            self.output,
+            self.map_intermediate,
+            self.finalize_intermediate,
+        ):
             for buffer in bundle:
                 ret = ret | buffer.axes
         return ret
@@ -69,7 +76,8 @@ def make_fold_spec(
         input: Mapping[str, BufferSpec],
         execution: Mapping[str, BufferSpec],
         output: Mapping[str, BufferSpec],
-        intermediate: Mapping[str, BufferSpec] | None = None,
+        map_intermediate: Mapping[str, BufferSpec] | None = None,
+        finalize_intermediate: Mapping[str, BufferSpec] | None = None,
         batch: str | Axes,
         fold: str | Axis,
         map_fold_work: WorkModel = WorkModel(),
@@ -83,7 +91,13 @@ def make_fold_spec(
         input=bundle_spec(Input, **dict(input)),
         execution=bundle_spec(Internal("execution"), **dict(execution)),
         output=bundle_spec(Output, **dict(output)),
-        intermediate=bundle_spec(Internal("intermediate"), **dict(intermediate or {})),
+        map_intermediate=bundle_spec(
+            Internal("map_intermediate"), **dict(map_intermediate or {})
+        ),
+        finalize_intermediate=bundle_spec(
+            Internal("finalize_intermediate"),
+            **dict(finalize_intermediate or {}),
+        ),
         batch=batch_axes,
         fold=fold_axis,
         map_fold_work=map_fold_work,

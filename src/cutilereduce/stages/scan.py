@@ -118,23 +118,47 @@ def make_scan_program(stage: BuiltStage, combine, carriers: BufferBundle, initia
     write_output = make_buffer_helper(output_writes)
     to_semantic = to_semantic or identity
 
+    if stage.partition_axis is None:
+        raise ValueError("scan stage has no partition axis")
+    scan_axis = stage.partition_axis.id
+    carrier_shapes = tuple(
+        buffer.tile.shape[:position] + buffer.tile.shape[position + 1:]
+        for buffer in carrier_writes
+        for position in (
+            tuple(axis.id for axis in buffer.storage_axes).index(scan_axis),
+        )
+    )
+
+    def execution_carrier(materialized_carrier):
+        """Remove the materialized scan coordinate from user-facing values."""
+        ret = ()
+        for i, shape in ct.static_iter(enumerate(carrier_shapes)):
+            ret += (ct.reshape(materialized_carrier[i], shape),)
+        return ret
+
+    def load_carrier(stage_tid, read_buffers):
+        return execution_carrier(read.load(stage_tid, read_buffers))
+
+    def init_carrier():
+        return execution_carrier(write_carrier.init())
+
     if exclusive:
         @ct.function
         def loop_body(loop_tid, loop_stage_tid, acc, read_buffers, carrier_buffers):
-            value = read.load(loop_stage_tid, read_buffers)
+            value = load_carrier(loop_stage_tid, read_buffers)
             write_carrier.store(loop_stage_tid, carrier_buffers, acc)
             return combine(*acc, *value)
     else:
         @ct.function
         def loop_body(loop_tid, loop_stage_tid, acc, read_buffers, carrier_buffers):
-            value = read.load(loop_stage_tid, read_buffers)
+            value = load_carrier(loop_stage_tid, read_buffers)
             acc = combine(*acc, *value)
             write_carrier.store(loop_stage_tid, carrier_buffers, acc)
             return acc
 
     if exclusive:
         loop = grid.loop_with_tail(loop_body, start=0)
-        initial_fn = write_carrier.init if initial is None else initial
+        initial_fn = init_carrier if initial is None else initial
 
         @ct.function
         def scan_program(tid, program_tid, read_buffers, write_buffers):
@@ -155,7 +179,7 @@ def make_scan_program(stage: BuiltStage, combine, carriers: BufferBundle, initia
             output_buffers = split.right(write_buffers)
             loop_offset, _, _ = grid.loop_offset_and_size(program_tid)
             loop_tid = grid.set_loop_index(tid, loop_offset)
-            acc = read.load(loop_tid + program_tid, read_buffers)
+            acc = load_carrier(loop_tid + program_tid, read_buffers)
             write_carrier.store(loop_tid + program_tid, carrier_buffers, acc)
             acc = loop(tid, program_tid, acc, read_buffers, carrier_buffers)
             if has_outputs:

@@ -61,7 +61,7 @@ class RecomputeFinalizeGradWrite:
             BufferUse.read_resident(self.global_buffers),
             BufferUse.read_resident(self.output_grad),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.intermediate),
+            BufferUse.resident(self.spec.finalize_intermediate),
             BufferUse.write(grad_storage),
         ))
         return BuiltStage(
@@ -106,7 +106,7 @@ class RecomputeFoldFinalizeGradWrite:
             BufferUse.read_resident(self.global_buffers),
             BufferUse.read_resident(self.output_grad),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.intermediate),
+            BufferUse.resident(self.spec.finalize_intermediate),
             BufferUse.write(grad_storage),
         ]
         buffers = bind_buffer_uses(domain, tuple(uses))
@@ -163,7 +163,7 @@ class RecomputePrefixFoldFinalizeGradWrite:
                 axis_map={self.prefix_axis.id: self.spec.fold.id},
             ),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.intermediate),
+            BufferUse.resident(self.spec.finalize_intermediate),
             BufferUse.write(grad_storage),
         ))
         return BuiltStage(

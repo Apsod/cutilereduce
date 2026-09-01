@@ -46,9 +46,19 @@ def affine_attention_spec():
         },
         # Logical tile-local values used by the map/finalize callbacks. These
         # are heuristic residency declarations, not materialized buffers.
-        intermediate={
+        map_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
-            "bias_logits": buffer_spec("h l g r", ct.float32),
+            "alpha": buffer_spec("h l g r", ct.float32),
+        },
+        finalize_intermediate={
+            "logits": buffer_spec("h l g r", ct.float32),
+            "alpha": buffer_spec("h l g r", ct.float32),
+            "local_weights": buffer_spec("h l g r", ct.float32),
+            "probability": buffer_spec("h l g r", ct.float32),
+            "previous_mass": buffer_spec("h l g r", ct.float32),
+            "previous_projection": buffer_spec("h l g r", ct.float32),
+            "g_score": buffer_spec("h l g r", ct.bfloat16),
+            "g_bias_score": buffer_spec("h l g r", ct.bfloat16),
         },
         batch="h l g",
         fold="r",
@@ -73,17 +83,23 @@ def affine_attention_spec():
 @ct.function
 def combine(a_alpha, a_m, a_e, a_u, b_alpha, b_m, b_e, b_u):
     shifted_a_m = a_m + b_alpha
-    m = ct.maximum(shifted_a_m, b_m)
-    skip = m == float("-inf")
-    a_scale = ct.exp2(shifted_a_m - m)
-    b_scale = ct.exp2(b_m - m)
-    e = ct.where(skip, a_e + b_e, a_e * a_scale + b_e * b_scale)
-    u = ct.where(
-        skip[..., None],
-        a_u + b_u,
-        a_u * a_scale[..., None] + b_u * b_scale[..., None],
+    left_is_high = shifted_a_m > b_m
+    high_m = ct.where(left_is_high, shifted_a_m, b_m)
+    low_m = ct.where(left_is_high, b_m, shifted_a_m)
+    skip = high_m == float("-inf")
+    scaling = ct.exp2(ct.where(skip, 0.0, low_m - high_m))
+    a_scale = ct.where(left_is_high, 1.0, scaling)
+    b_scale = ct.where(left_is_high, scaling, 1.0)
+    return (
+        a_alpha + b_alpha,
+        high_m,
+        ct.where(skip, a_e + b_e, a_e * a_scale + b_e * b_scale),
+        ct.where(
+            skip[:, :, :, None],
+            a_u + b_u,
+            a_u * a_scale[:, :, :, None] + b_u * b_scale[:, :, :, None],
+        ),
     )
-    return a_alpha + b_alpha, m, e, u
 
 
 @ct.function
@@ -103,10 +119,8 @@ def affine_attention_map(tid, query, key, bias_query, bias_key):
     bias_query = bias_query.reshape((head, length * group, db))
     bias_logits = ct.zeros((head, length * group, right), ct.float32)
     bias_logits = ct.mma(bias_query, bias_key.transpose(1, 2), bias_logits)
-    alpha = -ct.exp(bias_logits)
-
-    alpha = ct.where(factor_mask, alpha, 0.0)
-    logits = ct.where(factor_mask, logits, float("-inf"))
+    alpha = ct.where(factor_mask, bias_logits * LOG2E, 0.0)
+    logits = ct.where(factor_mask, logits * LOG2E, float("-inf"))
     return logits, alpha
 
 
@@ -118,8 +132,6 @@ def map_reduce(tid, query, key, value, bias_query, bias_key):
     logits, alpha = affine_attention_map(
         tid, query, key, bias_query, bias_key,
     )
-    logits = logits * LOG2E
-    alpha = alpha * LOG2E
     suffix_after = ct.cumsum(alpha, axis=2, reverse=True) - alpha
     adjusted_logits = logits + suffix_after
     maximum = ct.max(adjusted_logits, axis=2)
@@ -151,11 +163,15 @@ def to_output(alpha, z, mu):
 
 @ct.function
 def embed(alpha, z, mu, g_alpha, g_z, g_mu):
+    head, length, group = alpha.shape
+    dv = mu.shape[3]
     return (
-        alpha,
-        z,
-        g_z - ct.sum(mu * g_mu, axis=3),
-        g_mu.astype(ct.bfloat16),
+        (alpha * LOG2E).reshape((head, length * group)),
+        (z * LOG2E).reshape((head, length * group)),
+        (g_z - ct.sum(mu * g_mu, axis=3)).reshape(
+            (head, length * group)
+        ),
+        g_mu.astype(ct.bfloat16).reshape((head, length * group, dv)),
     )
 
 
@@ -170,61 +186,76 @@ def finalize(
     length, group, head, right, dqk, dv, db = tid.shape(
         "l", "g", "h", "r", "dqk", "dv", "db"
     )
-    query_flat = query.reshape((head, length * group, dqk))
-    bias_query_flat = bias_query.reshape((head, length * group, db))
     logits, alpha = affine_attention_map(
         tid, query, key, bias_query, bias_key,
     )
 
-    prefix_alpha_flat = prefix_alpha.reshape((head, length * group)) * LN2
-    total_alpha_flat = total_alpha.reshape((head, length * group))
-    total_z_flat = total_z.reshape((head, length * group))
-    inclusive_alpha = prefix_alpha_flat[:, :, None] + ct.cumsum(alpha, axis=2)
-    scores = logits + total_alpha_flat[:, :, None] - inclusive_alpha
-    probability = ct.exp(scores - total_z_flat[:, :, None])
+    query_flat = query.reshape((head, length * group, dqk))
+    bias_query_flat = bias_query.reshape((head, length * group, db))
 
-    prefix_z = ((prefix_m + ct.log2(prefix_e)) * LN2).reshape(
+    prefix_alpha_flat = prefix_alpha.reshape((head, length * group))
+    total_alpha_flat = total_alpha
+    total_z_flat = total_z
+    inclusive_local_alpha = ct.cumsum(alpha, axis=2)
+    local_alpha = ct.sum(alpha, axis=2)
+    adjusted_logits = (
+        logits + local_alpha[:, :, None] - inclusive_local_alpha
+    )
+    local_m = ct.max(adjusted_logits, axis=2)
+    local_weights = ct.exp2(adjusted_logits - local_m[:, :, None])
+    local_e = ct.sum(local_weights, axis=2)
+    global_shift = total_alpha_flat - prefix_alpha_flat - local_alpha
+    probability_scale = ct.exp2(local_m + global_shift - total_z_flat)
+    probability = local_weights * probability_scale[:, :, None]
+
+    prefix_valid = prefix_e != 0
+    safe_prefix_e = ct.where(prefix_valid, prefix_e, 1.0)
+    prefix_z = ct.where(
+        prefix_valid,
+        prefix_m + ct.log2(safe_prefix_e),
+        float("-inf"),
+    ).reshape(
         (head, length * group, 1)
     )
-    prefix_mass = ct.exp(
+    prefix_mass = ct.exp2(
         prefix_z
         + total_alpha_flat[:, :, None]
         - prefix_alpha_flat[:, :, None]
         - total_z_flat[:, :, None]
     )
-    prefix_mass = ct.where(prefix_e.reshape((head, length * group, 1)) == 0, 0.0, prefix_mass)
-    prefix_mu = ct.where(
-        prefix_e[..., None] == 0,
+    prefix_mass = ct.where(
+        prefix_valid.reshape((head, length * group, 1)),
+        prefix_mass,
         0.0,
-        prefix_u / prefix_e[..., None],
-    ).reshape((head, length * group, dv))
-    previous_mass = prefix_mass + ct.cumsum(probability, axis=2) - probability
-    weighted_value = probability[..., None] * value[:, None, :, :]
-    previous_value = (
-        prefix_mass[..., None] * prefix_mu[:, :, None, :]
-        + ct.cumsum(weighted_value, axis=2)
-        - weighted_value
     )
+    prefix_mu = (prefix_u / safe_prefix_e[..., None]).reshape(
+        (head, length * group, dv)
+    )
+    previous_mass = prefix_mass + ct.cumsum(probability, axis=2) - probability
 
-    accumulator_s = accumulator_s.reshape((head, length * group, dv))
     accumulator_s_float = accumulator_s.astype(ct.float32)
-    accumulator_w = accumulator_w.reshape((head, length * group, 1))
+    accumulator_w = accumulator_w[:, :, None]
+    value_projection = ct.sum(
+        accumulator_s_float[:, :, None, :] * value[:, None, :, :],
+        axis=3,
+    )
+    weighted_projection = probability * value_projection
+    prefix_projection = ct.sum(
+        accumulator_s_float * prefix_mu,
+        axis=2,
+    )
+    previous_projection = (
+        prefix_mass * prefix_projection[:, :, None]
+        + ct.cumsum(weighted_projection, axis=2)
+        - weighted_projection
+    )
     prior_grad = (
         previous_mass * accumulator_w
-        + ct.sum(
-            accumulator_s_float[:, :, None, :] * previous_value,
-            axis=3,
-        )
+        + previous_projection
     )
-    g_score = probability * (
-        accumulator_w
-        + ct.sum(
-            accumulator_s_float[:, :, None, :] * value[:, None, :, :],
-            axis=3,
-        )
-    )
+    g_score = probability * (accumulator_w + value_projection)
     g_score_bf16 = g_score.astype(ct.bfloat16)
-    g_bias_score = (prior_grad * alpha).astype(ct.bfloat16)
+    g_bias_score = prior_grad.astype(ct.bfloat16)
 
     g_value = ct.mma(
         probability.transpose(1, 2).astype(ct.bfloat16),
@@ -240,13 +271,6 @@ def finalize(
     )
     g_bias_key = ct.mma(g_bias_score.transpose(1, 2), bias_query_flat, g_bias_key)
 
-    alpha_execution = alpha * LOG2E
-    logits_execution = logits * LOG2E
-    suffix_after = ct.cumsum(alpha_execution, axis=2, reverse=True) - alpha_execution
-    adjusted_logits = logits_execution + suffix_after
-    local_m = ct.max(adjusted_logits, axis=2)
-    local_weights = ct.exp2(adjusted_logits - local_m[:, :, None])
-    local_e = ct.sum(local_weights, axis=2)
     local_u = ct.zeros((head, length * group, dv), ct.float32)
     local_u = ct.mma(local_weights.astype(ct.bfloat16), value, local_u)
     next_state = combine(
@@ -254,7 +278,7 @@ def finalize(
         prefix_m,
         prefix_e,
         prefix_u,
-        ct.sum(alpha_execution, axis=2).reshape((head, length, group)),
+        local_alpha.reshape((head, length, group)),
         local_m.reshape((head, length, group)),
         local_e.reshape((head, length, group)),
         local_u.reshape((head, length, group, dv)),
@@ -322,15 +346,23 @@ def make_plan(spec, sizes, *, fold_tile, partitions, checkpointed_backward=True)
     )
 
 
-def reference(query, key, value, bias_query, bias_key):
-    logits = torch.einsum("hlgd,hrd->hlgr", query.float(), key.float())
+def reference(
+        query, key, value, bias_query, bias_key, *,
+        dtype=torch.float32,
+        ):
+    query = query.to(dtype)
+    key = key.to(dtype)
+    value = value.to(dtype)
+    bias_query = bias_query.to(dtype)
+    bias_key = bias_key.to(dtype)
+    logits = torch.einsum("hlgd,hrd->hlgr", query, key)
     bias_logits = torch.einsum(
-        "hlgd,hrd->hlgr", bias_query.float(), bias_key.float()
+        "hlgd,hrd->hlgr", bias_query, bias_key
     )
-    alpha = -torch.exp(bias_logits)
+    alpha = bias_logits
     suffix_after = alpha.flip(-1).cumsum(-1).flip(-1) - alpha
     weights = torch.softmax(logits + suffix_after, dim=-1)
-    return torch.einsum("hlgr,hrd->hlgd", weights, value.float())
+    return torch.einsum("hlgr,hrd->hlgd", weights, value)
 
 
 def make_inputs(sizes):
@@ -353,10 +385,45 @@ def make_inputs(sizes):
     return query, key, value, bias_query, bias_key
 
 
+def evaluate_reference(inputs, grad, *, dtype):
+    reference_inputs = tuple(
+        tensor.detach().to(dtype).requires_grad_(grad is not None)
+        for tensor in inputs
+    )
+    output = reference(
+        *reference_inputs,
+        dtype=dtype,
+    )
+    gradients = None if grad is None else torch.autograd.grad(
+        output,
+        reference_inputs,
+        grad.to(dtype),
+    )
+    return (
+        output.detach(),
+        None if gradients is None else tuple(g.detach() for g in gradients),
+    )
+
+
+def print_mae_matrix(title, values):
+    labels = tuple(values)
+    width = max(12, max(map(len, labels)) + 1)
+    print(title)
+    print("".ljust(width) + "".join(label.rjust(width) for label in labels))
+    for row_label in labels:
+        row = [row_label.ljust(width)]
+        for column_label in labels:
+            error = (
+                values[row_label].double() - values[column_label].double()
+            ).abs().mean().item()
+            row.append(f"{error:.6g}".rjust(width))
+        print("".join(row))
+
+
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--length", type=int, default=256)
-    parser.add_argument("--right", type=int, default=512)
+    parser.add_argument("--length", type=int, default=2048)
+    parser.add_argument("--right", type=int, default=2048)
     parser.add_argument("--heads", type=int, default=2)
     parser.add_argument("--groups", type=int, default=2)
     parser.add_argument("--dqk", type=int, default=64)
@@ -373,6 +440,12 @@ def main():
     parser.add_argument("--full-recompute-backward", action="store_true")
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--benchmark-seconds", type=float, default=0.5)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument(
+        "--accuracy-matrix",
+        action="store_true",
+        help="compare CuTile and BF16/FP32/FP64 references pairwise; FP64 can be expensive",
+    )
     args = parser.parse_args()
     if args.torch_compile and args.forward_only:
         parser.error("--torch-compile currently requires the autograd plan")
@@ -416,23 +489,72 @@ def main():
         torch.compile(eager_function, fullgraph=True, mode="reduce-overhead")
         if args.torch_compile and not args.forward_only else eager_function
     )
+    torch.manual_seed(args.seed)
     inputs = make_inputs(sizes)
     cutile, = function(*inputs)
-    pytorch = reference(*inputs)
-    print(f"forward mean absolute error: {(cutile - pytorch).abs().mean().item():.6g}")
     print("stages:", ", ".join(stage.stage.name for stage in plan.forward))
-    if not args.forward_only:
-        grad = torch.randn_like(cutile)
-        cutile_grads = torch.autograd.grad(cutile, inputs, grad, retain_graph=True)
-        pytorch_grads = torch.autograd.grad(pytorch, inputs, grad)
-        for name, actual, expected in zip(
-                ("query", "key", "value", "bias_query", "bias_key"),
-                cutile_grads,
-                pytorch_grads,
-                strict=True,
-                ):
-            error = (actual.float() - expected.float()).abs().mean().item()
-            print(f"{name} gradient mean absolute error: {error:.6g}")
+    grad = None if args.forward_only else torch.randn(
+        cutile.shape,
+        device=cutile.device,
+        dtype=torch.bfloat16,
+    )
+    cutile_grads = None if grad is None else torch.autograd.grad(
+        cutile, inputs, grad,
+    )
+
+    reference_results = {}
+    reference_dtypes = {
+        "PyTorch BF16": torch.bfloat16,
+        "PyTorch FP32": torch.float32,
+    }
+    if args.accuracy_matrix:
+        reference_dtypes["PyTorch FP64"] = torch.float64
+    for label, dtype in reference_dtypes.items():
+        reference_results[label] = evaluate_reference(
+            inputs,
+            grad,
+            dtype=dtype,
+        )
+
+    if args.accuracy_matrix:
+        outputs = {"CuTile": cutile.detach()}
+        outputs.update(
+            (label, result[0]) for label, result in reference_results.items()
+        )
+        print_mae_matrix("forward pairwise MAE", outputs)
+        if cutile_grads is not None:
+            for index, name in enumerate(
+                    ("query", "key", "value", "bias_query", "bias_key")
+                    ):
+                gradients = {"CuTile": cutile_grads[index].detach()}
+                gradients.update(
+                    (label, result[1][index])
+                    for label, result in reference_results.items()
+                )
+                print_mae_matrix(f"{name} gradient pairwise MAE", gradients)
+    else:
+        pytorch_bf16, pytorch_bf16_grads = reference_results["PyTorch BF16"]
+        pytorch_fp32, pytorch_fp32_grads = reference_results["PyTorch FP32"]
+        print(
+            "forward mean absolute error: "
+            f"fp32={((cutile.float() - pytorch_fp32.float()).abs().mean().item()):.6g}, "
+            f"bf16={((cutile.float() - pytorch_bf16.float()).abs().mean().item()):.6g}"
+        )
+        if cutile_grads is not None:
+            for name, actual, expected_fp32, expected_bf16 in zip(
+                    ("query", "key", "value", "bias_query", "bias_key"),
+                    cutile_grads,
+                    pytorch_fp32_grads,
+                    pytorch_bf16_grads,
+                    strict=True,
+                    ):
+                fp32_error = (actual.float() - expected_fp32.float()).abs().mean().item()
+                bf16_error = (actual.float() - expected_bf16.float()).abs().mean().item()
+                print(
+                    f"{name} gradient mean absolute error: "
+                    f"fp32={fp32_error:.6g}, bf16={bf16_error:.6g}"
+                )
+    if cutile_grads is not None:
         print("backward:", ", ".join(stage.stage.name for stage in plan.backward))
 
     if args.benchmark_seconds > 0:
@@ -446,17 +568,33 @@ def main():
             with torch.no_grad():
                 return reference(*inputs)
 
+        def pytorch_bf16_forward():
+            with torch.no_grad():
+                return reference(
+                    *inputs,
+                    dtype=torch.bfloat16,
+                )
+
         cases = [
             (f"{cutile_label} forward", cutile_forward),
-            ("PyTorch forward", pytorch_forward),
+            ("PyTorch FP32 forward", pytorch_forward),
+            ("PyTorch BF16 forward", pytorch_bf16_forward),
         ]
         if not args.forward_only:
             cases.extend((
                 (f"{cutile_label} forward + backward", lambda: torch.autograd.grad(
                     function(*inputs)[0], inputs, grad
                 )),
-                ("PyTorch forward + backward", lambda: torch.autograd.grad(
-                    reference(*inputs), inputs, grad
+                ("PyTorch FP32 forward + backward", lambda: torch.autograd.grad(
+                    reference(
+                        *inputs,
+                    ), inputs, grad
+                )),
+                ("PyTorch BF16 forward + backward", lambda: torch.autograd.grad(
+                    reference(
+                        *inputs,
+                        dtype=torch.bfloat16,
+                    ), inputs, grad
                 )),
             ))
         measurements = [

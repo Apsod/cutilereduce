@@ -37,8 +37,13 @@ def attention_spec():
             "z": buffer_spec("h l g", ct.float32, default=float("-inf")),
             "mu": buffer_spec("h l g dv", ct.float32, default=0),
         },
-        intermediate={
+        map_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
+        },
+        finalize_intermediate={
+            "logits": buffer_spec("h l g r", ct.float32),
+            "scale": buffer_spec("h l g r", ct.float32),
+            "g_logits": buffer_spec("h l g r", ct.bfloat16),
         },
         batch="h l g",
         fold="r",
@@ -126,10 +131,14 @@ def to_output(logsumexp, mean):
 
 @ct.function
 def embed(logsumexp, mean, g_logsumexp, g_mean):
+    head, length, group = logsumexp.shape
+    dv = mean.shape[3]
     return (
-        logsumexp,
-        g_logsumexp - ct.sum(mean * g_mean, axis=3),
-        g_mean.astype(ct.bfloat16),
+        logsumexp.reshape((head, length * group)),
+        (g_logsumexp - ct.sum(mean * g_mean, axis=3)).reshape(
+            (head, length * group)
+        ),
+        g_mean.astype(ct.bfloat16).reshape((head, length * group, dv)),
     )
 
 
@@ -150,11 +159,10 @@ def finalize(
     length, group, head, right, dv, dqk = tid.shape(
         "l", "g", "h", "r", "dv", "dqk"
     )
-    scale = ct.exp(logits - logsumexp.reshape((head, length * group, 1)))
-    g_mean = g_mean.reshape((head, length * group, dv))
+    scale = ct.exp(logits - logsumexp[:, :, None])
     g_value = ct.mma(scale.transpose(1, 2).astype(ct.bfloat16), g_mean, g_value)
     g_logits = ct.broadcast_to(
-        g_logsumexp.reshape((head, length * group, 1)),
+        g_logsumexp[:, :, None],
         (head, length * group, right),
     )
     g_logits = ct.mma(g_mean, value.transpose(1, 2), g_logits)

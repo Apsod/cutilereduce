@@ -98,7 +98,7 @@ class MapFold:
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.intermediate),
+            BufferUse.resident(self.spec.map_intermediate),
             BufferUse.write(self.spec.output),
         ))
         return BuiltStage(
@@ -173,7 +173,7 @@ class MapFoldPartial:
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.intermediate),
+            BufferUse.resident(self.spec.map_intermediate),
             BufferUse.write(
                 self.partials,
                 BufferStorage.Materialized,

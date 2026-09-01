@@ -37,8 +37,13 @@ def xentropy_spec():
             "z": buffer_spec("b", ct.float32, default=float("-inf")),
             "l": buffer_spec("b", ct.float32, default=0),
         },
-        intermediate={
+        map_intermediate={
             "logits": buffer_spec("b v", ct.float32),
+        },
+        finalize_intermediate={
+            "logits": buffer_spec("b v", ct.float32),
+            "scale": buffer_spec("b v", ct.float32),
+            "g_logits": buffer_spec("b v", ct.bfloat16),
         },
         batch="b",
         fold="v",
