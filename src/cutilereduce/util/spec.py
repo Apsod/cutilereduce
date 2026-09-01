@@ -45,7 +45,7 @@ rtx5080 = {
     BANDWIDTH: 960e9,
     SM_COUNT: 84,
     MAX_PROGRAMS_PER_SM: 32,
-    SMEM_PER_SM: 128 * 1024,
+    SMEM_PER_SM: 100 * 1024,
 }
 
 rtx5070 = {
@@ -55,4 +55,3 @@ rtx5070 = {
     MAX_PROGRAMS_PER_SM: 32,
     SMEM_PER_SM: 128 * 1024,
 }
-

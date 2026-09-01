@@ -20,18 +20,34 @@ class StageFunctions:
     embed: Any = None
     finalize: Any = None
     map_backward: Any = None
+    # Compatibility alias for the stateful general-fold finalize callback.
     map_reduce_backward: Any = None
 
 
-class Bundle:
-    def __init__(self, **kwargs):
-        for key, value in kwargs.items():
-            setattr(self, key, value)
+@dataclass(frozen=True)
+class BufferHelper:
+    view: Any
+    load: Any
+    store: Any
+    init: Any
+    reshape: Any
+    num: int
 
-    def __getitem__(self, key):
-        if isinstance(key, tuple):
-            return tuple(getattr(self, k) for k in key)
-        return getattr(self, key)
+
+@dataclass(frozen=True)
+class BufferSplit:
+    left: Any
+    right: Any
+    merge: Any
+
+
+@dataclass(frozen=True)
+class BufferSplitPlan:
+    """Host-side metadata plus the value safe to capture in a kernel."""
+
+    functions: BufferSplit
+    left_buffers: tuple[StageBuffer, ...]
+    right_buffers: tuple[StageBuffer, ...]
 
 
 @ct.function
@@ -165,6 +181,7 @@ def make_buffer_helper(buffers):
         return view.load(retile(tid, info.index))
 
     def _view_store_add(tid, view, tile, info):
+        tile = ct.reshape(tile, info.tile_shape)
         if info.multiplicity == 1:
             view.store(retile(tid, info.index), tile)
         else:
@@ -190,16 +207,20 @@ def make_buffer_helper(buffers):
         return ct.load(buffer, retile(tid, info.index), info.tile_shape, padding_mode=info.padding_mode)
 
     def _store(tid, buffer, tile, info):
-        ct.store(buffer, retile(tid, info.index), tile)
+        ct.store(buffer, retile(tid, info.index), ct.reshape(tile, info.tile_shape))
 
     def _init(info):
         return ct.full(info.tile_shape, info.default, info.dtype)
 
-    return Bundle(
+    def _reshape(tile, info):
+        return ct.reshape(tile, info.tile_shape)
+
+    return BufferHelper(
         view=_mk_views,
         load=ctzipmap(_load, infos),
         store=ctzipdo(_store, infos, nzips=2),
         init=ctmap(_init, infos),
+        reshape=ctzipmap(_reshape, infos),
         num=num,
     )
 
@@ -237,6 +258,8 @@ def make_buffer_split(
             index.append(right_index[buffer_id])
         else:
             raise KeyError(f"buffer {buffer_id} is not covered by split")
+    origin = tuple(origin)
+    index = tuple(index)
 
     def _left(raw_buffers):
         return retile(raw_buffers, left_arg_index)
@@ -245,12 +268,10 @@ def make_buffer_split(
         return retile(raw_buffers, right_arg_index)
 
     def _merge(left_tiles, right_tiles):
-        return merge_tuples(left_tiles, right_tiles, tuple(origin), tuple(index))
+        return merge_tuples(left_tiles, right_tiles, origin, index)
 
-    return Bundle(
-        left=_left,
-        right=_right,
-        merge=_merge,
+    return BufferSplitPlan(
+        functions=BufferSplit(left=_left, right=_right, merge=_merge),
         left_buffers=left_buffers,
         right_buffers=right_buffers,
     )
@@ -275,6 +296,8 @@ class StageGridInfo:
     loop_span_base: ct.Constant[int]
     loop_span_remainder: ct.Constant[int]
     compute_rank: ct.Constant[int]
+    tile_shapes: ct.Constant[tuple[int, ...]]
+    totals: ct.Constant[tuple[int, ...]]
 
     @classmethod
     def make(cls, stage: BuiltStage) -> StageGridInfo:
@@ -304,6 +327,8 @@ class StageGridInfo:
             loop_span_base=loop_tiles // loop_programs,
             loop_span_remainder=loop_tiles % loop_programs,
             compute_rank=len(domain.compute_axes),
+            tile_shapes=tuple(int(axis.tile) for axis in domain.compute_axes),
+            totals=tuple(int(axis.extent) for axis in domain.compute_axes),
         )
 
     @ct.function
@@ -333,7 +358,7 @@ class StageGridInfo:
     def set_loop_index(self, tid, value):
         return set_at(tid, self.loop_compute_index, value)
 
-    def loop_with_tail(self, body, *, static: bool = True, start: int = 0):
+    def loop_with_tail(self, body, *, static: bool = False, start: int = 0):
         @ct.function
         def _loop(tid, program_tid, carry, *args):
             loop_offset, loop_size, extra = self.loop_offset_and_size(program_tid)
@@ -361,12 +386,14 @@ class StageGridInfo:
         tile_shapes: ct.Constant[tuple[int, ...]]
         totals: ct.Constant[tuple[int, ...]]
 
-        def axis_index(self, axis: ct.Constant[str | int]):
-            if isinstance(axis, str):
-                return self.axis_names.index(axis)
-            return axis
+        def axis_index(self, axis: ct.Constant[str]):
+            ret = -1
+            for i, name in ct.static_iter(enumerate(self.axis_names)):
+                if name == axis:
+                    ret = i
+            return ret
 
-        def shape(self, axis: ct.Constant[str | int], *more):
+        def shape(self, axis: ct.Constant[str], *more):
             ret = (self.tile_shapes[self.axis_index(axis)],)
             for current in ct.static_iter(more):
                 ret += (self.tile_shapes[self.axis_index(current)],)
@@ -374,38 +401,37 @@ class StageGridInfo:
                 return ret
             return ret[0]
 
-        def offset(self, axis: ct.Constant[str | int]):
+        def offset(self, axis: ct.Constant[str]):
             axis = self.axis_index(axis)
             return self.tid[axis] * self.tile_shapes[axis]
 
-        def indices(self, axis: ct.Constant[str | int]):
-            axis = self.axis_index(axis)
-            tile = self.tile_shapes[axis]
-            return self.offset(axis) + ct.arange(tile, dtype=ct.int32)
-
-        def mask(self, axis: ct.Constant[str | int], *more):
+        def indices(self, axis: ct.Constant[str]):
             ix = self.axis_index(axis)
-            ret = self.indices(ix) < self.totals[ix]
+            tile = self.tile_shapes[ix]
+            return self.tid[ix] * tile + ct.arange(tile, dtype=ct.int32)
+
+        def mask(self, axis: ct.Constant[str], *more):
+            ix = self.axis_index(axis)
+            indices = self.tid[ix] * self.tile_shapes[ix] + ct.arange(self.tile_shapes[ix], dtype=ct.int32)
+            ret = indices < self.totals[ix]
             for current in ct.static_iter(more):
                 ix = self.axis_index(current)
                 ret = ct.expand_dims(ret, -1)
-                ret &= self.indices(ix) < self.totals[ix]
+                indices = self.tid[ix] * self.tile_shapes[ix] + ct.arange(self.tile_shapes[ix], dtype=ct.int32)
+                ret &= indices < self.totals[ix]
             return ret
 
     def tid_info(self, tid):
-        compute_axes = self._compute_axes
         return StageGridInfo.TidInfo(
             tid=tid,
             axis_names=self.axis_names,
-            tile_shapes=tuple(int(a.tile) for a in compute_axes),
-            totals=tuple(int(a.extent) for a in compute_axes),
+            tile_shapes=self.tile_shapes,
+            totals=self.totals,
         )
 
 
 def stage_grid_info(stage: BuiltStage):
-    info = StageGridInfo.make(stage)
-    object.__setattr__(info, "_compute_axes", stage.domain.compute_axes)
-    return info
+    return StageGridInfo.make(stage)
 
 
 def identity(*xs):
@@ -413,7 +439,9 @@ def identity(*xs):
 
 
 __all__ = [
-    "Bundle",
+    "BufferHelper",
+    "BufferSplit",
+    "BufferSplitPlan",
     "StageBufferInfo",
     "StageFunctions",
     "StageGridInfo",

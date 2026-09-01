@@ -4,7 +4,7 @@ import polars.selectors as cs
 from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import make_fold_spec, sweep_commutative_fold
-from cutilereduce.util.spec import l4
+from cutilereduce.util.spec import rtx5080
 
 
 def xentropy_spec():
@@ -26,14 +26,19 @@ def xentropy_spec():
         batch="b",
         fold="v",
         map_fold_work=WorkModel.make(MatMulWork.make(M="b", N="v", K="d")),
+        backward_work=WorkModel.make(
+            MatMulWork.make(M="b", N="v", K="d"),
+            MatMulWork.make(M="b", N="d", K="v"),
+            MatMulWork.make(M="v", N="d", K="b"),
+        ),
     )
 
 
 def main():
     result = sweep_commutative_fold(
         xentropy_spec(),
-        sizes={"b": 128 * 1, "v": 128 * 128, "d": 128},
-        hardware=l4,
+        sizes={"b": 128 * 128, "v": 128 * 128, "d": 128},
+        hardware=rtx5080,
     )
 
     print(result.select(

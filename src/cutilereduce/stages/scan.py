@@ -31,6 +31,7 @@ class Scan:
     combine: object | None = None
     initial: object | None = None
     to_semantic: object | None = None
+    exclusive: bool = False
 
     @classmethod
     def make(
@@ -44,6 +45,7 @@ class Scan:
             combine=None,
             initial=None,
             to_semantic=None,
+            exclusive: bool = False,
             ) -> Scan:
         return cls(
             spec=spec,
@@ -55,6 +57,7 @@ class Scan:
             combine=combine,
             initial=initial,
             to_semantic=to_semantic,
+            exclusive=exclusive,
         )
 
     def build(self) -> BuiltStage:
@@ -97,40 +100,65 @@ class Scan:
                 combine=self.combine,
                 initial=self.initial,
                 to_semantic=self.to_semantic,
+                exclusive=self.exclusive,
             ),
         )
 
 
-def make_scan_program(stage: BuiltStage, combine, carriers: BufferBundle, initial=None, to_semantic=None):
+def make_scan_program(stage: BuiltStage, combine, carriers: BufferBundle, initial=None, to_semantic=None, *, exclusive=False):
     grid = stage_grid_info(stage)
     read = make_buffer_helper(stage.stage.read_buffers)
     all_writes = tuple(stage.stage.write_buffers)
     carrier_writes = tuple(buffer for buffer in all_writes if buffer.id in carriers)
     output_writes = tuple(buffer for buffer in all_writes if buffer.id not in carriers)
+    has_outputs = bool(output_writes)
     write_split = make_buffer_split(all_writes, carrier_writes, output_writes)
+    split = write_split.functions
     write_carrier = make_buffer_helper(carrier_writes)
     write_output = make_buffer_helper(output_writes)
     to_semantic = to_semantic or identity
 
-    @ct.function
-    def loop_body(loop_tid, loop_stage_tid, acc, read_buffers, carrier_buffers):
-        value = read.load(loop_stage_tid, read_buffers)
-        acc = combine(*acc, *value)
-        write_carrier.store(loop_stage_tid, carrier_buffers, acc)
-        return acc
+    if exclusive:
+        @ct.function
+        def loop_body(loop_tid, loop_stage_tid, acc, read_buffers, carrier_buffers):
+            value = read.load(loop_stage_tid, read_buffers)
+            write_carrier.store(loop_stage_tid, carrier_buffers, acc)
+            return combine(*acc, *value)
+    else:
+        @ct.function
+        def loop_body(loop_tid, loop_stage_tid, acc, read_buffers, carrier_buffers):
+            value = read.load(loop_stage_tid, read_buffers)
+            acc = combine(*acc, *value)
+            write_carrier.store(loop_stage_tid, carrier_buffers, acc)
+            return acc
 
-    if initial is None:
+    if exclusive:
+        loop = grid.loop_with_tail(loop_body, start=0)
+        initial_fn = write_carrier.init if initial is None else initial
+
         @ct.function
         def scan_program(tid, program_tid, read_buffers, write_buffers):
-            carrier_buffers = write_split.left(write_buffers)
-            output_buffers = write_split.right(write_buffers)
+            carrier_buffers = split.left(write_buffers)
+            output_buffers = split.right(write_buffers)
+            acc = initial_fn()
+            acc = loop(tid, program_tid, acc, read_buffers, carrier_buffers)
+            if has_outputs:
+                stage_tid = tid + program_tid
+                write_output.store(stage_tid, output_buffers, to_semantic(*acc))
+            return acc
+    elif initial is None:
+        loop = grid.loop_with_tail(loop_body, start=1)
+
+        @ct.function
+        def scan_program(tid, program_tid, read_buffers, write_buffers):
+            carrier_buffers = split.left(write_buffers)
+            output_buffers = split.right(write_buffers)
             loop_offset, _, _ = grid.loop_offset_and_size(program_tid)
             loop_tid = grid.set_loop_index(tid, loop_offset)
             acc = read.load(loop_tid + program_tid, read_buffers)
             write_carrier.store(loop_tid + program_tid, carrier_buffers, acc)
-            loop = grid.loop_with_tail(loop_body, start=1)
             acc = loop(tid, program_tid, acc, read_buffers, carrier_buffers)
-            if output_writes:
+            if has_outputs:
                 stage_tid = tid + program_tid
                 write_output.store(stage_tid, output_buffers, to_semantic(*acc))
             return acc
@@ -139,10 +167,10 @@ def make_scan_program(stage: BuiltStage, combine, carriers: BufferBundle, initia
 
         @ct.function
         def scan_program(tid, program_tid, read_buffers, write_buffers):
-            carrier_buffers = write_split.left(write_buffers)
-            output_buffers = write_split.right(write_buffers)
+            carrier_buffers = split.left(write_buffers)
+            output_buffers = split.right(write_buffers)
             acc = loop(tid, program_tid, initial(), read_buffers, carrier_buffers)
-            if output_writes:
+            if has_outputs:
                 stage_tid = tid + program_tid
                 write_output.store(stage_tid, output_buffers, to_semantic(*acc))
             return acc
@@ -157,6 +185,7 @@ def compile_scan_stage(
         combine=None,
         initial=None,
         to_semantic=None,
+        exclusive=False,
         ):
     grid = stage_grid_info(stage)
     if functions is not None:
@@ -168,6 +197,7 @@ def compile_scan_stage(
         stage.carriers,
         initial=initial,
         to_semantic=to_semantic,
+        exclusive=exclusive,
     )
 
     @ct.kernel

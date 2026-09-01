@@ -64,13 +64,48 @@ class Fold:
 
 def make_fold_program(stage: BuiltStage, combine, initial=None):
     grid = stage_grid_info(stage)
-    read = make_buffer_helper(stage.stage.read_buffers)
+    read_buffers = tuple(stage.stage.read_buffers)
+    load = make_buffer_helper(read_buffers).load
     if combine is None:
         raise ValueError("fold stage requires combine function")
 
+    if stage.partition_axis is None:
+        raise ValueError("fold stage has no partition axis")
+    fold_axis = stage.partition_axis.id
+    fold_positions = tuple(
+        tuple(axis.id for axis in buffer.storage_axes).index(fold_axis)
+        for buffer in read_buffers
+    )
+    if len(set(fold_positions)) != 1:
+        raise ValueError(f"fold axis has inconsistent tile positions: {fold_positions}")
+    tile_axis = fold_positions[0]
+    fold_tile = int(stage.domain.get(fold_axis).tile)
+    reduced_shapes = tuple(
+        info.tile.shape[:tile_axis] + info.tile.shape[tile_axis + 1:]
+        for info in read_buffers
+    )
+    identities = tuple(buffer.default for buffer in read_buffers)
+
+    if fold_tile > 1:
+        def load_carrier(tid, buffers):
+            factors = load(tid, buffers)
+            return ct.reduce(
+                factors,
+                axis=tile_axis,
+                func=combine,
+                identity=identities,
+            )
+    else:
+        def load_carrier(tid, buffers):
+            factors = load(tid, buffers)
+            ret = ()
+            for i, shape in ct.static_iter(enumerate(reduced_shapes)):
+                ret += (ct.reshape(factors[i], shape),)
+            return ret
+
     @ct.function
     def loop_body(loop_tid, loop_stage_tid, acc, read_buffers):
-        return combine(*acc, *read.load(loop_stage_tid, read_buffers))
+        return combine(*acc, *load_carrier(loop_stage_tid, read_buffers))
 
 
     if initial is None:
@@ -79,7 +114,7 @@ def make_fold_program(stage: BuiltStage, combine, initial=None):
         def fold_program(tid, program_tid, read_buffers):
             loop_offset, _, _ = grid.loop_offset_and_size(program_tid)
             loop_tid = grid.set_loop_index(tid, loop_offset)
-            acc = read.load(loop_tid + program_tid, read_buffers)
+            acc = load_carrier(loop_tid + program_tid, read_buffers)
             return loop(tid, program_tid, acc, read_buffers)
     else:
         loop = grid.loop_with_tail(loop_body, start=0)

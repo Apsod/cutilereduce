@@ -129,6 +129,14 @@ class Buffer:
 @dataclass(frozen=True, kw_only=True)
 class BufferBundle(TupleSet[Buffer]):
 
+    def contention_axes(self, contribution_axes: Axes) -> Axes:
+        """Axes whose independent contributions can target the same buffer."""
+        return Axes(values=tuple(
+            axis
+            for axis in contribution_axes
+            if any(axis not in buffer.axes for buffer in self)
+        ))
+
     def as_grad(self, dtype=ct.float32):
         assert all(b.role == Input for b in self)
         return self.subset(lambda b: b.req_grad).map(lambda b: b.as_grad(dtype))

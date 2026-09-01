@@ -33,9 +33,11 @@ class FoldSpec:
     input: BufferBundle
     execution: BufferBundle
     output: BufferBundle
+    intermediate: BufferBundle
     batch: Axes
     fold: Axis
     map_fold_work: WorkModel = WorkModel()
+    backward_work: WorkModel | None = None
     combine_work: WorkModel = WorkModel()
     algebra: AlgebraKind = AlgebraKind.commutative
 
@@ -46,7 +48,7 @@ class FoldSpec:
     @property
     def axes(self) -> Axes:
         ret = self.batch | Axes(values=(self.fold,))
-        for bundle in (self.input, self.execution, self.output):
+        for bundle in (self.input, self.execution, self.output, self.intermediate):
             for buffer in bundle:
                 ret = ret | buffer.axes
         return ret
@@ -67,9 +69,11 @@ def make_fold_spec(
         input: Mapping[str, BufferSpec],
         execution: Mapping[str, BufferSpec],
         output: Mapping[str, BufferSpec],
+        intermediate: Mapping[str, BufferSpec] | None = None,
         batch: str | Axes,
         fold: str | Axis,
         map_fold_work: WorkModel = WorkModel(),
+        backward_work: WorkModel | None = None,
         combine_work: WorkModel = WorkModel(),
         algebra: AlgebraKind = AlgebraKind.commutative,
         ) -> FoldSpec:
@@ -79,9 +83,11 @@ def make_fold_spec(
         input=bundle_spec(Input, **dict(input)),
         execution=bundle_spec(Internal("execution"), **dict(execution)),
         output=bundle_spec(Output, **dict(output)),
+        intermediate=bundle_spec(Internal("intermediate"), **dict(intermediate or {})),
         batch=batch_axes,
         fold=fold_axis,
         map_fold_work=map_fold_work,
+        backward_work=backward_work,
         combine_work=combine_work,
         algebra=algebra,
     )

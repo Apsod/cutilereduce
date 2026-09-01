@@ -6,6 +6,7 @@ import torch
 
 from cutilereduce.core import (
     ATOMIC_ADD,
+    Axes,
     MatMulWork,
     WorkModel,
     atomic_add_write,
@@ -104,6 +105,10 @@ output = bundle_spec(
 output_grad = output.as_output_grad()
 
 grad_storage = input.as_grad()
+assert tuple(axis.name for axis in grad_storage.contention_axes(Axes.make("b v"))) == (
+    "b",
+    "v",
+)
 
 grad_accumulator = bundle_spec(
     Internal('grad_acc'),

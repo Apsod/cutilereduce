@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import cuda.tile as ct
 
 from cutilereduce.core.axis import Axis, Axes
-from cutilereduce.core.buffer import BufferBundle
+from cutilereduce.core.buffer import BufferBundle, Internal
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
 from cutilereduce.core.stage_domain import (
@@ -98,6 +98,7 @@ class MapFold:
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
             BufferUse.resident(self.spec.execution),
+            BufferUse.resident(self.spec.intermediate),
             BufferUse.write(self.spec.output),
         ))
         return BuiltStage(
@@ -172,6 +173,7 @@ class MapFoldPartial:
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
             BufferUse.resident(self.spec.execution),
+            BufferUse.resident(self.spec.intermediate),
             BufferUse.write(
                 self.partials,
                 BufferStorage.Materialized,
@@ -194,7 +196,11 @@ class MapFoldPartial:
 
 def make_map_fold_program(stage: BuiltStage, map_reduce, combine, initial=None):
     grid = stage_grid_info(stage)
-    execution = make_buffer_helper(stage.stage.resident_buffers.intermediate)
+    execution = make_buffer_helper(tuple(
+        buffer for buffer in stage.stage.resident_buffers.intermediate
+        if isinstance(buffer.id.role, Internal)
+        and "execution" in buffer.id.role.tags
+    ))
     if map_reduce is None or combine is None:
         raise ValueError("map-fold stage requires map_reduce and combine functions")
     read_split = make_buffer_split(
@@ -202,13 +208,14 @@ def make_map_fold_program(stage: BuiltStage, map_reduce, combine, initial=None):
         stage.stage.read_buffers.persistent,
         stage.stage.read_buffers.streamed,
     )
+    split = read_split.functions
     read_persistent = make_buffer_helper(read_split.left_buffers)
     read_streamed = make_buffer_helper(read_split.right_buffers)
 
     @ct.function
     def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
         streamed_inputs = streamed_views.load(loop_stage_tid)
-        inputs = read_split.merge(persistent_inputs, streamed_inputs)
+        inputs = split.merge(persistent_inputs, streamed_inputs)
         local = map_reduce(grid.tid_info(loop_tid), *inputs)
         return combine(*acc, *local)
 
@@ -216,8 +223,8 @@ def make_map_fold_program(stage: BuiltStage, map_reduce, combine, initial=None):
 
     @ct.function
     def map_fold_program(tid, program_tid, read_buffers):
-        persistent_buffers = read_split.left(read_buffers)
-        streamed_buffers = read_split.right(read_buffers)
+        persistent_buffers = split.left(read_buffers)
+        streamed_buffers = split.right(read_buffers)
 
         persistent_inputs = read_persistent.load(tid + program_tid, persistent_buffers)
         streamed_views = read_streamed.view(streamed_buffers)

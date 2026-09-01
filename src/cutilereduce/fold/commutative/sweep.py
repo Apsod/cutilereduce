@@ -8,9 +8,10 @@ from types import MappingProxyType
 import polars as pl
 import sympy
 
-from cutilereduce.core.axis import Axis, AxisId, axis_id
+from cutilereduce.core.axis import Axis, AxisId, Axes, axis_id
 from cutilereduce.core.sweep import Sweep
 from cutilereduce.fold.plan import FoldSpec, StageSchedule
+from cutilereduce.fold.commutative.plan import commutative_backward_stage, full_fold_plan, partial_fold_plan
 from cutilereduce.stages import Fold, MapFold, MapFoldPartial, normalize_axis_mapping
 from cutilereduce.util.spec import l4
 
@@ -20,6 +21,7 @@ class FoldSweepSymbols:
     full_tiles: Mapping[AxisId, sympy.Symbol]
     partial_tiles: Mapping[AxisId, sympy.Symbol]
     combine_tiles: Mapping[AxisId, sympy.Symbol]
+    backward_tiles: Mapping[AxisId, sympy.Symbol]
     partition_count: sympy.Symbol = sympy.Symbol("partition_count")
 
     def full_tile(self, axis: Axis | AxisId) -> sympy.Symbol:
@@ -30,6 +32,9 @@ class FoldSweepSymbols:
 
     def combine_tile(self, axis: Axis | AxisId) -> sympy.Symbol:
         return self.combine_tiles[axis_id(axis)]
+
+    def backward_tile(self, axis: Axis | AxisId) -> sympy.Symbol:
+        return self.backward_tiles[axis_id(axis)]
 
 
 def powers_of_two(stop: int) -> tuple[int, ...]:
@@ -49,6 +54,11 @@ def _tile_axes(spec: FoldSpec) -> tuple[Axis, ...]:
     return (*spec.batch, spec.fold)
 
 
+def _backward_loop_axes(spec: FoldSpec) -> tuple[Axis, ...]:
+    contribution_axes = Axes(values=_tile_axes(spec))
+    return tuple(spec.grad_storage.contention_axes(contribution_axes))
+
+
 def _make_symbols(spec: FoldSpec, partition_axis: Axis | None = None) -> FoldSweepSymbols:
     partition_axis = partition_axis or spec.fold.partition_axis
     tile_axes = _tile_axes(spec)
@@ -58,6 +68,10 @@ def _make_symbols(spec: FoldSpec, partition_axis: Axis | None = None) -> FoldSwe
         combine_tiles={
             **{axis.id: sympy.Symbol(f"combine_{axis.name}_tile") for axis in spec.batch},
             partition_axis.id: sympy.Symbol(f"combine_{partition_axis.name}_tile"),
+        },
+        backward_tiles={
+            axis.id: sympy.Symbol(f"backward_{axis.name}_tile")
+            for axis in tile_axes
         },
     )
 
@@ -123,6 +137,27 @@ def _combine_schedule(
         }),
         programs=MappingProxyType({partition_axis.id: 1}),
         loop=partition_axis.id,
+    )
+
+
+def _backward_schedule(
+        spec: FoldSpec,
+        sizes: Mapping[AxisId, int],
+        symbols: FoldSweepSymbols,
+        loop_axis: Axis,
+        partition_axis: Axis,
+        ) -> StageSchedule:
+    tile_axes = set(axis.id for axis in _tile_axes(spec))
+    return StageSchedule(
+        extents=_extent_mapping(spec, sizes),
+        tiles=MappingProxyType({
+            axis.id: symbols.backward_tile(axis)
+            if axis.id in tile_axes
+            else sizes[axis.id]
+            for axis in spec.axes
+        }),
+        programs=MappingProxyType({partition_axis.id: symbols.partition_count}),
+        loop=loop_axis.id,
     )
 
 
@@ -259,7 +294,9 @@ def _evaluate_partial_path(
         sweep: Sweep = Sweep.default,
         ):
     partition_axis = spec.fold.partition_axis
-    frontier_sweep = sweep.with_frontier_keys(f"cfg:{symbols.partition_count}")
+    frontier_sweep = sweep.add_filters(
+        pl.col("partial_storage_ratio") <= 1,
+    ).with_frontier_keys(f"cfg:{symbols.partition_count}")
     partial = MapFoldPartial.make(
         spec,
         _partial_schedule(spec, sizes, symbols, partition_axis),
@@ -344,9 +381,181 @@ def sweep_commutative_fold(
     return pl.concat(frames, how="diagonal").sort("forward_estimated_time")
 
 
+def sweep_commutative_backward(
+        spec: FoldSpec,
+        *,
+        sizes: Mapping[str | Axis | AxisId, int],
+        hardware: Mapping = l4,
+        max_tile: int = 256,
+        max_group_count: int = 4,
+        sweep: Sweep = Sweep.default,
+        ) -> pl.DataFrame:
+    normalized_sizes = _normalize_sizes(spec, sizes)
+    symbols = _make_symbols(spec)
+    axes = _tile_axes(spec)
+    tile_configs = _stage_tile_configs(
+        axes,
+        tuple(f"cfg:{symbols.backward_tile(axis)}" for axis in axes),
+        normalized_sizes,
+        max_tile,
+    )
+    counts = pl.DataFrame({
+        f"cfg:{symbols.partition_count}": range(1, max_group_count + 1),
+    })
+    configs = tile_configs.join(counts, how="cross")
+    frames = []
+    for loop_axis in _backward_loop_axes(spec):
+        partition_axis = loop_axis.partition_axis
+        loop_configs = configs.filter(
+            pl.col(f"cfg:{symbols.partition_count}")
+            <= (
+                normalized_sizes[loop_axis.id]
+                + pl.col(f"cfg:{symbols.backward_tile(loop_axis)}") - 1
+            ) // pl.col(f"cfg:{symbols.backward_tile(loop_axis)}")
+        )
+        stage = commutative_backward_stage(
+            spec,
+            _backward_schedule(
+                spec,
+                normalized_sizes,
+                symbols,
+                loop_axis,
+                partition_axis,
+            ),
+            partition_axis=partition_axis,
+        )
+        evaluated = sweep.with_frontier_keys(
+            f"cfg:{symbols.partition_count}"
+        ).apply(stage.stage, loop_configs, symbols=hardware)
+        if not evaluated.is_empty():
+            frames.append(evaluated.with_columns(pl.lit(loop_axis.name).alias("loop_axis")))
+    if not frames:
+        return pl.DataFrame()
+    return pl.concat(frames).sort("estimated_time")
+
+
+def _config_value(config: Mapping[str, object], symbol: sympy.Symbol) -> int:
+    name = f"cfg:{symbol}"
+    value = config.get(name)
+    if not isinstance(value, int):
+        raise TypeError(f"configuration value for {name} is not an integer: {value!r}")
+    return value
+
+
+def commutative_fold_plan_from_config(
+        spec: FoldSpec,
+        *,
+        sizes: Mapping[str | Axis | AxisId, int],
+        config: Mapping[str, object],
+        backward: bool = False,
+        ):
+    """Build a concrete full or partial plan from one sweep result row."""
+    normalized_sizes = _normalize_sizes(spec, sizes)
+    partition_axis = spec.fold.partition_axis
+    symbols = _make_symbols(spec, partition_axis)
+    path = config["path"]
+
+    def map_schedule(kind: str, *, partition_count: int | None = None):
+        tile = symbols.full_tile if kind == "full" else symbols.partial_tile
+        programs = {} if partition_count is None else {partition_axis.id: partition_count}
+        return StageSchedule(
+            extents=_extent_mapping(spec, normalized_sizes),
+            tiles=MappingProxyType({
+                axis.id: _config_value(config, tile(axis))
+                if axis in _tile_axes(spec)
+                else normalized_sizes[axis.id]
+                for axis in spec.axes
+            }),
+            programs=MappingProxyType(programs),
+            loop=spec.fold.id,
+        )
+
+    if path == "single":
+        schedule = map_schedule("full")
+        return full_fold_plan(
+            spec,
+            schedule,
+            backward_schedule=schedule if backward else None,
+        )
+    if path != "partial":
+        raise ValueError(f"unknown fold path: {path!r}")
+
+    partition_count = _config_value(config, symbols.partition_count)
+    partial_schedule = map_schedule("partial", partition_count=partition_count)
+    backward_schedule = map_schedule("partial") if backward else None
+    combine_schedule = StageSchedule(
+        extents=_extent_mapping(
+            spec,
+            normalized_sizes,
+            {partition_axis.id: partition_count},
+        ),
+        tiles=MappingProxyType({
+            **{
+                axis.id: _config_value(config, symbols.combine_tile(axis))
+                for axis in spec.batch
+            },
+            **{
+                axis.id: normalized_sizes[axis.id]
+                for axis in spec.axes
+                if axis not in spec.batch and axis != spec.fold
+            },
+            partition_axis.id: _config_value(config, symbols.combine_tile(partition_axis)),
+        }),
+        programs=MappingProxyType({partition_axis.id: 1}),
+        loop=partition_axis.id,
+    )
+    return partial_fold_plan(
+        spec,
+        partial_schedule,
+        combine_schedule,
+        backward_schedule=backward_schedule,
+    )
+
+
+def commutative_backward_stage_from_config(
+        spec: FoldSpec,
+        *,
+        sizes: Mapping[str | Axis | AxisId, int],
+        config: Mapping[str, object],
+        ):
+    normalized_sizes = _normalize_sizes(spec, sizes)
+    symbols = _make_symbols(spec)
+    loop_name = config.get("loop_axis")
+    loop_axis = next(
+        (axis for axis in _tile_axes(spec) if axis.name == loop_name),
+        None,
+    )
+    if loop_axis is None:
+        raise ValueError(f"unknown backward loop axis: {loop_name!r}")
+    partition_axis = loop_axis.partition_axis
+    group_count = _config_value(config, symbols.partition_count)
+    tile_axes = set(axis.id for axis in _tile_axes(spec))
+    schedule = StageSchedule(
+        extents=_extent_mapping(spec, normalized_sizes),
+        tiles=MappingProxyType({
+            axis.id: _config_value(config, symbols.backward_tile(axis))
+            if axis.id in tile_axes
+            else normalized_sizes[axis.id]
+            for axis in spec.axes
+        }),
+        programs=MappingProxyType(
+            {} if group_count == 1 else {partition_axis.id: group_count}
+        ),
+        loop=loop_axis.id,
+    )
+    return commutative_backward_stage(
+        spec,
+        schedule,
+        partition_axis=None if group_count == 1 else partition_axis,
+    )
+
+
 __all__ = [
     "FoldSweepSymbols",
+    "commutative_backward_stage_from_config",
+    "commutative_fold_plan_from_config",
     "generate_commutative_fold_configs",
     "powers_of_two",
+    "sweep_commutative_backward",
     "sweep_commutative_fold",
 ]

@@ -252,7 +252,6 @@ Sweep.default = Sweep(
     ),
     filters=(
         pl.col("resident_programs_per_sm") >= 1,
-        pl.col("partial_storage_ratio") <= 1,
     ),
     key="estimated_time",
 )
