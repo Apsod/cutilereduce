@@ -3,17 +3,18 @@ import math
 
 import cuda.tile as ct
 import torch
-import torch.utils.benchmark as torch_benchmark
 
 from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
+    FoldOperator,
     fold_functions,
     make_fold_spec,
-    mk_fold_autograd,
-    tune_commutative_fold_plan,
 )
-from cutilereduce.util.runner import run_grad
+from cutilereduce.util.runner import (
+    benchmark_implementations,
+    validate_precision_matrix,
+)
 from cutilereduce.util.spec import rtx5080
 
 
@@ -127,112 +128,56 @@ FUNCTIONS = fold_functions(
 )
 
 
-def validate(plan, sizes):
-    print("PyTorch correctness validation", flush=True)
-    batch, fold, inner = (sizes[name] for name in ("b", "v", "d"))
-    ctx = torch.randn(batch, inner, device="cuda", dtype=torch.bfloat16) * inner**-0.5
-    trg = torch.randn(fold, inner, device="cuda", dtype=torch.bfloat16) * inner**-0.5
-    targets = torch.randint(fold, (batch,), device="cuda", dtype=torch.int32)
-
-    ctx.requires_grad_()
-    trg.requires_grad_()
-    function = mk_fold_autograd(plan, FUNCTIONS)
-
-    @torch.compile()
-    def cutile(current_ctx, current_trg, current_targets):
-        loss, = function(current_ctx, current_trg, current_targets)
-        return loss
-
-    @torch.compile()
-    def reference(current_ctx, current_trg, current_targets):
-        return torch.nn.functional.cross_entropy(
-            current_ctx @ current_trg.t(),
-            current_targets.to(torch.long),
-            reduction="none",
-        )
-
-    checked = run_grad(ctx, trg, targets, cutile=cutile, pytorch=reference)
-    cutile_forward, = checked["cutile"]["fwd"]
-    pytorch_forward, = checked["pytorch"]["fwd"]
-    print(f"forward mean absolute error: {(cutile_forward - pytorch_forward).abs().mean().item():.6g}")
-    for name, cutile_grad, pytorch_grad in zip(
-            ("ctx", "trg"),
-            checked["cutile"]["bwd"],
-            checked["pytorch"]["bwd"],
-            strict=True,
-            ):
-        print(f"{name} grad mean absolute error: {(cutile_grad - pytorch_grad).abs().mean().item():.6g}")
-
-
-def benchmark_full(plan, sizes, min_run_time, *, torch_compile=False):
-    print("end-to-end timing comparison", flush=True)
+def make_inputs(sizes):
     batch, fold, inner = (sizes[name] for name in ("b", "v", "d"))
     ctx = torch.randn(batch, inner, device="cuda", dtype=torch.bfloat16) * inner**-0.5
     trg = torch.randn(fold, inner, device="cuda", dtype=torch.bfloat16) * inner**-0.5
     targets = torch.randint(fold, (batch,), device="cuda", dtype=torch.int32)
     ctx.requires_grad_()
     trg.requires_grad_()
-    eager_function = mk_fold_autograd(plan, FUNCTIONS)
-    compiled_function = (
-        torch.compile(eager_function, fullgraph=True, mode="reduce-overhead")
-        if torch_compile else None
+    return ctx, trg, targets
+
+
+def reference(ctx, trg, targets):
+    return torch.nn.functional.cross_entropy(
+        ctx @ trg.t(), targets.to(torch.long), reduction="none",
     )
-    mock = torch.randn(batch, device="cuda", dtype=torch.float32)
 
-    def cutile_forward(function):
-        with torch.no_grad():
-            return function(ctx, trg, targets)[0]
 
-    def cutile_train_forward(function):
-        return function(ctx, trg, targets)[0]
+def validate(operator, plan, sizes, *, accuracy_matrix=False):
+    print("PyTorch correctness validation", flush=True)
+    reference_dtypes = {
+        "PyTorch BF16": torch.bfloat16,
+        "PyTorch FP32": torch.float32,
+    }
+    if accuracy_matrix:
+        reference_dtypes["PyTorch FP64"] = torch.float64
+    validate_precision_matrix(
+        operator.build(plan),
+        reference,
+        make_inputs(sizes),
+        input_names=("ctx", "trg"),
+        reference_dtypes=reference_dtypes,
+        pairwise=accuracy_matrix,
+    )
 
-    def pytorch_forward():
-        with torch.no_grad():
-            return torch.nn.functional.cross_entropy(
-                ctx @ trg.t(),
-                targets.to(torch.long),
-                reduction="none",
-            )
 
-    def pytorch_train_forward():
-        return torch.nn.functional.cross_entropy(
-            ctx @ trg.t(), targets.to(torch.long), reduction="none",
+def benchmark_full(operator, plan, sizes, min_run_time, *, torch_compile=False):
+    print("end-to-end timing comparison", flush=True)
+    implementations = {
+        "CuTile eager": operator.build(plan),
+        "PyTorch": reference,
+    }
+    if torch_compile:
+        implementations["CuTile torch.compile"] = operator.build(
+            plan, torch_compile=True,
         )
-
-    def cutile_forward_backward(function):
-        ctx.grad = None
-        trg.grad = None
-        (cutile_train_forward(function) * mock).sum().backward()
-
-    def pytorch_forward_backward():
-        ctx.grad = None
-        trg.grad = None
-        (pytorch_train_forward() * mock).sum().backward()
-
-    cases = [
-        ("forward", "CuTile eager", lambda: cutile_forward(eager_function)),
-        ("forward", "PyTorch", pytorch_forward),
-        ("forward + backward", "CuTile eager", lambda: cutile_forward_backward(eager_function)),
-        ("forward + backward", "PyTorch", pytorch_forward_backward),
-    ]
-    if compiled_function is not None:
-        cutile_forward_backward(compiled_function)
-        cases.extend((
-            ("forward", "CuTile torch.compile", lambda: cutile_forward(compiled_function)),
-            ("forward + backward", "CuTile torch.compile", lambda: cutile_forward_backward(compiled_function)),
-        ))
-    measurements = []
-    for label, implementation, function_to_time in cases:
-        timer = torch_benchmark.Timer(
-            stmt="function_to_time()",
-            globals={"function_to_time": function_to_time},
-            label=f"xentropy {label}",
-            sub_label=implementation,
-            description="selected configuration",
-            num_threads=1,
-        )
-        measurements.append(timer.blocked_autorange(min_run_time=min_run_time))
-    torch_benchmark.Compare(measurements).print()
+    benchmark_implementations(
+        "xentropy",
+        make_inputs(sizes),
+        implementations,
+        min_run_time=min_run_time,
+    )
 
 
 def main():
@@ -253,6 +198,8 @@ def main():
         help="subprocess timeout; disabled by default because CUDA IPC may be unavailable",
     )
     parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--accuracy-matrix", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--torch-compile",
         action="store_true",
@@ -273,23 +220,26 @@ def main():
     if args.candidates <= 0:
         parser.error("--candidates must be positive")
     sizes = {"b": args.batch, "v": args.fold, "d": args.inner}
+    torch.manual_seed(args.seed)
     spec = xentropy_spec()
-    plan = tune_commutative_fold_plan(
-        spec,
+    operator = FoldOperator(spec, FUNCTIONS)
+    plan = operator.tune(
         sizes,
         args.candidates,
         args.timeout,
-        functions=FUNCTIONS,
         hardware=rtx5080,
-        quiet_tuning=args.quiet_tuning,
+        quiet=args.quiet_tuning,
     )
     if args.benchmark_seconds > 0:
         benchmark_full(
-            plan, sizes, args.benchmark_seconds,
+            operator, plan, sizes, args.benchmark_seconds,
             torch_compile=args.torch_compile,
         )
     if args.validate:
-        validate(plan, sizes)
+        validate(
+            operator, plan, sizes,
+            accuracy_matrix=args.accuracy_matrix,
+        )
 
 
 if __name__ == "__main__":

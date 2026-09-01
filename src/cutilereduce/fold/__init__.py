@@ -30,6 +30,7 @@ from .impl import (
     mk_fold_autograd,
     mk_fold_forward,
 )
+from .operator import FoldOperator
 from .general import (
     GeneralFoldSweepSymbols,
     general_backward_stage_from_config,
@@ -53,6 +54,7 @@ __all__ = [
     "CompiledStage",
     "FoldForwardEstimate",
     "FoldPlan",
+    "FoldOperator",
     "FoldSchedule",
     "FoldSpec",
     "FoldStage",

@@ -3,20 +3,20 @@ import math
 
 import cuda.tile as ct
 import torch
-import torch.utils.benchmark as torch_benchmark
 
 from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
     AlgebraKind,
-    StageSchedule,
+    FoldOperator,
     fold_functions,
     make_fold_spec,
-    mk_fold_autograd,
-    mk_fold_forward,
-    tune_general_fold_plan,
 )
-from cutilereduce.fold.general import partial_fold_plan
+from cutilereduce.util.runner import (
+    benchmark_implementations,
+    print_plan,
+    validate_precision_matrix,
+)
 from cutilereduce.util.spec import rtx5080
 
 
@@ -305,51 +305,11 @@ FUNCTIONS = fold_functions(
 )
 
 
-def make_plan(spec, sizes, *, fold_tile, partitions, checkpointed_backward=True):
-    partition_axis = spec.fold.partition_axis
-    partial_schedule = StageSchedule.make(
-        spec,
-        extents=sizes,
-        tiles={
-            "h": 1,
-            "l": min(8, sizes["l"]),
-            "g": sizes["g"],
-            "r": min(fold_tile, sizes["r"]),
-            "dqk": sizes["dqk"],
-            "dv": sizes["dv"],
-            "db": sizes["db"],
-        },
-        programs={partition_axis: partitions},
-        loop=spec.fold,
-    )
-    scan_schedule = StageSchedule.make(
-        spec,
-        extents={**sizes, partition_axis: partitions},
-        tiles={
-            "h": 1,
-            "l": min(8, sizes["l"]),
-            "g": sizes["g"],
-            "dqk": sizes["dqk"],
-            "dv": sizes["dv"],
-            "db": sizes["db"],
-            partition_axis: 1,
-        },
-        programs={partition_axis: 1},
-        loop=partition_axis,
-    )
-    return partial_fold_plan(
-        spec,
-        partial_schedule,
-        scan_schedule,
-        backward_schedule=partial_schedule,
-        checkpointed_backward=checkpointed_backward,
-    )
-
-
 def reference(
         query, key, value, bias_query, bias_key, *,
-        dtype=torch.float32,
+        dtype=None,
         ):
+    dtype = dtype or query.dtype
     query = query.to(dtype)
     key = key.to(dtype)
     value = value.to(dtype)
@@ -383,41 +343,6 @@ def make_inputs(sizes):
     for tensor in tensors:
         tensor.requires_grad_()
     return query, key, value, bias_query, bias_key
-
-
-def evaluate_reference(inputs, grad, *, dtype):
-    reference_inputs = tuple(
-        tensor.detach().to(dtype).requires_grad_(grad is not None)
-        for tensor in inputs
-    )
-    output = reference(
-        *reference_inputs,
-        dtype=dtype,
-    )
-    gradients = None if grad is None else torch.autograd.grad(
-        output,
-        reference_inputs,
-        grad.to(dtype),
-    )
-    return (
-        output.detach(),
-        None if gradients is None else tuple(g.detach() for g in gradients),
-    )
-
-
-def print_mae_matrix(title, values):
-    labels = tuple(values)
-    width = max(12, max(map(len, labels)) + 1)
-    print(title)
-    print("".ljust(width) + "".join(label.rjust(width) for label in labels))
-    for row_label in labels:
-        row = [row_label.ljust(width)]
-        for column_label in labels:
-            error = (
-                values[row_label].double() - values[column_label].double()
-            ).abs().mean().item()
-            row.append(f"{error:.6g}".rjust(width))
-        print("".join(row))
 
 
 def main():
@@ -459,156 +384,72 @@ def main():
         "db": args.db,
     }
     spec = affine_attention_spec()
+    operator = FoldOperator(spec, FUNCTIONS)
     if args.fixed_plan:
-        plan = make_plan(
-            spec,
+        plan = operator.plan(
             sizes,
-            fold_tile=args.fold_tile,
+            path="partial",
+            tiles={
+                "h": 1,
+                "l": min(8, sizes["l"]),
+                "g": sizes["g"],
+                "r": min(args.fold_tile, sizes["r"]),
+            },
             partitions=args.partitions,
             checkpointed_backward=not args.full_recompute_backward,
         )
     else:
-        plan = tune_general_fold_plan(
-            spec,
+        plan = operator.tune(
             sizes,
             args.candidates,
             args.timeout,
-            functions=FUNCTIONS,
             hardware=rtx5080,
             max_tile=args.max_tile,
             max_partition_count=args.partitions,
-            quiet_tuning=args.quiet_tuning,
+            quiet=args.quiet_tuning,
             backward=not args.forward_only,
         )
-    eager_function = (
-        mk_fold_forward(plan, FUNCTIONS)
-        if args.forward_only
-        else mk_fold_autograd(plan, FUNCTIONS)
-    )
-    function = (
-        torch.compile(eager_function, fullgraph=True, mode="reduce-overhead")
-        if args.torch_compile and not args.forward_only else eager_function
+    function = operator.build(
+        plan,
+        backward=not args.forward_only,
+        torch_compile=args.torch_compile,
     )
     torch.manual_seed(args.seed)
     inputs = make_inputs(sizes)
-    cutile, = function(*inputs)
-    print("stages:", ", ".join(stage.stage.name for stage in plan.forward))
-    grad = None if args.forward_only else torch.randn(
-        cutile.shape,
-        device=cutile.device,
-        dtype=torch.bfloat16,
-    )
-    cutile_grads = None if grad is None else torch.autograd.grad(
-        cutile, inputs, grad,
-    )
-
-    reference_results = {}
+    print_plan(plan)
     reference_dtypes = {
         "PyTorch BF16": torch.bfloat16,
         "PyTorch FP32": torch.float32,
     }
     if args.accuracy_matrix:
         reference_dtypes["PyTorch FP64"] = torch.float64
-    for label, dtype in reference_dtypes.items():
-        reference_results[label] = evaluate_reference(
-            inputs,
-            grad,
-            dtype=dtype,
-        )
-
-    if args.accuracy_matrix:
-        outputs = {"CuTile": cutile.detach()}
-        outputs.update(
-            (label, result[0]) for label, result in reference_results.items()
-        )
-        print_mae_matrix("forward pairwise MAE", outputs)
-        if cutile_grads is not None:
-            for index, name in enumerate(
-                    ("query", "key", "value", "bias_query", "bias_key")
-                    ):
-                gradients = {"CuTile": cutile_grads[index].detach()}
-                gradients.update(
-                    (label, result[1][index])
-                    for label, result in reference_results.items()
-                )
-                print_mae_matrix(f"{name} gradient pairwise MAE", gradients)
-    else:
-        pytorch_bf16, pytorch_bf16_grads = reference_results["PyTorch BF16"]
-        pytorch_fp32, pytorch_fp32_grads = reference_results["PyTorch FP32"]
-        print(
-            "forward mean absolute error: "
-            f"fp32={((cutile.float() - pytorch_fp32.float()).abs().mean().item()):.6g}, "
-            f"bf16={((cutile.float() - pytorch_bf16.float()).abs().mean().item()):.6g}"
-        )
-        if cutile_grads is not None:
-            for name, actual, expected_fp32, expected_bf16 in zip(
-                    ("query", "key", "value", "bias_query", "bias_key"),
-                    cutile_grads,
-                    pytorch_fp32_grads,
-                    pytorch_bf16_grads,
-                    strict=True,
-                    ):
-                fp32_error = (actual.float() - expected_fp32.float()).abs().mean().item()
-                bf16_error = (actual.float() - expected_bf16.float()).abs().mean().item()
-                print(
-                    f"{name} gradient mean absolute error: "
-                    f"fp32={fp32_error:.6g}, bf16={bf16_error:.6g}"
-                )
-    if cutile_grads is not None:
-        print("backward:", ", ".join(stage.stage.name for stage in plan.backward))
-
+    validate_precision_matrix(
+        function,
+        reference,
+        inputs,
+        input_names=("query", "key", "value", "bias_query", "bias_key"),
+        reference_dtypes=reference_dtypes,
+        backward=not args.forward_only,
+        pairwise=args.accuracy_matrix,
+    )
     if args.benchmark_seconds > 0:
         cutile_label = "CuTile torch.compile" if args.torch_compile else "CuTile eager"
-
-        def cutile_forward():
-            with torch.no_grad():
-                return function(*inputs)[0]
-
-        def pytorch_forward():
-            with torch.no_grad():
-                return reference(*inputs)
-
-        def pytorch_bf16_forward():
-            with torch.no_grad():
-                return reference(
-                    *inputs,
-                    dtype=torch.bfloat16,
-                )
-
-        cases = [
-            (f"{cutile_label} forward", cutile_forward),
-            ("PyTorch FP32 forward", pytorch_forward),
-            ("PyTorch BF16 forward", pytorch_bf16_forward),
-        ]
-        if not args.forward_only:
-            cases.extend((
-                (f"{cutile_label} forward + backward", lambda: torch.autograd.grad(
-                    function(*inputs)[0], inputs, grad
-                )),
-                ("PyTorch FP32 forward + backward", lambda: torch.autograd.grad(
-                    reference(
-                        *inputs,
-                    ), inputs, grad
-                )),
-                ("PyTorch BF16 forward + backward", lambda: torch.autograd.grad(
-                    reference(
-                        *inputs,
-                        dtype=torch.bfloat16,
-                    ), inputs, grad
-                )),
-            ))
-        measurements = [
-            torch_benchmark.Timer(
-                stmt="call()",
-                globals={"call": call},
-                label="affine LWS attention forward",
-                sub_label=name,
-                description="",
-                num_threads=1,
-            ).blocked_autorange(min_run_time=args.benchmark_seconds)
-            for name, call in cases
-        ]
-        torch_benchmark.Compare(measurements).print()
+        benchmark_implementations(
+            "affine LWS attention",
+            inputs,
+            {
+                cutile_label: function,
+                "PyTorch FP32": lambda *current: reference(
+                    *current, dtype=torch.float32,
+                ),
+                "PyTorch BF16": lambda *current: reference(
+                    *current, dtype=torch.bfloat16,
+                ),
+            },
+            min_run_time=args.benchmark_seconds,
+            backward=not args.forward_only,
+            output_grad_dtype=torch.bfloat16,
+        )
 
 
 if __name__ == "__main__":

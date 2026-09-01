@@ -194,15 +194,25 @@ class MapFoldPartial:
         )
 
 
-def make_map_fold_program(stage: BuiltStage, map_reduce, combine, initial=None):
+def make_map_fold_program(
+        stage,
+        map_reduce,
+        combine,
+        initial=None,
+        map_reduce_combine=None,
+        ):
     grid = stage_grid_info(stage)
     execution = make_buffer_helper(tuple(
         buffer for buffer in stage.stage.resident_buffers.intermediate
         if isinstance(buffer.id.role, Internal)
         and "execution" in buffer.id.role.tags
     ))
-    if map_reduce is None or combine is None:
-        raise ValueError("map-fold stage requires map_reduce and combine functions")
+    if map_reduce is None and map_reduce_combine is None:
+        raise ValueError(
+            "map-fold stage requires map_reduce or map_reduce_combine"
+        )
+    if combine is None:
+        raise ValueError("map-fold stage requires a combine function")
     read_split = make_buffer_split(
         stage.stage.read_buffers,
         stage.stage.read_buffers.persistent,
@@ -212,12 +222,19 @@ def make_map_fold_program(stage: BuiltStage, map_reduce, combine, initial=None):
     read_persistent = make_buffer_helper(read_split.left_buffers)
     read_streamed = make_buffer_helper(read_split.right_buffers)
 
-    @ct.function
-    def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
-        streamed_inputs = streamed_views.load(loop_stage_tid)
-        inputs = split.merge(persistent_inputs, streamed_inputs)
-        local = map_reduce(grid.tid_info(loop_tid), *inputs)
-        return combine(*acc, *local)
+    if map_reduce_combine is None:
+        @ct.function
+        def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
+            streamed_inputs = streamed_views.load(loop_stage_tid)
+            inputs = split.merge(persistent_inputs, streamed_inputs)
+            local = map_reduce(grid.tid_info(loop_tid), *inputs)
+            return combine(*acc, *local)
+    else:
+        @ct.function
+        def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
+            streamed_inputs = streamed_views.load(loop_stage_tid)
+            inputs = split.merge(persistent_inputs, streamed_inputs)
+            return map_reduce_combine(grid.tid_info(loop_tid), *inputs, acc)
 
     loop = grid.loop_with_tail(loop_body)
 
@@ -245,6 +262,7 @@ def _compile_map_fold_like_stage(
         write_carrier: bool,
         map_reduce=None,
         combine=None,
+        map_reduce_combine=None,
         initial=None,
         to_semantic=None,
         ):
@@ -252,6 +270,9 @@ def _compile_map_fold_like_stage(
     write = make_buffer_helper(stage.stage.write_buffers)
     if functions is not None:
         map_reduce = map_reduce or functions.map_reduce
+        map_reduce_combine = (
+            map_reduce_combine or functions.map_reduce_combine
+        )
         combine = combine or functions.combine
         to_semantic = to_semantic or functions.to_semantic
     to_semantic = to_semantic or identity
@@ -260,6 +281,7 @@ def _compile_map_fold_like_stage(
         map_reduce,
         combine,
         initial,
+        map_reduce_combine,
     )
 
     @ct.kernel

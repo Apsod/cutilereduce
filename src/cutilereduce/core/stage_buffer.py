@@ -210,7 +210,11 @@ class StageBuffer:
         return torch.full(self.total.shape, self.default, device=device, requires_grad=self.req_grad, dtype=self.torch_dtype)
 
     def mk_zeros(self, device=None):
-        return torch.zeros(self.total.shape, device=device)
+        return torch.zeros(
+            self.total.shape,
+            device=device,
+            dtype=self.torch_dtype,
+        )
 
 @dataclass(frozen=True, kw_only=True)
 class KernelBuffers(TupleSet[StageBuffer]):

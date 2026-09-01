@@ -3,17 +3,18 @@ import math
 
 import cuda.tile as ct
 import torch
-import torch.utils.benchmark as torch_benchmark
 
 from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
+    FoldOperator,
     fold_functions,
     make_fold_spec,
-    mk_fold_autograd,
-    tune_commutative_fold_plan,
 )
-from cutilereduce.util.runner import run_grad
+from cutilereduce.util.runner import (
+    benchmark_implementations,
+    validate_precision_matrix,
+)
 from cutilereduce.util.spec import rtx5080
 
 
@@ -91,6 +92,49 @@ def map_reduce(tid, query, key, value):
         maximum.reshape((head, length, group)),
         exponential_sum.reshape((head, length, group)),
         numerator.reshape((head, length, group, dv)),
+    )
+
+
+@ct.function
+def map_reduce_combine(tid, query, key, value, acc):
+    acc_m, acc_e, acc_u = acc
+    length, group, head, _, dv, _ = tid.shape(
+        "l", "g", "h", "r", "dv", "dqk"
+    )
+    logits = attention_map(tid, query, key) * LOG2E
+    local_m = ct.max(logits, axis=2)
+    local_weights = ct.exp2(logits - local_m[:, :, None])
+    local_e = ct.sum(local_weights, axis=2)
+
+    acc_m = acc_m.reshape((head, length * group))
+    acc_e = acc_e.reshape((head, length * group))
+    acc_u = acc_u.reshape((head, length * group, dv))
+    acc_is_high = acc_m > local_m
+    high_m = ct.where(acc_is_high, acc_m, local_m)
+    low_m = ct.where(acc_is_high, local_m, acc_m)
+    skip = high_m == float("-inf")
+    scaling = ct.exp2(ct.where(skip, 0.0, low_m - high_m))
+    acc_scale = ct.where(acc_is_high, 1.0, scaling)
+    local_scale = ct.where(acc_is_high, scaling, 1.0)
+
+    numerator = acc_u * acc_scale[:, :, None]
+    numerator = ct.mma(
+        (local_weights * local_scale[:, :, None]).astype(ct.bfloat16),
+        value,
+        numerator,
+    )
+    return (
+        high_m.reshape((head, length, group)),
+        ct.where(
+            skip,
+            acc_e + local_e,
+            acc_e * acc_scale + local_e * local_scale,
+        ).reshape((head, length, group)),
+        ct.where(
+            skip[:, :, None],
+            acc_u,
+            numerator,
+        ).reshape((head, length, group, dv)),
     )
 
 
@@ -185,6 +229,7 @@ FUNCTIONS = fold_functions(
     combine,
     to_semantic,
     to_output,
+    map_reduce_combine=map_reduce_combine,
     embed=embed,
     finalize=finalize,
 )
@@ -227,82 +272,40 @@ def make_inputs(sizes):
     return query, key, value
 
 
-def validate(plan, sizes):
+def validate(operator, plan, sizes, *, accuracy_matrix=False):
     print("SDPA correctness validation", flush=True)
-    inputs = make_inputs(sizes)
-    function = mk_fold_autograd(plan, FUNCTIONS)
-    checked = run_grad(
-        *inputs,
-        cutile=lambda *current: function(*current)[0],
-        pytorch=sdpa,
+    reference_dtypes = {
+        "PyTorch BF16": torch.bfloat16,
+        "PyTorch FP32": torch.float32,
+    }
+    if accuracy_matrix:
+        reference_dtypes["PyTorch FP64"] = torch.float64
+    validate_precision_matrix(
+        operator.build(plan),
+        sdpa,
+        make_inputs(sizes),
+        input_names=("query", "key", "value"),
+        reference_dtypes=reference_dtypes,
+        pairwise=accuracy_matrix,
     )
-    for cutile, pytorch in zip(
-            checked["cutile"]["fwd"], checked["pytorch"]["fwd"], strict=True,
-            ):
-        print(f"forward mean absolute error: {(cutile - pytorch).abs().mean().item():.6g}")
-    for name, cutile, pytorch in zip(
-            ("query", "key", "value"),
-            checked["cutile"]["bwd"],
-            checked["pytorch"]["bwd"],
-            strict=True,
-            ):
-        print(f"{name} grad mean absolute error: {(cutile - pytorch).abs().mean().item():.6g}")
 
 
-def benchmark_full(plan, sizes, min_run_time, *, torch_compile=False):
+def benchmark_full(operator, plan, sizes, min_run_time, *, torch_compile=False):
     print("end-to-end timing comparison", flush=True)
-    query, key, value = make_inputs(sizes)
-    eager_function = mk_fold_autograd(plan, FUNCTIONS)
-    compiled_function = (
-        torch.compile(eager_function, fullgraph=True, mode="reduce-overhead")
-        if torch_compile else None
+    implementations = {
+        "CuTile eager": operator.build(plan),
+        "PyTorch SDPA": sdpa,
+    }
+    if torch_compile:
+        implementations["CuTile torch.compile"] = operator.build(
+            plan, torch_compile=True,
+        )
+    benchmark_implementations(
+        "attention",
+        make_inputs(sizes),
+        implementations,
+        min_run_time=min_run_time,
     )
-    mock = torch.randn(
-        sizes["h"], sizes["l"], sizes["g"], sizes["dv"], device="cuda"
-    )
-
-    def cutile_forward(function):
-        with torch.no_grad():
-            return function(query, key, value)[0]
-
-    def cutile_train_forward(function):
-        return function(query, key, value)[0]
-
-    def sdpa_forward():
-        with torch.no_grad():
-            return sdpa(query, key, value)
-
-    def sdpa_train_forward():
-        return sdpa(query, key, value)
-
-    def backward(forward):
-        for tensor in (query, key, value):
-            tensor.grad = None
-        (forward() * mock).sum().backward()
-
-    cases = [
-        ("forward", "CuTile eager", lambda: cutile_forward(eager_function)),
-        ("forward", "PyTorch SDPA", sdpa_forward),
-        ("forward + backward", "CuTile eager", lambda: backward(lambda: cutile_train_forward(eager_function))),
-        ("forward + backward", "PyTorch SDPA", lambda: backward(sdpa_train_forward)),
-    ]
-    if compiled_function is not None:
-        backward(lambda: cutile_train_forward(compiled_function))
-        cases.extend((
-            ("forward", "CuTile torch.compile", lambda: cutile_forward(compiled_function)),
-            ("forward + backward", "CuTile torch.compile", lambda: backward(lambda: cutile_train_forward(compiled_function))),
-        ))
-    measurements = []
-    for label, implementation, function_to_time in cases:
-        measurements.append(torch_benchmark.Timer(
-            stmt="function_to_time()",
-            globals={"function_to_time": function_to_time},
-            label=f"attention {label}",
-            sub_label=implementation,
-            description="selected configuration",
-            num_threads=1,
-        ).blocked_autorange(min_run_time=min_run_time))
-    torch_benchmark.Compare(measurements).print()
 
 
 def main():
@@ -317,6 +320,8 @@ def main():
     parser.add_argument("--timeout", type=float, default=0)
     parser.add_argument("--quiet-tuning", action="store_true")
     parser.add_argument("--validate", action="store_true")
+    parser.add_argument("--accuracy-matrix", action="store_true")
+    parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--benchmark-seconds", type=float, default=1.0)
     args = parser.parse_args()
@@ -330,22 +335,25 @@ def main():
         "dqk": args.dqk,
         "dv": args.dv,
     }
-    plan = tune_commutative_fold_plan(
-        attention_spec(),
+    torch.manual_seed(args.seed)
+    operator = FoldOperator(attention_spec(), FUNCTIONS)
+    plan = operator.tune(
         sizes,
         args.candidates,
         args.timeout,
-        functions=FUNCTIONS,
         hardware=rtx5080,
-        quiet_tuning=args.quiet_tuning,
+        quiet=args.quiet_tuning,
     )
     if args.benchmark_seconds > 0:
         benchmark_full(
-            plan, sizes, args.benchmark_seconds,
+            operator, plan, sizes, args.benchmark_seconds,
             torch_compile=args.torch_compile,
         )
     if args.validate:
-        validate(plan, sizes)
+        validate(
+            operator, plan, sizes,
+            accuracy_matrix=args.accuracy_matrix,
+        )
 
 
 if __name__ == "__main__":

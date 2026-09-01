@@ -14,6 +14,7 @@ from cutilereduce.stages.base import BuiltStage
 @dataclass(frozen=True)
 class StageFunctions:
     map_reduce: Any = None
+    map_reduce_combine: Any = None
     combine: Any = None
     to_semantic: Any = None
     to_output: Any = None
