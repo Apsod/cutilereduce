@@ -34,7 +34,7 @@ This repository is still a prototype. The current landed version supports:
 
 Not yet landed:
 
-- grouped reductions across multiple programs;
+- multiple fold/loop axes, such as joint or factorized cross-entropy kernels;
 - first-class scan and scan-fold APIs beyond the internal scan used to combine
   ordered partial folds;
 - broader API polish and packaging around the prototype examples.
