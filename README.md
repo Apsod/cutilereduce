@@ -34,6 +34,9 @@ This repository is still a prototype. The current landed version supports:
 
 Not yet landed:
 
+- decomposition along non-batch, non-fold dimensions: these inner dimensions
+  must currently fit in a single program tile and cannot themselves be split
+  across programs or selected as the loop axis;
 - multiple fold/loop axes, such as joint or factorized cross-entropy kernels;
 - first-class scan and scan-fold APIs beyond the internal scan used to combine
   ordered partial folds;
