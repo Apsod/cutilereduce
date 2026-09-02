@@ -334,6 +334,8 @@ def main():
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--benchmark-seconds", type=float, default=1.0)
     parser.add_argument("--benchmark-memory", action="store_true")
+    parser.add_argument("--load-plan", metavar="PATH")
+    parser.add_argument("--save-plan", metavar="PATH")
     args = parser.parse_args()
     if args.candidates <= 0:
         parser.error("--candidates must be positive")
@@ -347,13 +349,19 @@ def main():
     }
     torch.manual_seed(args.seed)
     operator = FoldOperator(attention_spec(), FUNCTIONS)
-    plan = operator.tune(
-        sizes,
-        args.candidates,
-        args.timeout,
-        hardware=rtx5080,
-        quiet=args.quiet_tuning,
+    plan = (
+        operator.load_plan(args.load_plan, sizes)
+        if args.load_plan
+        else operator.tune(
+            sizes,
+            args.candidates,
+            args.timeout,
+            hardware=rtx5080,
+            quiet=args.quiet_tuning,
+        )
     )
+    if args.save_plan:
+        operator.save_plan(plan, args.save_plan, metadata={"hardware": "rtx5080"})
     if args.benchmark_seconds > 0 or args.benchmark_memory:
         benchmark_full(
             operator, plan, sizes, args.benchmark_seconds,

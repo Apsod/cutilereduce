@@ -31,6 +31,12 @@ from .impl import (
     mk_fold_forward,
 )
 from .operator import FoldOperator
+from .persistence import (
+    fold_plan_from_record,
+    load_fold_plan,
+    plan_record,
+    save_fold_plan,
+)
 from .general import (
     GeneralFoldSweepSymbols,
     general_backward_stage_from_config,
@@ -75,15 +81,19 @@ __all__ = [
     "estimate_fold_stage",
     "fold_stage_kernel_cost",
     "fold_functions",
+    "fold_plan_from_record",
     "full_fold_plan",
     "generate_commutative_fold_configs",
     "general_fold_plan_from_config",
     "make_fold_spec",
+    "load_fold_plan",
     "mk_fold_autograd",
     "mk_fold_forward",
     "output_grad_buffers",
     "partial_fold_plan",
     "powers_of_two",
+    "plan_record",
+    "save_fold_plan",
     "sweep_commutative_backward",
     "sweep_commutative_fold",
     "sweep_general_fold",

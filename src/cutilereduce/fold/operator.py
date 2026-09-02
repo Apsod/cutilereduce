@@ -16,6 +16,7 @@ from cutilereduce.fold.general.plan import (
 )
 from cutilereduce.fold.impl import FoldFunctions, mk_fold_autograd, mk_fold_forward
 from cutilereduce.fold.plan import AlgebraKind, FoldPlan, FoldSpec, StageSchedule
+from cutilereduce.fold.persistence import load_fold_plan, save_fold_plan
 
 
 @dataclass(frozen=True)
@@ -201,6 +202,24 @@ class FoldOperator:
                 mode="reduce-overhead",
             )
         return function
+
+    def save_plan(self, plan: FoldPlan, path, *, metadata=None) -> None:
+        if plan.spec is not self.spec and plan.spec != self.spec:
+            raise ValueError("plan was created for a different fold specification")
+        save_fold_plan(plan, path, metadata=metadata)
+
+    def load_plan(self, path, sizes=None) -> FoldPlan:
+        plan = load_fold_plan(self.spec, path)
+        if sizes is not None:
+            expected = {self.spec.axis_id(name): size for name, size in sizes.items()}
+            for stage in (*plan.forward, *plan.backward):
+                for axis in stage.domain.compute_axes:
+                    if axis.id in expected and axis.extent != expected[axis.id]:
+                        raise ValueError(
+                            f"persisted extent for {axis.name!r} is {axis.extent}, "
+                            f"but the requested size is {expected[axis.id]}"
+                        )
+        return plan
 
 
 __all__ = ["FoldOperator"]

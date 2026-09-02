@@ -367,6 +367,8 @@ def main():
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--benchmark-seconds", type=float, default=0.5)
     parser.add_argument("--benchmark-memory", action="store_true")
+    parser.add_argument("--load-plan", metavar="PATH")
+    parser.add_argument("--save-plan", metavar="PATH")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--accuracy-matrix",
@@ -387,7 +389,9 @@ def main():
     }
     spec = affine_attention_spec()
     operator = FoldOperator(spec, FUNCTIONS)
-    if args.fixed_plan:
+    if args.load_plan:
+        plan = operator.load_plan(args.load_plan, sizes)
+    elif args.fixed_plan:
         plan = operator.plan(
             sizes,
             path="partial",
@@ -411,6 +415,8 @@ def main():
             quiet=args.quiet_tuning,
             backward=not args.forward_only,
         )
+    if args.save_plan:
+        operator.save_plan(plan, args.save_plan, metadata={"hardware": "rtx5080"})
     function = operator.build(
         plan,
         backward=not args.forward_only,
