@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+import gc
 
 import torch
 import torch.utils.benchmark as torch_benchmark
@@ -165,6 +166,87 @@ def benchmark_implementations(
     return measurements
 
 
+def benchmark_memory(
+        name,
+        inputs,
+        implementations: Mapping[str, object],
+        *,
+        backward=True,
+        output_grad_dtype=None,
+        ):
+    """Measure incremental peak PyTorch-managed CUDA tensor allocation."""
+    with torch.no_grad():
+        sample = as_tuple(next(iter(implementations.values()))(*inputs))
+    output_grads = make_output_grads(sample, dtype=output_grad_dtype)
+    del sample
+    grad_inputs = differentiable_inputs(inputs)
+
+    def forward(function):
+        with torch.no_grad():
+            return function(*inputs)
+
+    def forward_backward(function):
+        outputs = as_tuple(function(*inputs))
+        return torch.autograd.grad(
+            outputs,
+            grad_inputs,
+            tuple(
+                grad.to(output.dtype)
+                for output, grad in zip(outputs, output_grads, strict=True)
+            ),
+        )
+
+    for function in implementations.values():
+        forward(function)
+        if backward:
+            forward_backward(function)
+    torch.cuda.synchronize()
+
+    def peak_delta(call):
+        gc.collect()
+        torch.cuda.empty_cache()
+        torch.cuda.synchronize()
+        baseline = torch.cuda.memory_allocated()
+        torch.cuda.reset_peak_memory_stats()
+        result = call()
+        torch.cuda.synchronize()
+        peak = torch.cuda.max_memory_allocated() - baseline
+        del result
+        return peak
+
+    rows = []
+    for implementation, function in implementations.items():
+        forward_peak = peak_delta(lambda f=function: forward(f))
+        backward_peak = (
+            peak_delta(lambda f=function: forward_backward(f))
+            if backward else None
+        )
+        rows.append((implementation, forward_peak, backward_peak))
+
+    mib = 1024 ** 2
+    label_width = max(len("Implementation"), *(len(row[0]) for row in rows))
+    print(f"{name} incremental peak CUDA allocation")
+    if backward:
+        print(
+            f"{'Implementation'.ljust(label_width)}  "
+            f"{'Forward'.rjust(12)}  {'Forward + backward'.rjust(20)}"
+        )
+        for implementation, forward_peak, backward_peak in rows:
+            print(
+                f"{implementation.ljust(label_width)}  "
+                f"{forward_peak / mib:10.3f} MiB  "
+                f"{backward_peak / mib:18.3f} MiB"
+            )
+    else:
+        print(f"{'Implementation'.ljust(label_width)}  {'Forward'.rjust(12)}")
+        for implementation, forward_peak, _ in rows:
+            print(
+                f"{implementation.ljust(label_width)}  "
+                f"{forward_peak / mib:10.3f} MiB"
+            )
+    return rows
+
+
 def print_mae_matrix(title, values):
     labels = tuple(values)
     width = max(12, max(map(len, labels)) + 1)
@@ -261,6 +343,7 @@ def print_plan(plan):
 __all__ = [
     "as_tuple",
     "benchmark_implementations",
+    "benchmark_memory",
     "evaluate",
     "make_output_grads",
     "print_mae_matrix",

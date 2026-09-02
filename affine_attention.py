@@ -14,6 +14,7 @@ from cutilereduce.fold import (
 )
 from cutilereduce.util.runner import (
     benchmark_implementations,
+    benchmark_memory,
     print_plan,
     validate_precision_matrix,
 )
@@ -365,6 +366,7 @@ def main():
     parser.add_argument("--full-recompute-backward", action="store_true")
     parser.add_argument("--torch-compile", action="store_true")
     parser.add_argument("--benchmark-seconds", type=float, default=0.5)
+    parser.add_argument("--benchmark-memory", action="store_true")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--accuracy-matrix",
@@ -432,24 +434,34 @@ def main():
         backward=not args.forward_only,
         pairwise=args.accuracy_matrix,
     )
-    if args.benchmark_seconds > 0:
+    if args.benchmark_seconds > 0 or args.benchmark_memory:
         cutile_label = "CuTile torch.compile" if args.torch_compile else "CuTile eager"
-        benchmark_implementations(
-            "affine LWS attention",
-            inputs,
-            {
-                cutile_label: function,
-                "PyTorch FP32": lambda *current: reference(
-                    *current, dtype=torch.float32,
-                ),
-                "PyTorch BF16": lambda *current: reference(
-                    *current, dtype=torch.bfloat16,
-                ),
-            },
-            min_run_time=args.benchmark_seconds,
-            backward=not args.forward_only,
-            output_grad_dtype=torch.bfloat16,
-        )
+        implementations = {
+            cutile_label: function,
+            "PyTorch FP32": lambda *current: reference(
+                *current, dtype=torch.float32,
+            ),
+            "PyTorch BF16": lambda *current: reference(
+                *current, dtype=torch.bfloat16,
+            ),
+        }
+        if args.benchmark_seconds > 0:
+            benchmark_implementations(
+                "affine LWS attention",
+                inputs,
+                implementations,
+                min_run_time=args.benchmark_seconds,
+                backward=not args.forward_only,
+                output_grad_dtype=torch.bfloat16,
+            )
+        if args.benchmark_memory:
+            benchmark_memory(
+                "affine LWS attention",
+                inputs,
+                implementations,
+                backward=not args.forward_only,
+                output_grad_dtype=torch.bfloat16,
+            )
 
 
 if __name__ == "__main__":

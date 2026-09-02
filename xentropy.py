@@ -13,6 +13,7 @@ from cutilereduce.fold import (
 )
 from cutilereduce.util.runner import (
     benchmark_implementations,
+    benchmark_memory,
     validate_precision_matrix,
 )
 from cutilereduce.util.spec import rtx5080
@@ -162,8 +163,11 @@ def validate(operator, plan, sizes, *, accuracy_matrix=False):
     )
 
 
-def benchmark_full(operator, plan, sizes, min_run_time, *, torch_compile=False):
-    print("end-to-end timing comparison", flush=True)
+def benchmark_full(
+        operator, plan, sizes, min_run_time, *,
+        torch_compile=False,
+        measure_memory=False,
+        ):
     implementations = {
         "CuTile eager": operator.build(plan),
         "PyTorch": reference,
@@ -172,12 +176,17 @@ def benchmark_full(operator, plan, sizes, min_run_time, *, torch_compile=False):
         implementations["CuTile torch.compile"] = operator.build(
             plan, torch_compile=True,
         )
-    benchmark_implementations(
-        "xentropy",
-        make_inputs(sizes),
-        implementations,
-        min_run_time=min_run_time,
-    )
+    inputs = make_inputs(sizes)
+    if min_run_time > 0:
+        print("end-to-end timing comparison", flush=True)
+        benchmark_implementations(
+            "xentropy",
+            inputs,
+            implementations,
+            min_run_time=min_run_time,
+        )
+    if measure_memory:
+        benchmark_memory("xentropy", inputs, implementations)
 
 
 def main():
@@ -216,6 +225,7 @@ def main():
         default=1.0,
         help="minimum run time per end-to-end benchmark; set to 0 to disable",
     )
+    parser.add_argument("--benchmark-memory", action="store_true")
     args = parser.parse_args()
     if args.candidates <= 0:
         parser.error("--candidates must be positive")
@@ -230,10 +240,11 @@ def main():
         hardware=rtx5080,
         quiet=args.quiet_tuning,
     )
-    if args.benchmark_seconds > 0:
+    if args.benchmark_seconds > 0 or args.benchmark_memory:
         benchmark_full(
             operator, plan, sizes, args.benchmark_seconds,
             torch_compile=args.torch_compile,
+            measure_memory=args.benchmark_memory,
         )
     if args.validate:
         validate(
