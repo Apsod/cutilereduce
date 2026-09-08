@@ -45,13 +45,13 @@ def affine_attention_spec():
             "z": buffer_spec("h l g", ct.float32, default=float("-inf")),
             "mu": buffer_spec("h l g dv", ct.float32, default=0),
         },
-        # Logical tile-local values used by the map/finalize callbacks. These
+        # Logical tile-local values used by the map/map_finalize callbacks. These
         # are heuristic residency declarations, not materialized buffers.
         map_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
             "alpha": buffer_spec("h l g r", ct.float32),
         },
-        finalize_intermediate={
+        map_finalize_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
             "alpha": buffer_spec("h l g r", ct.float32),
             "local_weights": buffer_spec("h l g r", ct.float32),
@@ -126,7 +126,7 @@ def affine_attention_map(tid, query, key, bias_query, bias_key):
 
 
 @ct.function
-def map_reduce(tid, query, key, value, bias_query, bias_key):
+def map_fold(tid, query, key, value, bias_query, bias_key):
     length, group, head, _, _, dv, _ = tid.shape(
         "l", "g", "h", "r", "dqk", "dv", "db"
     )
@@ -177,7 +177,7 @@ def embed(alpha, z, mu, g_alpha, g_z, g_mu):
 
 
 @ct.function
-def finalize(
+def map_finalize(
         tid,
         query, key, value, bias_query, bias_key,
         g_query, g_key, g_value, g_bias_query, g_bias_key,
@@ -297,12 +297,12 @@ def finalize(
 
 
 FUNCTIONS = fold_functions(
-    map_reduce,
+    map_fold,
     combine,
     to_semantic,
     to_output,
     embed=embed,
-    finalize=finalize,
+    map_finalize=map_finalize,
 )
 
 

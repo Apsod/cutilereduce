@@ -9,16 +9,25 @@ often be derived from local gradient rules for those monoids.
 The current implementation focuses on a practical subset of that model:
 forward and backward kernels for fold-style reductions. A user supplies:
 
-- a `Spec` describing the logical grid, input/output buffers, fold dimension,
-  work model, and concrete tiling;
-- a tile-local `map_reduce` function that maps input tiles to one or more
-  monoidal summary tiles;
-- a `combine` function that merges two summaries.
+- a `FoldSpec` describing the logical axes, input/output and carrier buffers,
+  fold dimension, algebra, and work models;
+- a forward pass specification:
+  - a tile-local `map_fold` function that maps input tiles to one or more
+    monoidal summary tiles;
+  - a `combine` function that merges two summaries;
+- a backward pass specification:
+  - an `embed` function that turns semantic outputs and output gradients into
+    a compact gradient representation;
+  - a tile-local `map_finalize` function that maps input tiles, input-gradient
+    accumulators, and the compact gradient representation into input tile
+    gradients. For general/non-commutative folds, `map_finalize` also threads the
+    ordered fold state.
 
-CutileReduce then builds CUDA Tile kernels that reduce over the fold dimension
-inside each program and write the final summary. Optional `to_semantic` and
-`to_output` hooks can convert the execution representation back into semantic
-outputs.
+Concrete problem sizes and tiling choices are supplied when constructing or
+tuning a `FoldPlan`. CutileReduce then builds CUDA Tile kernels that reduce
+over the fold dimension inside each program and write the final summary.
+Optional `to_semantic` and `to_output` hooks can convert the execution
+representation back into semantic outputs.
 
 ## Current Scope
 
@@ -54,15 +63,15 @@ input-gradient tiles.
 Forward callbacks:
 
 ```python
-map_reduce: (TID, *Input) -> State
+map_fold: (TID, *Input) -> State
 combine: (*State, *State) -> State
-map_reduce_combine: (TID, *Input, State) -> State  # optional fused form
+map_fold_combine: (TID, *Input, State) -> State  # optional fused form
 to_semantic: (*State) -> Output                    # optional
 to_output: (*Output) -> Tensor | tuple[Tensor, ...] # optional host wrapper
 ```
 
-When `map_reduce_combine` is omitted, a map-fold stage computes
-`combine(*acc, *map_reduce(tid, *inputs))`. Supplying `map_reduce_combine`
+When `map_fold_combine` is omitted, a map-fold stage computes
+`combine(*acc, *map_fold(tid, *inputs))`. Supplying `map_fold_combine`
 lets an example fuse tile-local mapping with accumulator update, as in
 [`attention.py`](attention.py).
 
@@ -72,16 +81,15 @@ Backward callbacks:
 embed: (*Output, *OutputGrad) -> Embed
 
 # Commutative folds:
-finalize: (TID, *Input, *InputGrad, *Embed) -> InputGrad
+map_finalize: (TID, *Input, *InputGrad, *Embed) -> InputGrad
 
 # General/non-commutative folds:
-finalize: (TID, *Input, *InputGrad, *Embed, *State) -> tuple[InputGrad, State]
+map_finalize: (TID, *Input, *InputGrad, *Embed, *State) -> tuple[InputGrad, State]
 ```
 
-For general folds, `State` in `finalize` is the exclusive prefix state before
+For general folds, `State` in `map_finalize` is the exclusive prefix state before
 the current tile, and the returned `State` is the inclusive state after that
-tile. `map_reduce_backward` is still accepted as a compatibility alias for this
-stateful general-fold `finalize` callback.
+tile.
 
 ## Early Benchmarks
 

@@ -20,7 +20,7 @@ from cutilereduce.stages import StageSchedule
 
 
 FORMAT = "cutilereduce.fold-plan"
-VERSION = 1
+VERSION = 2
 
 
 def _axis_key(axis: AxisId) -> str:
@@ -140,9 +140,9 @@ def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
             else general_full_fold_plan
         )
         expected_backward = (
-            "recompute_finalize_grad_write"
+            "recompute_map_finalize_grad_write"
             if spec.algebra == AlgebraKind.commutative
-            else "recompute_fold_finalize_grad_write"
+            else "recompute_fold_map_finalize_grad_write"
         )
         if backward_kind not in (None, expected_backward):
             raise ValueError(f"invalid backward stage {backward_kind!r} for full fold")
@@ -152,7 +152,7 @@ def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
     if kinds != ("map_fold_partial", expected_second):
         raise ValueError(f"unsupported persisted forward stage sequence: {kinds}")
     if spec.algebra == AlgebraKind.commutative:
-        if backward_kind not in (None, "recompute_finalize_grad_write"):
+        if backward_kind not in (None, "recompute_map_finalize_grad_write"):
             raise ValueError(f"invalid backward stage {backward_kind!r} for commutative fold")
         return commutative_partial_fold_plan(
             spec,
@@ -161,11 +161,11 @@ def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
             backward_schedule=backward_schedule,
         )
 
-    checkpointed = backward_kind == "recompute_prefix_fold_finalize_grad_write"
+    checkpointed = backward_kind == "recompute_prefix_fold_map_finalize_grad_write"
     if backward_kind not in (
         None,
-        "recompute_fold_finalize_grad_write",
-        "recompute_prefix_fold_finalize_grad_write",
+        "recompute_fold_map_finalize_grad_write",
+        "recompute_prefix_fold_map_finalize_grad_write",
     ):
         raise ValueError(f"invalid backward stage {backward_kind!r} for general fold")
     return general_partial_fold_plan(

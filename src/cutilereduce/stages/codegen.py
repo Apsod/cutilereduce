@@ -13,16 +13,14 @@ from cutilereduce.stages.base import BuiltStage
 
 @dataclass(frozen=True)
 class StageFunctions:
-    map_reduce: Any = None
-    map_reduce_combine: Any = None
+    map_fold: Any = None
+    map_fold_combine: Any = None
     combine: Any = None
     to_semantic: Any = None
     to_output: Any = None
     embed: Any = None
-    finalize: Any = None
+    map_finalize: Any = None
     map_backward: Any = None
-    # Compatibility alias for the stateful general-fold finalize callback.
-    map_reduce_backward: Any = None
 
 
 @dataclass(frozen=True)

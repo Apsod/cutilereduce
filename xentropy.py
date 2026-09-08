@@ -42,7 +42,7 @@ def xentropy_spec():
         map_intermediate={
             "logits": buffer_spec("b v", ct.float32),
         },
-        finalize_intermediate={
+        map_finalize_intermediate={
             "logits": buffer_spec("b v", ct.float32),
             "scale": buffer_spec("b v", ct.float32),
             "g_logits": buffer_spec("b v", ct.bfloat16),
@@ -72,7 +72,7 @@ def xentropy_map(tid, ctx, trg, targets):
 
 
 @ct.function
-def map_reduce(tid, ctx, trg, targets):
+def map_fold(tid, ctx, trg, targets):
     logits, hits = xentropy_map(tid, ctx, trg, targets)
     maximum = ct.max(logits, axis=1)
     exponential_sum = ct.sum(ct.exp2(logits - maximum[:, None]), axis=1)
@@ -110,7 +110,7 @@ def embed(logsumexp, target_logit, g_logsumexp, g_target_logit):
 
 
 @ct.function
-def finalize(tid, ctx, trg, targets, g_ctx, g_trg, z, g_z, g_l):
+def map_finalize(tid, ctx, trg, targets, g_ctx, g_trg, z, g_z, g_l):
     logits, hits = xentropy_map(tid, ctx, trg, targets)
     scale = ct.exp2(logits - z[:, None])
     g_logits = (scale * g_z[:, None] + hits * g_l[:, None]).astype(ct.bfloat16)
@@ -120,12 +120,12 @@ def finalize(tid, ctx, trg, targets, g_ctx, g_trg, z, g_z, g_l):
 
 
 FUNCTIONS = fold_functions(
-    map_reduce,
+    map_fold,
     combine,
     to_semantic,
     to_output,
     embed=embed,
-    finalize=finalize,
+    map_finalize=map_finalize,
 )
 
 

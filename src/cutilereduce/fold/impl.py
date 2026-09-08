@@ -25,29 +25,25 @@ class FoldFunctions(StageFunctions):
 
 
 def fold_functions(
-        map_reduce=None,
+        map_fold=None,
         combine=None,
         to_semantic=None,
         to_output=None,
         *,
-        map_reduce_combine=None,
+        map_fold_combine=None,
         embed=None,
-        finalize=None,
+        map_finalize=None,
         map_backward=None,
-        map_reduce_backward=None,
         ) -> FoldFunctions:
-    if finalize is not None and map_reduce_backward is not None:
-        raise ValueError("pass finalize, not both finalize and map_reduce_backward")
     return FoldFunctions(
-        map_reduce=map_reduce,
-        map_reduce_combine=map_reduce_combine,
+        map_fold=map_fold,
+        map_fold_combine=map_fold_combine,
         combine=combine,
         to_semantic=to_semantic,
         to_output=to_output,
         embed=embed,
-        finalize=finalize,
+        map_finalize=map_finalize,
         map_backward=map_backward,
-        map_reduce_backward=map_reduce_backward,
     )
 
 
@@ -183,8 +179,8 @@ def _fake_tensor_like(reference, buffer):
 def _custom_op_digest(plan, functions):
     function_sources = []
     for name in (
-            "map_reduce", "map_reduce_combine", "combine", "to_semantic", "embed", "finalize",
-            "map_backward", "map_reduce_backward",
+            "map_fold", "map_fold_combine", "combine", "to_semantic", "embed", "map_finalize",
+            "map_backward",
             ):
         function = getattr(functions, name)
         if function is None:

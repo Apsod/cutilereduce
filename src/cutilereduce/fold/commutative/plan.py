@@ -5,7 +5,7 @@ import cuda.tile as ct
 from cutilereduce.core.axis import Axis
 from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.fold.plan import FoldPlan, FoldSpec, StageSchedule
-from cutilereduce.stages import Fold, MapFold, MapFoldPartial, RecomputeFinalizeGradWrite, partial_buffers
+from cutilereduce.stages import Fold, MapFold, MapFoldPartial, RecomputeMapFinalizeGradWrite, partial_buffers
 
 FullFold = MapFold
 PartialFold = MapFoldPartial
@@ -24,7 +24,7 @@ def commutative_backward_stage(
         output_grad: BufferBundle | None = None,
         partition_axis: Axis | None = None,
         ):
-    return RecomputeFinalizeGradWrite(
+    return RecomputeMapFinalizeGradWrite(
         spec=spec,
         schedule=schedule,
         global_buffers=global_buffers or spec.output,

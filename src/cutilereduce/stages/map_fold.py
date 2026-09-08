@@ -76,7 +76,7 @@ def partial_buffers(spec, partition_axis: Axis, partial_tag: str = "partial") ->
 class MapFold:
     spec: object
     schedule: StageSchedule
-    map_reduce: object | None = None
+    map_fold: object | None = None
     combine: object | None = None
     initial: object | None = None
     to_semantic: object | None = None
@@ -106,7 +106,7 @@ class MapFold:
             compiler=lambda stage, functions: compile_map_fold_stage(
                 stage,
                 functions,
-                map_reduce=self.map_reduce,
+                map_fold=self.map_fold,
                 combine=self.combine,
                 initial=self.initial,
                 to_semantic=self.to_semantic,
@@ -120,7 +120,7 @@ class MapFoldPartial:
     schedule: StageSchedule
     partition_axis: Axis
     partials: BufferBundle
-    map_reduce: object | None = None
+    map_fold: object | None = None
     combine: object | None = None
     initial: object | None = None
 
@@ -131,7 +131,7 @@ class MapFoldPartial:
             schedule: StageSchedule,
             *,
             partial_tag: str = "partial",
-            map_reduce=None,
+            map_fold=None,
             combine=None,
             initial=None,
             ) -> MapFoldPartial:
@@ -141,7 +141,7 @@ class MapFoldPartial:
             schedule=schedule,
             partition_axis=partition_axis,
             partials=partial_buffers(spec, partition_axis, partial_tag),
-            map_reduce=map_reduce,
+            map_fold=map_fold,
             combine=combine,
             initial=initial,
         )
@@ -187,7 +187,7 @@ class MapFoldPartial:
             compiler=lambda stage, functions: compile_map_fold_partial_stage(
                 stage,
                 functions,
-                map_reduce=self.map_reduce,
+                map_fold=self.map_fold,
                 combine=self.combine,
                 initial=self.initial,
             ),
@@ -196,10 +196,10 @@ class MapFoldPartial:
 
 def make_map_fold_program(
         stage,
-        map_reduce,
+        map_fold,
         combine,
         initial=None,
-        map_reduce_combine=None,
+        map_fold_combine=None,
         ):
     grid = stage_grid_info(stage)
     execution = make_buffer_helper(tuple(
@@ -207,9 +207,9 @@ def make_map_fold_program(
         if isinstance(buffer.id.role, Internal)
         and "execution" in buffer.id.role.tags
     ))
-    if map_reduce is None and map_reduce_combine is None:
+    if map_fold is None and map_fold_combine is None:
         raise ValueError(
-            "map-fold stage requires map_reduce or map_reduce_combine"
+            "map-fold stage requires map_fold or map_fold_combine"
         )
     if combine is None:
         raise ValueError("map-fold stage requires a combine function")
@@ -222,19 +222,19 @@ def make_map_fold_program(
     read_persistent = make_buffer_helper(read_split.left_buffers)
     read_streamed = make_buffer_helper(read_split.right_buffers)
 
-    if map_reduce_combine is None:
+    if map_fold_combine is None:
         @ct.function
         def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
             streamed_inputs = streamed_views.load(loop_stage_tid)
             inputs = split.merge(persistent_inputs, streamed_inputs)
-            local = map_reduce(grid.tid_info(loop_tid), *inputs)
+            local = map_fold(grid.tid_info(loop_tid), *inputs)
             return combine(*acc, *local)
     else:
         @ct.function
         def loop_body(loop_tid, loop_stage_tid, acc, persistent_inputs, streamed_views):
             streamed_inputs = streamed_views.load(loop_stage_tid)
             inputs = split.merge(persistent_inputs, streamed_inputs)
-            return map_reduce_combine(grid.tid_info(loop_tid), *inputs, acc)
+            return map_fold_combine(grid.tid_info(loop_tid), *inputs, acc)
 
     loop = grid.loop_with_tail(loop_body)
 
@@ -260,28 +260,28 @@ def _compile_map_fold_like_stage(
         functions: StageFunctions | None,
         *,
         write_carrier: bool,
-        map_reduce=None,
+        map_fold=None,
         combine=None,
-        map_reduce_combine=None,
+        map_fold_combine=None,
         initial=None,
         to_semantic=None,
         ):
     grid = stage_grid_info(stage)
     write = make_buffer_helper(stage.stage.write_buffers)
     if functions is not None:
-        map_reduce = map_reduce or functions.map_reduce
-        map_reduce_combine = (
-            map_reduce_combine or functions.map_reduce_combine
+        map_fold = map_fold or functions.map_fold
+        map_fold_combine = (
+            map_fold_combine or functions.map_fold_combine
         )
         combine = combine or functions.combine
         to_semantic = to_semantic or functions.to_semantic
     to_semantic = to_semantic or identity
     map_fold_program = make_map_fold_program(
         stage,
-        map_reduce,
+        map_fold,
         combine,
         initial,
-        map_reduce_combine,
+        map_fold_combine,
     )
 
     @ct.kernel

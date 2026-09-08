@@ -17,7 +17,7 @@ from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
 
 @dataclass(frozen=True)
-class RecomputeFinalizeGradWrite:
+class RecomputeMapFinalizeGradWrite:
     spec: object
     schedule: StageSchedule
     global_buffers: BufferBundle
@@ -51,7 +51,7 @@ class RecomputeFinalizeGradWrite:
                 programs=self.schedule.program(self.partition_axis, 1),
             ))
         domain = StageDomain(
-            name="recompute_finalize_grad_write",
+            name="recompute_map_finalize_grad_write",
             compute_axes=compute_axes,
             program_axes=ProgramAxes(values=tuple(program_axes)),
             loop=loop_axis,
@@ -61,24 +61,24 @@ class RecomputeFinalizeGradWrite:
             BufferUse.read_resident(self.global_buffers),
             BufferUse.read_resident(self.output_grad),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.finalize_intermediate),
+            BufferUse.resident(self.spec.map_finalize_intermediate),
             BufferUse.write(grad_storage),
         ))
         return BuiltStage(
             stage=KernelStage(
-                "recompute_finalize_grad_write",
+                "recompute_map_finalize_grad_write",
                 domain,
                 buffers,
                 self.spec.backward_work or self.spec.map_fold_work,
                 write_model=atomic_add_write,
             ),
             partition_axis=self.partition_axis,
-            compiler=compile_recompute_finalize_grad_write_stage,
+            compiler=compile_recompute_map_finalize_grad_write_stage,
         )
 
 
 @dataclass(frozen=True)
-class RecomputeFoldFinalizeGradWrite:
+class RecomputeFoldMapFinalizeGradWrite:
     spec: object
     schedule: StageSchedule
     global_buffers: BufferBundle
@@ -96,7 +96,7 @@ class RecomputeFoldFinalizeGradWrite:
         )
         program_axes = batch_program_axes(self.schedule, compute_axes)
         domain = StageDomain(
-            name="recompute_fold_finalize_grad_write",
+            name="recompute_fold_map_finalize_grad_write",
             compute_axes=compute_axes,
             program_axes=ProgramAxes(values=tuple(program_axes)),
             loop=self.schedule.loop or self.spec.fold.id,
@@ -106,24 +106,24 @@ class RecomputeFoldFinalizeGradWrite:
             BufferUse.read_resident(self.global_buffers),
             BufferUse.read_resident(self.output_grad),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.finalize_intermediate),
+            BufferUse.resident(self.spec.map_finalize_intermediate),
             BufferUse.write(grad_storage),
         ]
         buffers = bind_buffer_uses(domain, tuple(uses))
         return BuiltStage(
             stage=KernelStage(
-                "recompute_fold_finalize_grad_write",
+                "recompute_fold_map_finalize_grad_write",
                 domain,
                 buffers,
                 self.spec.backward_work or self.spec.map_fold_work,
                 write_model=atomic_add_write,
             ),
-            compiler=compile_recompute_fold_finalize_grad_write_stage,
+            compiler=compile_recompute_fold_map_finalize_grad_write_stage,
         )
 
 
 @dataclass(frozen=True)
-class RecomputePrefixFoldFinalizeGradWrite:
+class RecomputePrefixFoldMapFinalizeGradWrite:
     spec: object
     schedule: StageSchedule
     global_buffers: BufferBundle
@@ -148,7 +148,7 @@ class RecomputePrefixFoldFinalizeGradWrite:
             programs=self.schedule.program(self.prefix_axis, 1),
         ))
         domain = StageDomain(
-            name="recompute_prefix_fold_finalize_grad_write",
+            name="recompute_prefix_fold_map_finalize_grad_write",
             compute_axes=compute_axes,
             program_axes=ProgramAxes(values=tuple(program_axes)),
             loop=self.schedule.loop or self.spec.fold.id,
@@ -163,12 +163,12 @@ class RecomputePrefixFoldFinalizeGradWrite:
                 axis_map={self.prefix_axis.id: self.spec.fold.id},
             ),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.finalize_intermediate),
+            BufferUse.resident(self.spec.map_finalize_intermediate),
             BufferUse.write(grad_storage),
         ))
         return BuiltStage(
             stage=KernelStage(
-                "recompute_prefix_fold_finalize_grad_write",
+                "recompute_prefix_fold_map_finalize_grad_write",
                 domain,
                 buffers,
                 self.spec.backward_work or self.spec.map_fold_work,
@@ -176,7 +176,7 @@ class RecomputePrefixFoldFinalizeGradWrite:
             ),
             checkpoints=self.prefix,
             partition_axis=self.prefix_axis,
-            compiler=compile_recompute_prefix_fold_finalize_grad_write_stage,
+            compiler=compile_recompute_prefix_fold_map_finalize_grad_write_stage,
         )
 
 
@@ -188,7 +188,7 @@ def _is_global_read(buffer) -> bool:
     return buffer.role != Input and not _is_output_grad(buffer)
 
 
-def compile_recompute_finalize_grad_write_stage(stage: BuiltStage, functions: StageFunctions):
+def compile_recompute_map_finalize_grad_write_stage(stage: BuiltStage, functions: StageFunctions):
     grid = stage_grid_info(stage)
     embed_buffers = tuple(
         b for b in stage.stage.read_buffers
@@ -231,10 +231,10 @@ def compile_recompute_finalize_grad_write_stage(stage: BuiltStage, functions: St
         stage.stage.read_buffers,
         tuple(b for b in stage.stage.read_buffers if _is_output_grad(b)),
     )
-    finalize = functions.finalize
+    map_finalize = functions.map_finalize
     embed = functions.embed
-    if finalize is None or embed is None:
-        raise ValueError("recompute-finalize-grad-write stage requires embed and finalize functions")
+    if map_finalize is None or embed is None:
+        raise ValueError("recompute-map_finalize-grad-write stage requires embed and map_finalize functions")
 
     if embed_is_persistent:
         @ct.function
@@ -244,7 +244,7 @@ def compile_recompute_finalize_grad_write_stage(stage: BuiltStage, functions: St
             input_tiles = input_project(read_tiles)
             streamed_grads = write_streamed.init()
             grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
-            grads = finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
+            grads = map_finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
             persistent_grads = write_split_functions.left(grads)
             streamed_grads = write_split_functions.right(grads)
             streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
@@ -260,7 +260,7 @@ def compile_recompute_finalize_grad_write_stage(stage: BuiltStage, functions: St
             streamed_grads = write_streamed.init()
             grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
             embedded = embed(*dynamic_global_project(read_tiles), *dynamic_output_grad_project(read_tiles))
-            grads = finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
+            grads = map_finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
             persistent_grads = write_split_functions.left(grads)
             streamed_grads = write_split_functions.right(grads)
             streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
@@ -309,11 +309,11 @@ def compile_recompute_finalize_grad_write_stage(stage: BuiltStage, functions: St
     return kernel
 
 
-def compile_recompute_fold_finalize_grad_write_stage(stage: BuiltStage, functions):
+def compile_recompute_fold_map_finalize_grad_write_stage(stage: BuiltStage, functions):
     return _compile_ordered_fold_grad_write_stage(stage, functions, read_prefix=False)
 
 
-def compile_recompute_prefix_fold_finalize_grad_write_stage(stage: BuiltStage, functions):
+def compile_recompute_prefix_fold_map_finalize_grad_write_stage(stage: BuiltStage, functions):
     return _compile_ordered_fold_grad_write_stage(stage, functions, read_prefix=True)
 
 
@@ -323,13 +323,12 @@ def _is_prefix_buffer(stage: BuiltStage, buffer) -> bool:
 
 def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFunctions, *, read_prefix: bool):
     grid = stage_grid_info(stage)
-    # General-fold finalize is stateful: it consumes the exclusive fold state
-    # before this tile and returns (gradients, inclusive state after the tile).
-    # map_reduce_backward remains as a compatibility alias.
-    map_reduce_backward = functions.finalize or functions.map_reduce_backward
+    # General-fold map_finalize is stateful: it consumes the exclusive fold
+    # state before this tile and returns (gradients, inclusive state after it).
+    map_finalize = functions.map_finalize
     embed = functions.embed
-    if map_reduce_backward is None or embed is None:
-        raise ValueError("ordered fold backward stage requires embed and stateful finalize functions")
+    if map_finalize is None or embed is None:
+        raise ValueError("ordered fold backward stage requires embed and stateful map_finalize functions")
 
     ordinary_read_buffers = tuple(
         b for b in stage.stage.read_buffers
@@ -403,7 +402,7 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
             input_tiles = input_project(read_tiles)
             streamed_grads = write_streamed.init()
             grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
-            grad_tiles, prefix = map_reduce_backward(
+            grad_tiles, prefix = map_finalize(
                 grid.tid_info(loop_tid),
                 *input_tiles,
                 *grad_tiles,
@@ -426,7 +425,7 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
             streamed_grads = write_streamed.init()
             grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
             embedded = embed(*dynamic_global_project(read_tiles), *dynamic_output_grad_project(read_tiles))
-            grad_tiles, prefix = map_reduce_backward(
+            grad_tiles, prefix = map_finalize(
                 grid.tid_info(loop_tid),
                 *input_tiles,
                 *grad_tiles,
@@ -490,10 +489,10 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
 
 
 __all__ = [
-    "RecomputeFinalizeGradWrite",
-    "RecomputeFoldFinalizeGradWrite",
-    "RecomputePrefixFoldFinalizeGradWrite",
-    "compile_recompute_finalize_grad_write_stage",
-    "compile_recompute_fold_finalize_grad_write_stage",
-    "compile_recompute_prefix_fold_finalize_grad_write_stage",
+    "RecomputeMapFinalizeGradWrite",
+    "RecomputeFoldMapFinalizeGradWrite",
+    "RecomputePrefixFoldMapFinalizeGradWrite",
+    "compile_recompute_map_finalize_grad_write_stage",
+    "compile_recompute_fold_map_finalize_grad_write_stage",
+    "compile_recompute_prefix_fold_map_finalize_grad_write_stage",
 ]

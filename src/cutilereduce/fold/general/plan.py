@@ -6,8 +6,8 @@ from cutilereduce.fold.plan import FoldPlan, FoldSpec, StageSchedule
 from cutilereduce.stages import (
     MapFold,
     MapFoldPartial,
-    RecomputeFoldFinalizeGradWrite,
-    RecomputePrefixFoldFinalizeGradWrite,
+    RecomputeFoldMapFinalizeGradWrite,
+    RecomputePrefixFoldMapFinalizeGradWrite,
     Scan,
 )
 
@@ -17,7 +17,7 @@ def output_grad_buffers(spec: FoldSpec):
 
 
 def full_recompute_backward_stage(spec, schedule, *, global_buffers=None, output_grad=None):
-    return RecomputeFoldFinalizeGradWrite(
+    return RecomputeFoldMapFinalizeGradWrite(
         spec,
         schedule,
         global_buffers=global_buffers or spec.output,
@@ -26,7 +26,7 @@ def full_recompute_backward_stage(spec, schedule, *, global_buffers=None, output
 
 
 def prefix_recompute_backward_stage(spec, schedule, *, checkpoints, partition_axis, global_buffers=None, output_grad=None):
-    return RecomputePrefixFoldFinalizeGradWrite(
+    return RecomputePrefixFoldMapFinalizeGradWrite(
         spec,
         schedule,
         global_buffers=global_buffers or spec.output,

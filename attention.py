@@ -42,7 +42,7 @@ def attention_spec():
         map_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
         },
-        finalize_intermediate={
+        map_finalize_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
             "scale": buffer_spec("h l g r", ct.float32),
             "g_logits": buffer_spec("h l g r", ct.bfloat16),
@@ -81,7 +81,7 @@ def attention_map(tid, query, key):
 
 
 @ct.function
-def map_reduce(tid, query, key, value):
+def map_fold(tid, query, key, value):
     length, group, head, _, dv, _ = tid.shape("l", "g", "h", "r", "dv", "dqk")
     logits = attention_map(tid, query, key) * LOG2E
     maximum = ct.max(logits, axis=2)
@@ -97,7 +97,7 @@ def map_reduce(tid, query, key, value):
 
 
 @ct.function
-def map_reduce_combine(tid, query, key, value, acc):
+def map_fold_combine(tid, query, key, value, acc):
     acc_m, acc_e, acc_u = acc
     length, group, head, _, dv, _ = tid.shape(
         "l", "g", "h", "r", "dv", "dqk"
@@ -188,7 +188,7 @@ def embed(logsumexp, mean, g_logsumexp, g_mean):
 
 
 @ct.function
-def finalize(
+def map_finalize(
         tid,
         query,
         key,
@@ -226,13 +226,13 @@ def finalize(
 
 
 FUNCTIONS = fold_functions(
-    map_reduce,
+    map_fold,
     combine,
     to_semantic,
     to_output,
-    map_reduce_combine=map_reduce_combine,
+    map_fold_combine=map_fold_combine,
     embed=embed,
-    finalize=finalize,
+    map_finalize=map_finalize,
 )
 
 
