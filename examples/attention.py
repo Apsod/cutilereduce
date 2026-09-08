@@ -1,4 +1,4 @@
-import argparse
+from .cli import main as example_main
 import math
 
 import cuda.tile as ct
@@ -7,16 +7,9 @@ import torch
 from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
-    FoldOperator,
     fold_functions,
     make_fold_spec,
 )
-from cutilereduce.util.runner import (
-    benchmark_implementations,
-    benchmark_memory,
-    validate_precision_matrix,
-)
-from cutilereduce.util.spec import rtx5080
 
 
 LOG2E = math.log2(math.e)
@@ -253,126 +246,20 @@ def sdpa(query, key, value):
     return output.reshape(1, heads, group, length, dv)[0].transpose(1, 2)
 
 
-def make_inputs(sizes):
-    query = torch.randn(
-        sizes["h"], sizes["l"], sizes["g"], sizes["dqk"],
-        device="cuda", dtype=torch.bfloat16,
-    )
-    key = torch.randn(
-        sizes["h"], sizes["r"], sizes["dqk"],
-        device="cuda", dtype=torch.bfloat16,
-    )
-    value = torch.randn(
-        sizes["h"], sizes["r"], sizes["dv"],
-        device="cuda", dtype=torch.bfloat16,
-    )
-    for tensor in (query, key, value):
-        tensor.requires_grad_()
-    with torch.no_grad():
-        query.mul_(sizes["dqk"] ** -0.5)
-    return query, key, value
-
-
-def validate(operator, plan, sizes, *, accuracy_matrix=False):
-    print("SDPA correctness validation", flush=True)
-    reference_dtypes = {
-        "PyTorch BF16": torch.bfloat16,
-        "PyTorch FP32": torch.float32,
-    }
-    if accuracy_matrix:
-        reference_dtypes["PyTorch FP64"] = torch.float64
-    validate_precision_matrix(
-        operator.build(plan),
-        sdpa,
-        make_inputs(sizes),
-        input_names=("query", "key", "value"),
-        reference_dtypes=reference_dtypes,
-        pairwise=accuracy_matrix,
-    )
-
-
-def benchmark_full(
-        operator, plan, sizes, min_run_time, *,
-        torch_compile=False,
-        measure_memory=False,
-        ):
-    implementations = {
-        "CuTile eager": operator.build(plan),
-        "PyTorch SDPA": sdpa,
-    }
-    if torch_compile:
-        implementations["CuTile torch.compile"] = operator.build(
-            plan, torch_compile=True,
-        )
-    inputs = make_inputs(sizes)
-    if min_run_time > 0:
-        print("end-to-end timing comparison", flush=True)
-        benchmark_implementations(
-            "attention",
-            inputs,
-            implementations,
-            min_run_time=min_run_time,
-        )
-    if measure_memory:
-        benchmark_memory("attention", inputs, implementations)
+INITIALIZERS = {
+    'query': lambda t, s: t.normal_().mul_(s["dqk"] ** -0.25),
+    'key': lambda t, s: t.normal_().mul_(s["dqk"] ** -0.25),
+    'value': lambda t, s: t.normal_(),
+}
 
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--length", type=int, default=4096)
-    parser.add_argument("--right", type=int, default=4096)
-    parser.add_argument("--heads", type=int, default=4)
-    parser.add_argument("--groups", type=int, default=8)
-    parser.add_argument("--dqk", type=int, default=128)
-    parser.add_argument("--dv", type=int, default=128)
-    parser.add_argument("--candidates", type=int, default=20)
-    parser.add_argument("--timeout", type=float, default=0)
-    parser.add_argument("--quiet-tuning", action="store_true")
-    parser.add_argument("--validate", action="store_true")
-    parser.add_argument("--accuracy-matrix", action="store_true")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--torch-compile", action="store_true")
-    parser.add_argument("--benchmark-seconds", type=float, default=1.0)
-    parser.add_argument("--benchmark-memory", action="store_true")
-    parser.add_argument("--load-plan", metavar="PATH")
-    parser.add_argument("--save-plan", metavar="PATH")
-    args = parser.parse_args()
-    if args.candidates <= 0:
-        parser.error("--candidates must be positive")
-    sizes = {
-        "h": args.heads,
-        "l": args.length,
-        "g": args.groups,
-        "r": args.right,
-        "dqk": args.dqk,
-        "dv": args.dv,
-    }
-    torch.manual_seed(args.seed)
-    operator = FoldOperator(attention_spec(), FUNCTIONS)
-    plan = (
-        operator.load_plan(args.load_plan, sizes)
-        if args.load_plan
-        else operator.tune(
-            sizes,
-            args.candidates,
-            args.timeout,
-            hardware=rtx5080,
-            quiet=args.quiet_tuning,
-        )
+    example_main(
+        'attention', attention_spec(), FUNCTIONS, {'h': 4, 'l': 4096, 'g': 8, 'r': 4096, 'dqk': 128, 'dv': 128},
+        aliases={'h': 'heads', 'l': 'length', 'g': 'groups', 'r': 'right'}, benchmark_seconds=1.0,
+        reference=sdpa, references={'PyTorch SDPA': sdpa},
+        initializers=INITIALIZERS,
     )
-    if args.save_plan:
-        operator.save_plan(plan, args.save_plan, metadata={"hardware": "rtx5080"})
-    if args.benchmark_seconds > 0 or args.benchmark_memory:
-        benchmark_full(
-            operator, plan, sizes, args.benchmark_seconds,
-            torch_compile=args.torch_compile,
-            measure_memory=args.benchmark_memory,
-        )
-    if args.validate:
-        validate(
-            operator, plan, sizes,
-            accuracy_matrix=args.accuracy_matrix,
-        )
 
 
 if __name__ == "__main__":

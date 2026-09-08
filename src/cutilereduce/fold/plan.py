@@ -70,6 +70,59 @@ class FoldSpec:
     def axis_id(self, key: str | Axis | AxisId) -> AxisId:
         return resolve_axis_id(self, key)
 
+    def mk_inputs(self, sizes, *, device="cuda", **initializers):
+        """Return leaf tensors in spec order, with spec dtypes and grad flags.
+
+        Each initializer receives ``(tensor, sizes)`` and may fill the tensor
+        in place (returning None) or return a replacement of the same shape,
+        dtype and device. Floating inputs default to normal random values;
+        integer inputs require an initializer to choose their valid range.
+        Buffer defaults describe kernel padding, not input distributions.
+        """
+        import operator
+        from types import MappingProxyType
+
+        import torch
+
+        sizes = dict(sizes)
+        expected = {axis.name for axis in self.axes}
+        if sizes.keys() != expected:
+            raise ValueError(f"sizes must contain exactly {sorted(expected)}")
+        for name, value in sizes.items():
+            if isinstance(value, bool):
+                raise ValueError(f"size {name!r} must be a positive integer")
+            sizes[name] = operator.index(value)
+            if sizes[name] <= 0:
+                raise ValueError(f"size {name!r} must be positive")
+        unknown = initializers.keys() - {buffer.id.name for buffer in self.input}
+        if unknown:
+            raise ValueError(f"unknown input initializers: {sorted(unknown)}")
+        sizes = MappingProxyType(sizes)
+        inputs = []
+        with torch.no_grad():
+            for buffer in self.input:
+                tensor = torch.empty(
+                    tuple(sizes[axis.name] for axis in buffer.axes),
+                    dtype=buffer.torch_dtype, device=device,
+                )
+                initializer = initializers.get(buffer.id.name)
+                if initializer is None:
+                    if not tensor.is_floating_point():
+                        raise ValueError(f"input {buffer.id.name!r} requires an initializer")
+                    tensor.normal_()
+                else:
+                    result = initializer(tensor, sizes)
+                    if result is not None:
+                        if not isinstance(result, torch.Tensor) or (
+                            result.shape != tensor.shape
+                            or result.dtype != tensor.dtype
+                            or result.device != tensor.device
+                        ):
+                            raise ValueError(f"initializer for {buffer.id.name!r} changed shape, dtype or device")
+                        tensor = result
+                inputs.append(tensor.detach().requires_grad_(buffer.req_grad))
+        return tuple(inputs)
+
 
 def make_fold_spec(
         *,

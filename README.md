@@ -37,9 +37,9 @@ This repository is still a prototype. The current landed version supports:
 - general/non-commutative fold plans for ordered reductions that need prefix
   state;
 - basic spec construction, cost estimation, and sweep utilities;
-- working example-style experiments in [`xentropy.py`](xentropy.py),
-  [`attention.py`](attention.py), and
-  [`affine_attention.py`](affine_attention.py).
+- working example-style experiments in [`examples/xentropy.py`](examples/xentropy.py),
+  [`examples/attention.py`](examples/attention.py), and
+  [`examples/affine_attention.py`](examples/affine_attention.py).
 
 Not yet landed:
 
@@ -74,7 +74,7 @@ to_output: (*Output) -> Tensor | tuple[Tensor, ...] # optional host wrapper
 When `map_fold_combine` is omitted, a map-fold stage computes
 `combine(*acc, *map_fold(tid, *inputs))`. Supplying `map_fold_combine`
 lets an example fuse tile-local mapping with accumulator update, as in
-[`attention.py`](attention.py).
+[`examples/attention.py`](examples/attention.py).
 
 Backward callbacks:
 
@@ -104,7 +104,7 @@ steady-state wall-clock CUDA timings from `torch.utils.benchmark` with
 These are local prototype measurements rather than portable performance
 claims. In particular, the PyTorch baselines differ by example: standard
 attention uses PyTorch SDPA, while affine LWS attention uses the explicit
-PyTorch formulation in `affine_attention.py`.
+PyTorch formulation in `examples/affine_attention.py`.
 
 Each example also accepts `--benchmark-memory`. This runs a separate pass over
 the already selected and warmed plan and reports incremental peak
@@ -118,8 +118,8 @@ Tuned plans can be stored as versioned JSON and reused without repeating the
 analytical or empirical sweep:
 
 ```console
-uv run attention.py --save-plan plans/attention-rtx5080.json
-uv run attention.py --load-plan plans/attention-rtx5080.json \
+uv run -m examples.attention --save-plan plans/attention-rtx5080.json
+uv run -m examples.attention --load-plan plans/attention-rtx5080.json \
   --benchmark-seconds 0 --benchmark-memory
 ```
 
@@ -233,3 +233,49 @@ For commutative folds, the key simplification is that the gradient of a global
 product with respect to a local factor can be computed from the global product
 and that local factor, without carrying a prefix. This is the theoretical case
 targeted by the commutative examples in the current implementation.
+
+## Constructing inputs and running examples
+
+`FoldSpec.mk_inputs` takes all logical axis sizes and returns tensors in input
+spec order. Shapes, dtypes, and `requires_grad` come from the spec. Floating
+inputs use normal random values by default. Named callbacks receive an allocated
+tensor and a read-only mapping of all sizes; they may initialize in place or
+return a tensor with the same shape, dtype, and device. Returned inputs are
+leaves, so scaling during initialization does not create an autograd history.
+Integer inputs require an explicit initializer to define their valid range.
+Buffer `default` values remain kernel padding values.
+
+```python
+from examples.xentropy import xentropy_spec
+
+ctx, trg, targets = xentropy_spec().mk_inputs(
+    {"b": 32, "v": 128, "d": 64},
+    device="cuda",  # use "cpu" for host-side experiments
+    ctx=lambda tensor, sizes: tensor.normal_().mul_(sizes["d"] ** -0.5),
+    trg=lambda tensor, sizes: tensor.normal_().mul_(sizes["d"] ** -0.5),
+    targets=lambda tensor, sizes: tensor.random_(sizes["v"]),
+)
+```
+
+Run examples from the repository root:
+
+```console
+uv run -m examples.attention --heads 4 --l 4096 --r 4096 --validate
+uv run -m examples.xentropy --batch 1024 --v 4096 --d 128
+uv run -m examples.affine_attention --help
+```
+
+The shared `ExampleParser` generates dimension arguments from `spec.axes`.
+Examples supply size defaults and optional descriptive aliases (`--heads` for
+`--h`, for example). Tuning, seed, compilation, benchmark, and plan persistence
+options are shared; algorithm-specific options stay with their example.
+
+All three kernel examples call `examples.cli.main` with their spec, fold
+functions, size defaults, aliases, initializers, and references. The shared CLI
+handles parsing, seeding, tuning or loading a plan, saving, building, validation,
+and benchmarking. It builds one callable and passes it to the shared execution
+helpers. `--torch-compile` selects the compiled callable for both validation and
+benchmarking.
+`--validate` or `--accuracy-matrix` enables validation in all examples.
+All examples support `--forward-only` for tuning and running only the forward
+pass. It currently cannot be combined with `--torch-compile`.

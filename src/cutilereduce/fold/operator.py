@@ -153,10 +153,6 @@ class FoldOperator:
             quiet=False,
             ) -> FoldPlan:
         if self.spec.algebra == AlgebraKind.commutative:
-            if not backward:
-                raise ValueError(
-                    "forward-only commutative tuning is not currently supported"
-                )
             return tune_commutative_fold_plan(
                 self.spec,
                 sizes,
@@ -165,6 +161,7 @@ class FoldOperator:
                 functions=self.functions,
                 hardware=hardware,
                 quiet_tuning=quiet,
+                backward=backward,
             )
         if self.spec.algebra == AlgebraKind.general:
             return tune_general_fold_plan(

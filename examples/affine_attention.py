@@ -1,4 +1,4 @@
-import argparse
+from .cli import main as example_main
 import math
 
 import cuda.tile as ct
@@ -8,17 +8,9 @@ from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
     AlgebraKind,
-    FoldOperator,
     fold_functions,
     make_fold_spec,
 )
-from cutilereduce.util.runner import (
-    benchmark_implementations,
-    benchmark_memory,
-    print_plan,
-    validate_precision_matrix,
-)
-from cutilereduce.util.spec import rtx5080
 
 
 LOG2E = math.log2(math.e)
@@ -326,148 +318,25 @@ def reference(
     return torch.einsum("hlgr,hrd->hlgd", weights, value)
 
 
-def make_inputs(sizes):
-    shapes = (
-        (sizes["h"], sizes["l"], sizes["g"], sizes["dqk"]),
-        (sizes["h"], sizes["r"], sizes["dqk"]),
-        (sizes["h"], sizes["r"], sizes["dv"]),
-        (sizes["h"], sizes["l"], sizes["g"], sizes["db"]),
-        (sizes["h"], sizes["r"], sizes["db"]),
-    )
-    tensors = tuple(
-        torch.randn(shape, device="cuda", dtype=torch.bfloat16)
-        for shape in shapes
-    )
-    query, key, value, bias_query, bias_key = tensors
-    query.mul_(sizes["dqk"] ** -0.5)
-    bias_query.mul_(sizes["db"] ** -0.5)
-    for tensor in tensors:
-        tensor.requires_grad_()
-    return query, key, value, bias_query, bias_key
+INITIALIZERS = {
+    'query': lambda t, s: t.normal_().mul_(s["dqk"] ** -0.25),
+    'bias_query': lambda t, s: t.normal_().mul_(s["db"] ** -0.25),
+    'key': lambda t, s: t.normal_().mul_(s["dqk"] ** -0.25),
+    'bias_key': lambda t, s: t.normal_().mul_(s["db"] ** -0.25),
+    'value': lambda t, s: t.normal_(),
 
+}
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--length", type=int, default=2048)
-    parser.add_argument("--right", type=int, default=2048)
-    parser.add_argument("--heads", type=int, default=2)
-    parser.add_argument("--groups", type=int, default=2)
-    parser.add_argument("--dqk", type=int, default=64)
-    parser.add_argument("--dv", type=int, default=64)
-    parser.add_argument("--db", type=int, default=32)
-    parser.add_argument("--fold-tile", type=int, default=64)
-    parser.add_argument("--partitions", type=int, default=4)
-    parser.add_argument("--candidates", type=int, default=20)
-    parser.add_argument("--max-tile", type=int, default=128)
-    parser.add_argument("--timeout", type=float, default=0)
-    parser.add_argument("--quiet-tuning", action="store_true")
-    parser.add_argument("--fixed-plan", action="store_true")
-    parser.add_argument("--forward-only", action="store_true")
-    parser.add_argument("--full-recompute-backward", action="store_true")
-    parser.add_argument("--torch-compile", action="store_true")
-    parser.add_argument("--benchmark-seconds", type=float, default=0.5)
-    parser.add_argument("--benchmark-memory", action="store_true")
-    parser.add_argument("--load-plan", metavar="PATH")
-    parser.add_argument("--save-plan", metavar="PATH")
-    parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument(
-        "--accuracy-matrix",
-        action="store_true",
-        help="compare CuTile and BF16/FP32/FP64 references pairwise; FP64 can be expensive",
+    example_main(
+        'affine_attention', affine_attention_spec(), FUNCTIONS, {'h': 2, 'l': 4096, 'g': 2, 'r': 4096, 'dqk': 64, 'dv': 64, 'db': 32},
+        aliases={'h': 'heads', 'l': 'length', 'g': 'groups', 'r': 'right'}, benchmark_seconds=0.5,
+        reference=reference, references={
+            "PyTorch FP32": lambda *inputs: reference(*inputs, dtype=torch.float32),
+            "PyTorch BF16": lambda *inputs: reference(*inputs, dtype=torch.bfloat16),
+        },
+        initializers=INITIALIZERS,
     )
-    args = parser.parse_args()
-    if args.torch_compile and args.forward_only:
-        parser.error("--torch-compile currently requires the autograd plan")
-    sizes = {
-        "h": args.heads,
-        "l": args.length,
-        "g": args.groups,
-        "r": args.right,
-        "dqk": args.dqk,
-        "dv": args.dv,
-        "db": args.db,
-    }
-    spec = affine_attention_spec()
-    operator = FoldOperator(spec, FUNCTIONS)
-    if args.load_plan:
-        plan = operator.load_plan(args.load_plan, sizes)
-    elif args.fixed_plan:
-        plan = operator.plan(
-            sizes,
-            path="partial",
-            tiles={
-                "h": 1,
-                "l": min(8, sizes["l"]),
-                "g": sizes["g"],
-                "r": min(args.fold_tile, sizes["r"]),
-            },
-            partitions=args.partitions,
-            checkpointed_backward=not args.full_recompute_backward,
-        )
-    else:
-        plan = operator.tune(
-            sizes,
-            args.candidates,
-            args.timeout,
-            hardware=rtx5080,
-            max_tile=args.max_tile,
-            max_partition_count=args.partitions,
-            quiet=args.quiet_tuning,
-            backward=not args.forward_only,
-        )
-    if args.save_plan:
-        operator.save_plan(plan, args.save_plan, metadata={"hardware": "rtx5080"})
-    function = operator.build(
-        plan,
-        backward=not args.forward_only,
-        torch_compile=args.torch_compile,
-    )
-    torch.manual_seed(args.seed)
-    inputs = make_inputs(sizes)
-    print_plan(plan)
-    reference_dtypes = {
-        "PyTorch BF16": torch.bfloat16,
-        "PyTorch FP32": torch.float32,
-    }
-    if args.accuracy_matrix:
-        reference_dtypes["PyTorch FP64"] = torch.float64
-    validate_precision_matrix(
-        function,
-        reference,
-        inputs,
-        input_names=("query", "key", "value", "bias_query", "bias_key"),
-        reference_dtypes=reference_dtypes,
-        backward=not args.forward_only,
-        pairwise=args.accuracy_matrix,
-    )
-    if args.benchmark_seconds > 0 or args.benchmark_memory:
-        cutile_label = "CuTile torch.compile" if args.torch_compile else "CuTile eager"
-        implementations = {
-            cutile_label: function,
-            "PyTorch FP32": lambda *current: reference(
-                *current, dtype=torch.float32,
-            ),
-            "PyTorch BF16": lambda *current: reference(
-                *current, dtype=torch.bfloat16,
-            ),
-        }
-        if args.benchmark_seconds > 0:
-            benchmark_implementations(
-                "affine LWS attention",
-                inputs,
-                implementations,
-                min_run_time=args.benchmark_seconds,
-                backward=not args.forward_only,
-                output_grad_dtype=torch.bfloat16,
-            )
-        if args.benchmark_memory:
-            benchmark_memory(
-                "affine LWS attention",
-                inputs,
-                implementations,
-                backward=not args.forward_only,
-                output_grad_dtype=torch.bfloat16,
-            )
 
 
 if __name__ == "__main__":
