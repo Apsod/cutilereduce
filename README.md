@@ -50,6 +50,7 @@ Not yet landed:
 - first-class scan and scan-fold APIs beyond the internal scan used to combine
   ordered partial folds;
 - broader API polish and packaging around the prototype examples.
+- support for multi-device distributed folds.
 
 ## Function Interface
 
