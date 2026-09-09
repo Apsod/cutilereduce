@@ -1,6 +1,7 @@
 """Shared CLI options for the runnable examples."""
 
 import argparse
+from cutilereduce.util.spec import SPECMAP
 
 
 def positive_int(value):
@@ -46,6 +47,7 @@ class ExampleParser(argparse.ArgumentParser):
         self.add_argument("--benchmark-memory", action="store_true")
         self.add_argument("--load-plan", metavar="PATH")
         self.add_argument("--save-plan", metavar="PATH")
+        self.add_argument("--hardware", choices=list(spec.SPECMAP))
 
     def parse_args(self, args=None, namespace=None):
         parsed = super().parse_args(args, namespace)
@@ -55,6 +57,8 @@ class ExampleParser(argparse.ArgumentParser):
 
     def sizes(self, args):
         return {name: getattr(args, name) for name in self.axis_names}
+
+
 
 
 def make_inputs(spec, sizes, *, device="cuda", initializers=None):
@@ -144,18 +148,19 @@ def main(name, spec, functions, defaults, *, reference, references,
                            benchmark_seconds=benchmark_seconds)
     args = parser.parse_args(argv)
     sizes = parser.sizes(args)
+    hardware = SPECMAP[args.hardware]
     torch.manual_seed(args.seed)
     operator = FoldOperator(spec, functions)
     plan = (
         operator.load_plan(args.load_plan, sizes)
         if args.load_plan
         else operator.tune(
-            sizes, args.candidates, args.timeout, hardware=rtx5080,
+            sizes, args.candidates, args.timeout, hardware=hardware,
             quiet=args.quiet_tuning, backward=not args.forward_only,
         )
     )
     if args.save_plan:
-        operator.save_plan(plan, args.save_plan, metadata={"hardware": "rtx5080"})
+        operator.save_plan(plan, args.save_plan, metadata={"hardware": args.hardware})
     print_plan(plan)
     function = operator.build(
         plan, backward=not args.forward_only, torch_compile=args.torch_compile,
