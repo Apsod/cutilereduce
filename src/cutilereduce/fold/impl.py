@@ -109,7 +109,7 @@ def mk_fold_forward(
         ):
     compiled = compile_fold_forward(plan, functions)
     input_ids = tuple(buffer.id for buffer in plan.spec.input)
-    output_ids = tuple(buffer.id for buffer in plan.spec.output)
+    output_ids = tuple(buffer.id for buffer in plan.spec.semantic)
 
     def forward(*inputs):
         if len(inputs) != len(input_ids):
@@ -209,7 +209,7 @@ def _make_fold_custom_ops(plan, functions):
     forward_stages = compile_fold_forward(plan, functions)
     backward_stages = compile_fold_backward(plan, functions)
     input_ids = tuple(buffer.id for buffer in plan.spec.input)
-    output_ids = tuple(buffer.id for buffer in plan.spec.output)
+    output_ids = tuple(buffer.id for buffer in plan.spec.semantic)
     output_grad_ids = tuple(
         buffer.id
         for buffer in backward_stages[0].read_buffers
@@ -322,7 +322,7 @@ def mk_fold_autograd(
         ):
     del device
     input_ids = tuple(buffer.id for buffer in plan.spec.input)
-    output_ids = tuple(buffer.id for buffer in plan.spec.output)
+    output_ids = tuple(buffer.id for buffer in plan.spec.semantic)
     forward_op, backward_op = _make_fold_custom_ops(plan, functions)
 
     def apply(*inputs):

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, ClassVar
 
 import numpy as np
 import polars as pl
@@ -90,7 +90,11 @@ class _PreparedMetric:
             ):
         if isinstance(expr, sympy.Expr):
             prepared = _substitute_symbols(_replace_functions(expr, functions), symbols)
-            args = tuple(sorted(prepared.free_symbols, key=str))
+            args = tuple(
+                symbol
+                for symbol in sorted(prepared.free_symbols, key=str)
+                if isinstance(symbol, Symbol)
+            )
             return cls(
                 name=name,
                 expr=prepared,
@@ -153,7 +157,7 @@ def chunked_evaluate_stage(
             _metric_series(metric.name, metric.evaluate(chunk), chunk.height)
             for metric in metrics
         ])
-        yield pl.concat((chunk, metric_frame), how="horizontal")
+        yield pl.concat((chunk, metric_frame), how="horizontal_extend")
 
 
 def evaluate_stage(
@@ -180,6 +184,8 @@ def evaluate_stage(
 
 @dataclass(frozen=True)
 class Sweep:
+    default: ClassVar[Sweep]
+
     attributes: tuple[str, ...]
     filters: tuple[pl.Expr, ...]
     key: str | pl.Expr

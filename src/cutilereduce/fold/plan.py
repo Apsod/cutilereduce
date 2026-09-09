@@ -32,13 +32,13 @@ def _axes(spec: str | Axes) -> Axes:
 class FoldSpec:
     input: BufferBundle
     execution: BufferBundle
-    output: BufferBundle
-    map_intermediate: BufferBundle
+    semantic: BufferBundle
+    map_fold_intermediate: BufferBundle
     map_finalize_intermediate: BufferBundle
     batch: Axes
-    fold: Axis
+    fold: LogicalAxis
     map_fold_work: WorkModel = WorkModel()
-    backward_work: WorkModel | None = None
+    map_finalize_work: WorkModel | None = None
     combine_work: WorkModel = WorkModel()
     algebra: AlgebraKind = AlgebraKind.commutative
 
@@ -52,8 +52,8 @@ class FoldSpec:
         for bundle in (
             self.input,
             self.execution,
-            self.output,
-            self.map_intermediate,
+            self.semantic,
+            self.map_fold_intermediate,
             self.map_finalize_intermediate,
         ):
             for buffer in bundle:
@@ -61,11 +61,35 @@ class FoldSpec:
         return ret
 
     def check(self) -> None:
+        if not isinstance(self.fold, LogicalAxis):
+            raise TypeError(f"fold axis must be logical: {self.fold!r}")
+        invalid_batch = tuple(axis for axis in self.batch if not isinstance(axis, LogicalAxis))
+        if invalid_batch:
+            raise TypeError(f"batch axes must be logical: {invalid_batch!r}")
+        invalid_buffers = {
+            buffer.id: tuple(
+                axis for axis in buffer.axes
+                if not isinstance(axis, LogicalAxis)
+            )
+            for bundle in (
+                self.input,
+                self.execution,
+                self.semantic,
+                self.map_fold_intermediate,
+                self.map_finalize_intermediate,
+            )
+            for buffer in bundle
+        }
+        invalid_buffers = {
+            id: axes for id, axes in invalid_buffers.items() if axes
+        }
+        if invalid_buffers:
+            raise TypeError(f"buffer axes must be logical: {invalid_buffers!r}")
         if self.fold in self.batch:
             raise ValueError(f"fold axis is also a batch axis: {self.fold}")
-        invalid = tuple(b.id for b in self.output if self.fold in b.axes)
+        invalid = tuple(b.id for b in self.semantic if self.fold in b.axes)
         if invalid:
-            raise ValueError(f"fold outputs must not depend on fold axis: {invalid}")
+            raise ValueError(f"semantic buffers must not depend on fold axis: {invalid}")
 
     def axis_id(self, key: str | Axis | AxisId) -> AxisId:
         return resolve_axis_id(self, key)
@@ -128,13 +152,13 @@ def make_fold_spec(
         *,
         input: Mapping[str, BufferSpec],
         execution: Mapping[str, BufferSpec],
-        output: Mapping[str, BufferSpec],
-        map_intermediate: Mapping[str, BufferSpec] | None = None,
+        semantic: Mapping[str, BufferSpec],
+        map_fold_intermediate: Mapping[str, BufferSpec] | None = None,
         map_finalize_intermediate: Mapping[str, BufferSpec] | None = None,
         batch: str | Axes,
-        fold: str | Axis,
+        fold: str | LogicalAxis,
         map_fold_work: WorkModel = WorkModel(),
-        backward_work: WorkModel | None = None,
+        map_finalize_work: WorkModel | None = None,
         combine_work: WorkModel = WorkModel(),
         algebra: AlgebraKind = AlgebraKind.commutative,
         ) -> FoldSpec:
@@ -143,9 +167,9 @@ def make_fold_spec(
     spec = FoldSpec(
         input=bundle_spec(Input, **dict(input)),
         execution=bundle_spec(Internal("execution"), **dict(execution)),
-        output=bundle_spec(Output, **dict(output)),
-        map_intermediate=bundle_spec(
-            Internal("map_intermediate"), **dict(map_intermediate or {})
+        semantic=bundle_spec(Output, **dict(semantic)),
+        map_fold_intermediate=bundle_spec(
+            Internal("map_fold_intermediate"), **dict(map_fold_intermediate or {})
         ),
         map_finalize_intermediate=bundle_spec(
             Internal("map_finalize_intermediate"),
@@ -154,7 +178,7 @@ def make_fold_spec(
         batch=batch_axes,
         fold=fold_axis,
         map_fold_work=map_fold_work,
-        backward_work=backward_work,
+        map_finalize_work=map_finalize_work,
         combine_work=combine_work,
         algebra=algebra,
     )

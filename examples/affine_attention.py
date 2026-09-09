@@ -4,12 +4,13 @@ import math
 import cuda.tile as ct
 import torch
 
-from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
     AlgebraKind,
     fold_functions,
     make_fold_spec,
+    matmul,
+    workmodel,
 )
 
 
@@ -32,14 +33,14 @@ def affine_attention_spec():
             "e": buffer_spec("h l g", ct.float32, default=0),
             "u": buffer_spec("h l g dv", ct.float32, default=0),
         },
-        output={
+        semantic={
             "alpha": buffer_spec("h l g", ct.float32, default=0),
             "z": buffer_spec("h l g", ct.float32, default=float("-inf")),
             "mu": buffer_spec("h l g dv", ct.float32, default=0),
         },
         # Logical tile-local values used by the map/map_finalize callbacks. These
         # are heuristic residency declarations, not materialized buffers.
-        map_intermediate={
+        map_fold_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
             "alpha": buffer_spec("h l g r", ct.float32),
         },
@@ -55,19 +56,19 @@ def affine_attention_spec():
         },
         batch="h l g",
         fold="r",
-        map_fold_work=WorkModel.make(
-            MatMulWork.make(B="h", M="l g", N="r", K="dqk"),
-            MatMulWork.make(B="h", M="l g", N="r", K="db"),
-            MatMulWork.make(B="h", M="l g", N="dv", K="r"),
+        map_fold_work=workmodel(
+            matmul(B="h", M="l g", N="r", K="dqk"),
+            matmul(B="h", M="l g", N="r", K="db"),
+            matmul(B="h", M="l g", N="dv", K="r"),
         ),
-        backward_work=WorkModel.make(
-            MatMulWork.make(B="h", M="l g", N="r", K="dqk"),
-            MatMulWork.make(B="h", M="l g", N="r", K="db"),
-            MatMulWork.make(B="h", M="l g", N="dqk", K="r"),
-            MatMulWork.make(B="h", M="r", N="dqk", K="l g"),
-            MatMulWork.make(B="h", M="r", N="dv", K="l g"),
-            MatMulWork.make(B="h", M="l g", N="db", K="r"),
-            MatMulWork.make(B="h", M="r", N="db", K="l g"),
+        map_finalize_work=workmodel(
+            matmul(B="h", M="l g", N="r", K="dqk"),
+            matmul(B="h", M="l g", N="r", K="db"),
+            matmul(B="h", M="l g", N="dqk", K="r"),
+            matmul(B="h", M="r", N="dqk", K="l g"),
+            matmul(B="h", M="r", N="dv", K="l g"),
+            matmul(B="h", M="l g", N="db", K="r"),
+            matmul(B="h", M="r", N="db", K="l g"),
         ),
         algebra=AlgebraKind.general,
     )

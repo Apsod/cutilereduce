@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import cuda.tile as ct
 
-from cutilereduce.core.axis import Axis, axis_id
+from cutilereduce.core.axis import PartitionAxis, axis_id
 from cutilereduce.core.buffer import BufferBundle, BufferRole, Input, Internal
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
@@ -15,15 +16,18 @@ from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_
 from cutilereduce.stages.codegen import StageFunctions, make_buffer_helper, make_buffer_project, make_buffer_split, stage_grid_info
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
+if TYPE_CHECKING:
+    from cutilereduce.fold.plan import FoldSpec
+
 
 @dataclass(frozen=True)
 class RecomputeMapFinalizeGradWrite:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
     global_buffers: BufferBundle
     output_grad: BufferBundle
     grad_storage: BufferBundle | None = None
-    partition_axis: Axis | None = None
+    partition_axis: PartitionAxis | None = None
 
     def build(self) -> BuiltStage:
         grad_storage = self.grad_storage or self.spec.grad_storage
@@ -69,7 +73,7 @@ class RecomputeMapFinalizeGradWrite:
                 "recompute_map_finalize_grad_write",
                 domain,
                 buffers,
-                self.spec.backward_work or self.spec.map_fold_work,
+                self.spec.map_finalize_work or self.spec.map_fold_work,
                 write_model=atomic_add_write,
             ),
             partition_axis=self.partition_axis,
@@ -79,7 +83,7 @@ class RecomputeMapFinalizeGradWrite:
 
 @dataclass(frozen=True)
 class RecomputeFoldMapFinalizeGradWrite:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
     global_buffers: BufferBundle
     output_grad: BufferBundle
@@ -115,7 +119,7 @@ class RecomputeFoldMapFinalizeGradWrite:
                 "recompute_fold_map_finalize_grad_write",
                 domain,
                 buffers,
-                self.spec.backward_work or self.spec.map_fold_work,
+                self.spec.map_finalize_work or self.spec.map_fold_work,
                 write_model=atomic_add_write,
             ),
             compiler=compile_recompute_fold_map_finalize_grad_write_stage,
@@ -124,12 +128,12 @@ class RecomputeFoldMapFinalizeGradWrite:
 
 @dataclass(frozen=True)
 class RecomputePrefixFoldMapFinalizeGradWrite:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
     global_buffers: BufferBundle
     output_grad: BufferBundle
     prefix: BufferBundle
-    prefix_axis: Axis
+    prefix_axis: PartitionAxis
     grad_storage: BufferBundle | None = None
 
     def build(self) -> BuiltStage:
@@ -171,7 +175,7 @@ class RecomputePrefixFoldMapFinalizeGradWrite:
                 "recompute_prefix_fold_map_finalize_grad_write",
                 domain,
                 buffers,
-                self.spec.backward_work or self.spec.map_fold_work,
+                self.spec.map_finalize_work or self.spec.map_fold_work,
                 write_model=atomic_add_write,
             ),
             checkpoints=self.prefix,

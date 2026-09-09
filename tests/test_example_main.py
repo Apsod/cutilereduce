@@ -14,7 +14,11 @@ class ExampleMainTests(unittest.TestCase):
                 'cutilereduce.util.runner.print_plan'
             ), patch('examples.cli.run_example') as run:
                 operator = cls.return_value
-                argv = ['--forward-only', '--save-plan', 'saved.json']
+                argv = [
+                    '--forward-only',
+                    '--hardware', 'rtx5080',
+                    '--save-plan', 'saved.json',
+                ]
                 if load:
                     argv += ['--load-plan', 'existing.json']
                 main('test', spec, None, sizes, reference=None, references={}, argv=argv)

@@ -9,7 +9,7 @@ often be derived from local gradient rules for those monoids.
 The current implementation focuses on a practical subset of that model:
 forward and backward kernels for fold-style reductions. A user supplies:
 
-- a `FoldSpec` describing the logical axes, input/output and carrier buffers,
+- a `FoldSpec` describing the logical axes, input, semantic, and carrier buffers,
   fold dimension, algebra, and work models;
 - a forward pass specification:
   - a tile-local `map_fold` function that maps input tiles to one or more
@@ -56,8 +56,8 @@ Not yet landed:
 
 Fold callbacks are passed with `fold_functions(...)`. In the type sketches
 below, `TID` is the CUDA Tile loop index info, `Input` is the tuple of input
-tiles, `State` is the tuple of execution/carrier tiles, `Output` is the tuple of
-semantic output tiles, `OutputGrad` is the tuple of output-gradient tiles,
+tiles, `State` is the tuple of execution/carrier tiles, `Semantic` is the tuple of
+semantic tiles, `OutputGrad` is the tuple of semantic-gradient tiles,
 `Embed` is the tuple returned by `embed`, and `InputGrad` is the tuple of
 input-gradient tiles.
 
@@ -67,8 +67,8 @@ Forward callbacks:
 map_fold: (TID, *Input) -> State
 combine: (*State, *State) -> State
 map_fold_combine: (TID, *Input, State) -> State  # optional fused form
-to_semantic: (*State) -> Output                    # optional
-to_output: (*Output) -> Tensor | tuple[Tensor, ...] # optional host wrapper
+to_semantic: (*State) -> Semantic                    # optional
+to_output: (*Semantic) -> Tensor | tuple[Tensor, ...] # optional host wrapper
 ```
 
 When `map_fold_combine` is omitted, a map-fold stage computes
@@ -79,7 +79,7 @@ lets an example fuse tile-local mapping with accumulator update, as in
 Backward callbacks:
 
 ```python
-embed: (*Output, *OutputGrad) -> Embed
+embed: (*Semantic, *OutputGrad) -> Embed
 
 # Commutative folds:
 map_finalize: (TID, *Input, *InputGrad, *Embed) -> InputGrad

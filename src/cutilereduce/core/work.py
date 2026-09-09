@@ -89,3 +89,11 @@ class WorkModel:
 
     def effective_tile_work(self, domain: StageDomain):
         return sum(item.tile_work(domain) / item.tile_efficiency(domain) for item in self.items)
+
+
+def matmul(*, M: str | Axes, N: str | Axes, K: str | Axes, B: str | Axes = "") -> MatMulWork:
+    return MatMulWork.make(B=B, M=M, N=N, K=K)
+
+
+def workmodel(*items: WorkItem) -> WorkModel:
+    return WorkModel.make(*items)

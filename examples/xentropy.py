@@ -4,11 +4,12 @@ import math
 import cuda.tile as ct
 import torch
 
-from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
     fold_functions,
     make_fold_spec,
+    matmul,
+    workmodel,
 )
 
 
@@ -28,25 +29,23 @@ def xentropy_spec():
             "e": buffer_spec("b", ct.float32, default=0),
             "u": buffer_spec("b", ct.float32, default=0),
         },
-        output={
+        semantic={
             "z": buffer_spec("b", ct.float32, default=float("-inf")),
             "l": buffer_spec("b", ct.float32, default=0),
         },
-        map_intermediate={
+        map_fold_intermediate={
             "logits": buffer_spec("b v", ct.float32),
         },
         map_finalize_intermediate={
             "logits": buffer_spec("b v", ct.float32),
-            "scale": buffer_spec("b v", ct.float32),
-            "g_logits": buffer_spec("b v", ct.bfloat16),
         },
         batch="b",
         fold="v",
-        map_fold_work=WorkModel.make(MatMulWork.make(M="b", N="v", K="d")),
-        backward_work=WorkModel.make(
-            MatMulWork.make(M="b", N="v", K="d"),
-            MatMulWork.make(M="b", N="d", K="v"),
-            MatMulWork.make(M="v", N="d", K="b"),
+        map_fold_work=workmodel(matmul(M="b", N="v", K="d")),
+        map_finalize_work=workmodel(
+            matmul(M="b", N="v", K="d"),
+            matmul(M="b", N="d", K="v"),
+            matmul(M="v", N="d", K="b"),
         ),
     )
 

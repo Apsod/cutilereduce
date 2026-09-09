@@ -13,14 +13,14 @@ from cutilereduce.stages import (
 
 
 def output_grad_buffers(spec: FoldSpec):
-    return spec.output.as_output_grad(dtype=ct.float32)
+    return spec.semantic.as_output_grad(dtype=ct.float32)
 
 
 def full_recompute_backward_stage(spec, schedule, *, global_buffers=None, output_grad=None):
     return RecomputeFoldMapFinalizeGradWrite(
         spec,
         schedule,
-        global_buffers=global_buffers or spec.output,
+        global_buffers=global_buffers or spec.semantic,
         output_grad=output_grad or output_grad_buffers(spec),
     ).build()
 
@@ -29,7 +29,7 @@ def prefix_recompute_backward_stage(spec, schedule, *, checkpoints, partition_ax
     return RecomputePrefixFoldMapFinalizeGradWrite(
         spec,
         schedule,
-        global_buffers=global_buffers or spec.output,
+        global_buffers=global_buffers or spec.semantic,
         output_grad=output_grad or output_grad_buffers(spec),
         prefix=checkpoints,
         prefix_axis=partition_axis,
@@ -58,7 +58,7 @@ def partial_fold_plan(
         scan_schedule,
         scan_axis=partial.partition_axis,
         inputs=partial.partials,
-        outputs=spec.output,
+        outputs=spec.semantic,
         exclusive=True,
     )
     backward = ()

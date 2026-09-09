@@ -54,6 +54,7 @@ from .plan import (
     StageSchedule,
     make_fold_spec,
 )
+from cutilereduce.core import matmul, workmodel
 
 __all__ = [
     "AlgebraKind",
@@ -86,6 +87,7 @@ __all__ = [
     "generate_commutative_fold_configs",
     "general_fold_plan_from_config",
     "make_fold_spec",
+    "matmul",
     "load_fold_plan",
     "mk_fold_autograd",
     "mk_fold_forward",
@@ -100,4 +102,5 @@ __all__ = [
     "sweep_general_backward",
     "tune_commutative_fold_plan",
     "tune_general_fold_plan",
+    "workmodel",
 ]

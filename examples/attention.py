@@ -4,11 +4,12 @@ import math
 import cuda.tile as ct
 import torch
 
-from cutilereduce.core import MatMulWork, WorkModel
 from cutilereduce.core.buffer import buffer_spec
 from cutilereduce.fold import (
     fold_functions,
     make_fold_spec,
+    matmul,
+    workmodel,
 )
 
 
@@ -28,30 +29,28 @@ def attention_spec():
             "e": buffer_spec("h l g", ct.float32, default=0),
             "u": buffer_spec("h l g dv", ct.float32, default=0),
         },
-        output={
+        semantic={
             "z": buffer_spec("h l g", ct.float32, default=float("-inf")),
             "mu": buffer_spec("h l g dv", ct.float32, default=0),
         },
-        map_intermediate={
+        map_fold_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
         },
         map_finalize_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
-            "scale": buffer_spec("h l g r", ct.float32),
-            "g_logits": buffer_spec("h l g r", ct.bfloat16),
         },
         batch="h l g",
         fold="r",
-        map_fold_work=WorkModel.make(
-            MatMulWork.make(B="h", M="l g", N="r", K="dqk"),
-            MatMulWork.make(B="h", M="l g", N="dv", K="r"),
+        map_fold_work=workmodel(
+            matmul(B="h", M="l g", N="r", K="dqk"),
+            matmul(B="h", M="l g", N="dv", K="r"),
         ),
-        backward_work=WorkModel.make(
-            MatMulWork.make(B="h", M="l g", N="r", K="dqk"),
-            MatMulWork.make(B="h", M="l g", N="r", K="dv"),
-            MatMulWork.make(B="h", M="r", N="dv", K="l g"),
-            MatMulWork.make(B="h", M="l g", N="dqk", K="r"),
-            MatMulWork.make(B="h", M="r", N="dqk", K="l g"),
+        map_finalize_work=workmodel(
+            matmul(B="h", M="l g", N="r", K="dqk"),
+            matmul(B="h", M="l g", N="r", K="dv"),
+            matmul(B="h", M="r", N="dv", K="l g"),
+            matmul(B="h", M="l g", N="dqk", K="r"),
+            matmul(B="h", M="r", N="dqk", K="l g"),
         ),
     )
 

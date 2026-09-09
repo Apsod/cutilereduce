@@ -8,12 +8,11 @@ from types import MappingProxyType
 import polars as pl
 import sympy
 
-from cutilereduce.core.axis import Axis, AxisId, Axes, axis_id
+from cutilereduce.core.axis import Axis, AxisId, Axes, LogicalAxis, axis_id
 from cutilereduce.core.sweep import Sweep
 from cutilereduce.fold.plan import FoldSpec, StageSchedule
 from cutilereduce.fold.commutative.plan import commutative_backward_stage, full_fold_plan, partial_fold_plan
 from cutilereduce.stages import Fold, MapFold, MapFoldPartial, normalize_axis_mapping
-from cutilereduce.util.spec import l4
 
 
 @dataclass(frozen=True)
@@ -50,13 +49,22 @@ def _normalize_sizes(spec: FoldSpec, sizes: Mapping[str | Axis | AxisId, int]) -
     return normalize_axis_mapping(spec, sizes)
 
 
-def _tile_axes(spec: FoldSpec) -> tuple[Axis, ...]:
-    return (*spec.batch, spec.fold)
+def _logical_axis(axis: Axis) -> LogicalAxis:
+    if not isinstance(axis, LogicalAxis):
+        raise TypeError(f"expected logical axis: {axis!r}")
+    return axis
 
 
-def _backward_loop_axes(spec: FoldSpec) -> tuple[Axis, ...]:
+def _tile_axes(spec: FoldSpec) -> tuple[LogicalAxis, ...]:
+    return tuple(_logical_axis(axis) for axis in (*spec.batch, spec.fold))
+
+
+def _backward_loop_axes(spec: FoldSpec) -> tuple[LogicalAxis, ...]:
     contribution_axes = Axes(values=_tile_axes(spec))
-    return tuple(spec.grad_storage.contention_axes(contribution_axes))
+    return tuple(
+        _logical_axis(axis)
+        for axis in spec.grad_storage.contention_axes(contribution_axes)
+    )
 
 
 def _make_symbols(spec: FoldSpec, partition_axis: Axis | None = None) -> FoldSweepSymbols:
@@ -265,7 +273,7 @@ def _evaluate_single_path(
         symbols: FoldSweepSymbols,
         configs: pl.DataFrame,
         *,
-        hardware: Mapping = l4,
+        hardware: Mapping,
         sweep: Sweep = Sweep.default,
         ):
     stage = MapFold(spec, _full_schedule(spec, sizes, symbols)).build()
@@ -288,7 +296,7 @@ def _evaluate_partial_path(
         symbols: FoldSweepSymbols,
         configs: pl.DataFrame,
         *,
-        hardware: Mapping = l4,
+        hardware: Mapping,
         max_tile: int,
         max_partition_count: int,
         sweep: Sweep = Sweep.default,
@@ -339,7 +347,7 @@ def sweep_commutative_fold(
         spec: FoldSpec,
         *,
         sizes: Mapping[str | Axis | AxisId, int],
-        hardware: Mapping = l4,
+        hardware: Mapping,
         max_tile: int = 256,
         max_fold_programs: int | None = None,
         max_partition_count: int | None = None,
@@ -385,7 +393,7 @@ def sweep_commutative_backward(
         spec: FoldSpec,
         *,
         sizes: Mapping[str | Axis | AxisId, int],
-        hardware: Mapping = l4,
+        hardware: Mapping,
         max_tile: int = 256,
         max_group_count: int = 4,
         sweep: Sweep = Sweep.default,

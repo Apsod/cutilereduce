@@ -13,6 +13,7 @@ class WorkflowTests(unittest.TestCase):
         sizes = dict(b=3, v=7, d=4)
         args = ExampleParser(spec, sizes).parse_args([
             "--validate", "--benchmark-memory", "--torch-compile",
+            "--hardware", "rtx5080",
         ])
         def function(*inputs):
             return reference(*inputs)
@@ -46,7 +47,9 @@ class WorkflowTests(unittest.TestCase):
     def test_disabled_workflow_does_not_allocate(self):
         spec = xentropy_spec()
         sizes = dict(b=3, v=7, d=4)
-        args = ExampleParser(spec, sizes).parse_args(['--benchmark-seconds', '0'])
+        args = ExampleParser(spec, sizes).parse_args([
+            '--benchmark-seconds', '0', '--hardware', 'rtx5080',
+        ])
         with patch('examples.cli.make_inputs') as make:
             run_example('test', spec, sizes, reference, args=args,
                         reference=reference, references={})

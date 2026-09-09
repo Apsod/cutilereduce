@@ -38,7 +38,7 @@ from .stage_domain import (
 from .sweep import StageEstimate, Sweep, chunked_evaluate_stage, evaluate_stage
 from .typestuff import DType, to_torch_dtype
 from .variables import ATOMIC_ADD, atomic_add_write, normal_write
-from .work import MatMulWork, WorkModel
+from .work import MatMulWork, WorkModel, matmul, workmodel
 
 __all__ = [
     "Axis",
@@ -88,6 +88,8 @@ __all__ = [
     "bundle_spec",
     "chunked_evaluate_stage",
     "evaluate_stage",
+    "matmul",
     "normal_write",
     "to_torch_dtype",
+    "workmodel",
 ]

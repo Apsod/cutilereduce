@@ -56,10 +56,12 @@ class InputTests(unittest.TestCase):
     def test_generated_cli_and_aliases(self):
         defaults = dict(h=2, l=8, g=2, r=8, dqk=4, dv=4)
         parser = ExampleParser(attention_spec(), defaults, aliases={"h": "heads"})
-        args = parser.parse_args(["--heads", "3", "--r", "12"])
+        args = parser.parse_args([
+            "--heads", "3", "--r", "12", "--hardware", "rtx5080",
+        ])
         self.assertEqual(parser.sizes(args), defaults | {"h": 3, "r": 12})
         for argv in (["--r", "0"], ["--candidates", "-1"],
-                     ["--benchmark-seconds", "nan"]):
+                     ["--benchmark-seconds", "nan"], []):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
                 parser.parse_args(argv)
 

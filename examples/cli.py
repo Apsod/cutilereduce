@@ -47,7 +47,7 @@ class ExampleParser(argparse.ArgumentParser):
         self.add_argument("--benchmark-memory", action="store_true")
         self.add_argument("--load-plan", metavar="PATH")
         self.add_argument("--save-plan", metavar="PATH")
-        self.add_argument("--hardware", choices=list(spec.SPECMAP))
+        self.add_argument("--hardware", choices=list(SPECMAP), required=True)
 
     def parse_args(self, args=None, namespace=None):
         parsed = super().parse_args(args, namespace)
@@ -142,7 +142,6 @@ def main(name, spec, functions, defaults, *, reference, references,
     import torch
     from cutilereduce.fold import FoldOperator
     from cutilereduce.util.runner import print_plan
-    from cutilereduce.util.spec import rtx5080
 
     parser = ExampleParser(spec, defaults, aliases=aliases,
                            benchmark_seconds=benchmark_seconds)

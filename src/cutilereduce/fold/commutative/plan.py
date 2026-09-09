@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import cuda.tile as ct
 
-from cutilereduce.core.axis import Axis
+from cutilereduce.core.axis import PartitionAxis
 from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.fold.plan import FoldPlan, FoldSpec, StageSchedule
 from cutilereduce.stages import Fold, MapFold, MapFoldPartial, RecomputeMapFinalizeGradWrite, partial_buffers
@@ -13,7 +13,7 @@ PartialFold = MapFoldPartial
 
 def output_grad_buffers(spec: FoldSpec, tag: str = "output_grad") -> BufferBundle:
     del tag
-    return spec.output.as_output_grad(dtype=ct.float32)
+    return spec.semantic.as_output_grad(dtype=ct.float32)
 
 
 def commutative_backward_stage(
@@ -22,12 +22,12 @@ def commutative_backward_stage(
         *,
         global_buffers: BufferBundle | None = None,
         output_grad: BufferBundle | None = None,
-        partition_axis: Axis | None = None,
+        partition_axis: PartitionAxis | None = None,
         ):
     return RecomputeMapFinalizeGradWrite(
         spec=spec,
         schedule=schedule,
-        global_buffers=global_buffers or spec.output,
+        global_buffers=global_buffers or spec.semantic,
         output_grad=output_grad or output_grad_buffers(spec),
         partition_axis=partition_axis,
     ).build()

@@ -12,7 +12,6 @@ from cutilereduce.core.axis import Axis, AxisId, axis_id
 from cutilereduce.core.sweep import Sweep
 from cutilereduce.fold.plan import FoldSpec, StageSchedule
 from cutilereduce.stages import MapFold, MapFoldPartial, Scan, normalize_axis_mapping
-from cutilereduce.util.spec import l4
 
 from .plan import (
     full_fold_plan,
@@ -140,7 +139,7 @@ def sweep_general_fold(
         spec: FoldSpec,
         *,
         sizes: Mapping[str | Axis | AxisId, int],
-        hardware: Mapping = l4,
+        hardware: Mapping,
         max_tile: int = 128,
         max_partition_count: int = 4,
         sweep: Sweep = Sweep.default,
@@ -195,7 +194,7 @@ def sweep_general_fold(
         _scan_schedule(spec, sizes, symbols),
         scan_axis=spec.fold.partition_axis,
         inputs=partial.partials,
-        outputs=spec.output,
+        outputs=spec.semantic,
     ).build()
     # Scan reuses the materialized partial allocation; it does not make the
     # partition-count storage decision, so do not prune it by that ratio again.
@@ -309,7 +308,7 @@ def sweep_general_backward(
         *,
         sizes,
         forward_plan,
-        hardware=l4,
+        hardware,
         max_tile=128,
         sweep=Sweep.default,
         ):

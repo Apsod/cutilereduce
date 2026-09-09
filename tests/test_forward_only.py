@@ -40,7 +40,9 @@ class ForwardOnlyTests(unittest.TestCase):
         spec = xentropy_spec()
         sizes = dict(b=2, v=4, d=2)
         parser = ExampleParser(spec, sizes)
-        args = parser.parse_args(['--forward-only', '--validate'])
+        args = parser.parse_args([
+            '--forward-only', '--validate', '--hardware', 'rtx5080',
+        ])
         with patch('examples.cli.make_inputs', return_value=()) as inputs, patch(
             'examples.cli.validate'
         ) as validate, patch('examples.cli.benchmark_full') as benchmark:
@@ -50,4 +52,6 @@ class ForwardOnlyTests(unittest.TestCase):
         self.assertFalse(validate.call_args.kwargs['backward'])
         self.assertFalse(benchmark.call_args.kwargs['backward'])
         with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit):
-            parser.parse_args(['--forward-only', '--torch-compile'])
+            parser.parse_args([
+                '--forward-only', '--torch-compile', '--hardware', 'rtx5080',
+            ])

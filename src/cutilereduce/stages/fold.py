@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import cuda.tile as ct
 
-from cutilereduce.core.axis import Axis
+from cutilereduce.core.axis import PartitionAxis
 from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
@@ -13,12 +14,15 @@ from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_
 from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, stage_grid_info
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
+if TYPE_CHECKING:
+    from cutilereduce.fold.plan import FoldSpec
+
 
 @dataclass(frozen=True)
 class Fold:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
-    partition_axis: Axis
+    partition_axis: PartitionAxis
     partials: BufferBundle
     combine: object | None = None
     initial: object | None = None
@@ -46,7 +50,7 @@ class Fold:
         )
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.partials, BufferStorage.Materialized),
-            BufferUse.write(self.spec.output),
+            BufferUse.write(self.spec.semantic),
         ))
         return BuiltStage(
             stage=KernelStage("fold", domain, buffers, self.spec.combine_work),

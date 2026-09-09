@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import cuda.tile as ct
 
-from cutilereduce.core.axis import Axis, Axes
+from cutilereduce.core.axis import Axis, Axes, PartitionAxis
 from cutilereduce.core.buffer import BufferBundle, Internal
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
@@ -19,6 +20,9 @@ from cutilereduce.core.stage_domain import (
 from cutilereduce.core.utilities import ceil_div
 from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, make_buffer_split, stage_grid_info
+
+if TYPE_CHECKING:
+    from cutilereduce.fold.plan import FoldSpec
 
 
 def stage_axis(schedule: StageSchedule, axis: Axis, role: AxisRole) -> StageAxis:
@@ -74,7 +78,7 @@ def partial_buffers(spec, partition_axis: Axis, partial_tag: str = "partial") ->
 
 @dataclass(frozen=True)
 class MapFold:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
     map_fold: object | None = None
     combine: object | None = None
@@ -98,8 +102,8 @@ class MapFold:
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.map_intermediate),
-            BufferUse.write(self.spec.output),
+            BufferUse.resident(self.spec.map_fold_intermediate),
+            BufferUse.write(self.spec.semantic),
         ))
         return BuiltStage(
             stage=KernelStage("map_fold", domain, buffers, self.spec.map_fold_work),
@@ -116,9 +120,9 @@ class MapFold:
 
 @dataclass(frozen=True)
 class MapFoldPartial:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
-    partition_axis: Axis
+    partition_axis: PartitionAxis
     partials: BufferBundle
     map_fold: object | None = None
     combine: object | None = None
@@ -173,7 +177,7 @@ class MapFoldPartial:
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
             BufferUse.resident(self.spec.execution),
-            BufferUse.resident(self.spec.map_intermediate),
+            BufferUse.resident(self.spec.map_fold_intermediate),
             BufferUse.write(
                 self.partials,
                 BufferStorage.Materialized,
