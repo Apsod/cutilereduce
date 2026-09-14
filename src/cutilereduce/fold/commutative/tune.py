@@ -3,6 +3,7 @@ from __future__ import annotations
 from collections import Counter
 
 from cutilereduce.fold.plan import FoldPlan
+from cutilereduce.fold.embed import tune_embed_stage
 from cutilereduce.fold.tune import stage_key, tune_fold_stages
 
 from .sweep import (
@@ -136,6 +137,12 @@ def tune_commutative_fold_plan(
         viable_backward,
         key=lambda stage: backward_stage_times[stage_key(stage)],
     ),) if backward else ()
+    if backward:
+        embed_stage = tune_embed_stage(
+            spec, sizes, functions, hardware=hardware,
+            candidate_count=candidate_count, timeout=timeout, quiet=quiet_tuning,
+        )
+        best_backward = (embed_stage, *best_backward)
     plan = FoldPlan.make(spec, best_forward.forward, best_backward)
 
     print("isolated stage timings")
@@ -143,7 +150,7 @@ def tune_commutative_fold_plan(
         tiles = ", ".join(f"{axis.name}={axis.tile}" for axis in stage.stage.domain.compute_axes)
         print(f"  forward {stage.stage.name} ({tiles}): {forward_stage_times[stage_key(stage)]:.1f} us")
     if backward:
-        backward_stage = plan.backward[0]
+        backward_stage = plan.backward[1]
         tiles = ", ".join(f"{axis.name}={axis.tile}" for axis in backward_stage.stage.domain.compute_axes)
         loop_axis = backward_stage.stage.domain.loop_axis
         loop_program_axis = backward_stage.stage.domain.program_axis_for(loop_axis)

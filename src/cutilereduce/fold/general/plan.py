@@ -16,21 +16,17 @@ def output_grad_buffers(spec: FoldSpec):
     return spec.semantic.as_output_grad(dtype=ct.float32)
 
 
-def full_recompute_backward_stage(spec, schedule, *, global_buffers=None, output_grad=None):
+def full_recompute_backward_stage(spec, schedule):
     return RecomputeFoldMapFinalizeGradWrite(
         spec,
         schedule,
-        global_buffers=global_buffers or spec.semantic,
-        output_grad=output_grad or output_grad_buffers(spec),
     ).build()
 
 
-def prefix_recompute_backward_stage(spec, schedule, *, checkpoints, partition_axis, global_buffers=None, output_grad=None):
+def prefix_recompute_backward_stage(spec, schedule, *, checkpoints, partition_axis):
     return RecomputePrefixFoldMapFinalizeGradWrite(
         spec,
         schedule,
-        global_buffers=global_buffers or spec.semantic,
-        output_grad=output_grad or output_grad_buffers(spec),
         prefix=checkpoints,
         prefix_axis=partition_axis,
     ).build()

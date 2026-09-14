@@ -51,6 +51,7 @@ def fold_functions(
 class CompiledStage:
     stage: FoldStage
     kernel: Any
+    programmatic_dependent_launch: bool = False
 
     @property
     def launch_grid(self) -> tuple[int, int, int]:
@@ -84,7 +85,29 @@ def compile_fold_forward(plan: FoldPlan, functions: FoldFunctions) -> tuple[Comp
     )
 
 
-def compile_fold_backward(plan: FoldPlan, functions: FoldFunctions) -> tuple[CompiledStage, ...]:
+def compile_fold_backward(
+        plan: FoldPlan,
+        functions: FoldFunctions,
+        *,
+        programmatic_dependent_launch: bool = False,
+        ) -> tuple[CompiledStage, ...]:
+    if programmatic_dependent_launch:
+        if len(plan.backward) != 2:
+            raise ValueError("programmatic dependent launch requires exactly two backward stages")
+        producer, consumer = plan.backward
+        if producer.stage.name != "embed":
+            raise ValueError("programmatic dependent launch requires embed as the first backward stage")
+        return (
+            CompiledStage(
+                stage=producer,
+                kernel=producer.compile(functions, programmatic_dependent_launch=True),
+            ),
+            CompiledStage(
+                stage=consumer,
+                kernel=consumer.compile(functions, programmatic_dependent_launch=True),
+                programmatic_dependent_launch=True,
+            ),
+        )
     return tuple(
         CompiledStage(stage=stage, kernel=stage.compile(functions))
         for stage in plan.backward
@@ -138,11 +161,19 @@ def _is_output_grad(buffer: StageBuffer) -> bool:
 
 
 def _run_compiled_stages(stages, tensors, *, device, zero_writes):
+    # PDL permits the consumer to start as soon as the producer signals it.  Keep
+    # allocation and gradient initialization out of that launch interval: those
+    # operations enqueue regular stream work and would defeat the overlap.
+    prepared = []
     for compiled_stage in stages:
         writes = (
             compiled_stage.allocate_zero_writes(device=device)
-            if zero_writes else compiled_stage.allocate_writes(device=device)
+            if zero_writes and compiled_stage.stage.stage.name != "embed"
+            else compiled_stage.allocate_writes(device=device)
         )
+        prepared.append((compiled_stage, writes))
+
+    for compiled_stage, writes in prepared:
         read_args = tuple(
             _lookup(buffer, tensors) for buffer in compiled_stage.read_buffers
         )
@@ -151,6 +182,7 @@ def _run_compiled_stages(stages, tensors, *, device, zero_writes):
             compiled_stage.launch_grid,
             compiled_stage.kernel,
             (read_args, writes),
+            programmatic_dependent_launch=compiled_stage.programmatic_dependent_launch,
         )
         tensors.update(
             (buffer.id, tensor)
@@ -202,12 +234,16 @@ def _custom_op_digest(plan, functions):
     return hashlib.sha256(contract).hexdigest()[:16]
 
 
-def _make_fold_custom_ops(plan, functions):
+def _make_fold_custom_ops(plan, functions, *, programmatic_dependent_launch=False):
     """Register functional whole-plan ops understood by torch.compile."""
     if not plan.backward:
         raise ValueError("fold custom autograd requires backward stages")
     forward_stages = compile_fold_forward(plan, functions)
-    backward_stages = compile_fold_backward(plan, functions)
+    backward_stages = compile_fold_backward(
+        plan,
+        functions,
+        programmatic_dependent_launch=programmatic_dependent_launch,
+    )
     input_ids = tuple(buffer.id for buffer in plan.spec.input)
     output_ids = tuple(buffer.id for buffer in plan.spec.semantic)
     output_grad_ids = tuple(
@@ -215,6 +251,9 @@ def _make_fold_custom_ops(plan, functions):
         for buffer in backward_stages[0].read_buffers
         if _is_output_grad(buffer)
     )
+    backward_produced_ids = {
+        buffer.id for stage in backward_stages for buffer in stage.write_buffers
+    }
     required_grad_inputs = tuple(
         buffer.id for buffer in plan.spec.input if buffer.req_grad
     )
@@ -224,6 +263,7 @@ def _make_fold_custom_ops(plan, functions):
         for buffer in stage.read_buffers
         if buffer.id not in input_ids
         and buffer.id not in output_ids
+        and buffer.id not in backward_produced_ids
         and not _is_output_grad(buffer)
     ))
     forward_buffers = _stage_buffer_map(forward_stages)
@@ -319,11 +359,16 @@ def mk_fold_autograd(
         functions: FoldFunctions,
         *,
         device="cuda",
+        programmatic_dependent_launch=False,
         ):
     del device
     input_ids = tuple(buffer.id for buffer in plan.spec.input)
     output_ids = tuple(buffer.id for buffer in plan.spec.semantic)
-    forward_op, backward_op = _make_fold_custom_ops(plan, functions)
+    forward_op, backward_op = _make_fold_custom_ops(
+        plan,
+        functions,
+        programmatic_dependent_launch=programmatic_dependent_launch,
+    )
 
     def apply(*inputs):
         if len(inputs) != len(input_ids):

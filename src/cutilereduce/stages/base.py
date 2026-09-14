@@ -126,10 +126,10 @@ class BuiltStage:
     def domain(self) -> StageDomain:
         return self.stage.domain
 
-    def compile(self, functions=None):
+    def compile(self, functions=None, **options):
         if self.compiler is None:
             raise NotImplementedError(f"no compiler registered for stage {self.stage.name}")
-        return self.compiler(self, functions)
+        return self.compiler(self, functions, **options)
 
 
 __all__ = [

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from cutilereduce.fold.plan import FoldPlan
+from cutilereduce.fold.embed import tune_embed_stage
 from cutilereduce.fold.tune import stage_key, tune_fold_stages
 
 from .sweep import (
@@ -138,7 +139,11 @@ def tune_general_fold_plan(
         f"  backward {backward_path} ({tiles}): "
         f"{backward_times[stage_key(backward_stage)]:.1f} us"
     )
-    return FoldPlan.make(spec, plan.forward, (backward_stage,))
+    embed_stage = tune_embed_stage(
+        spec, sizes, functions, hardware=hardware,
+        candidate_count=candidate_count, timeout=timeout, quiet=quiet_tuning,
+    )
+    return FoldPlan.make(spec, plan.forward, (embed_stage, backward_stage))
 
 
 __all__ = ["tune_general_fold_plan"]

@@ -9,7 +9,8 @@ dependencies = [
     "polars>=1.42.0",
     "sympy>=1.14.0",
     "torch",
-    "cuda-tile[tileiras]>=1.5.0",
+    "cuda-tile[tileiras]>=1.6.0",
+    "cuda-toolkit[tileiras]>=13.4",
 ]
 
 [build-system]

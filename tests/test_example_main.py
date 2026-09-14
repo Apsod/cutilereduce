@@ -33,5 +33,23 @@ class ExampleMainTests(unittest.TestCase):
                 operator.save_plan.assert_called_once_with(
                     plan, 'saved.json', metadata={'hardware': 'rtx5080'},
                 )
-                operator.build.assert_called_once_with(plan, backward=False, torch_compile=False)
+                operator.build.assert_called_once_with(
+                    plan,
+                    backward=False,
+                    torch_compile=False,
+                    programmatic_dependent_launch=False,
+                )
                 self.assertIs(run.call_args.args[3], operator.build.return_value)
+
+    def test_programmatic_dependent_launch_reaches_build(self):
+        spec = xentropy_spec()
+        sizes = dict(b=2, v=4, d=2)
+        with patch('cutilereduce.fold.FoldOperator') as cls, patch(
+            'cutilereduce.util.runner.print_plan'
+        ), patch('examples.cli.run_example'):
+            operator = cls.return_value
+            main(
+                'test', spec, None, sizes, reference=None, references={},
+                argv=['--hardware', 'rtx5080', '--programmatic-dependent-launch'],
+            )
+        self.assertTrue(operator.build.call_args.kwargs['programmatic_dependent_launch'])

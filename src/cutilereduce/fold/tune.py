@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import torch
+from cuda.tile.tune import exhaustive_search
 
 from cutilereduce.fold.impl import CompiledStage
-from cutilereduce.util.tune import exhaustive_search
 
 
 def stage_key(stage):
@@ -52,9 +52,10 @@ def tune_fold_stages(stages, functions, *, timeout=0, quiet=False):
         tuple(compiled),
         torch.cuda.current_stream(),
         grid_fn=lambda key: compiled[key].launch_grid,
-        kernel_fn=lambda key: compiled[key].kernel,
+        kernel=lambda key: compiled[key].kernel,
         args_fn=arguments.__getitem__,
-        quiet=quiet,
+        # Keep reporting here; the native tuner also prints every result summary.
+        quiet=True,
         single_run_timeout_sec=None if timeout <= 0 else timeout,
     )
     for key, error_type, message in result.failures:

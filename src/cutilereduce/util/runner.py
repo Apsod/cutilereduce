@@ -3,7 +3,6 @@ from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
 import gc
-
 import torch
 import torch.utils.benchmark as torch_benchmark
 
@@ -23,7 +22,25 @@ def make_output_grads(outputs, *, dtype=None):
             device=output.device,
             dtype=dtype or output.dtype,
         )
+        if output.requires_grad else None
         for output in outputs
+    )
+
+
+def output_vjp(outputs, inputs, output_grads):
+    """VJP of each differentiable returned tensor with its cotangent."""
+    pairs = tuple(
+        (output, grad)
+        for output, grad in zip(outputs, output_grads, strict=True)
+        if output.requires_grad
+    )
+    if not pairs:
+        return tuple(torch.zeros_like(tensor) for tensor in inputs)
+    return torch.autograd.grad(
+        tuple(output for output, _ in pairs),
+        inputs,
+        tuple(grad.to(output.dtype) for output, grad in pairs),
+        materialize_grads=True,
     )
 
 
@@ -31,13 +48,8 @@ def evaluate(function, inputs, output_grads=None):
     outputs = as_tuple(function(*inputs))
     gradients = None
     if output_grads is not None:
-        gradients = torch.autograd.grad(
-            outputs,
-            differentiable_inputs(inputs),
-            tuple(
-                grad.to(output.dtype)
-                for output, grad in zip(outputs, output_grads, strict=True)
-            ),
+        gradients = output_vjp(
+            outputs, differentiable_inputs(inputs), output_grads,
         )
     return (
         tuple(output.detach() for output in outputs),
@@ -48,9 +60,9 @@ def evaluate(function, inputs, output_grads=None):
 def run_grad(*args, **functions):
     """Evaluate implementations with identical randomly generated cotangents."""
     first = next(iter(functions.values()))
-    with torch.no_grad():
-        sample = as_tuple(first(*args))
+    sample = as_tuple(first(*args))
     output_grads = make_output_grads(sample)
+    del sample
     return {
         name: dict(zip(("fwd", "bwd"), evaluate(function, args, output_grads)))
         for name, function in functions.items()
@@ -91,9 +103,9 @@ def validate_implementations(
     output_grad_dtype=None,
         ):
     first = next(iter(implementations.values()))
-    with torch.no_grad():
-        sample = as_tuple(first(*inputs))
+    sample = as_tuple(first(*inputs))
     output_grads = make_output_grads(sample, dtype=output_grad_dtype)
+    del sample
     results = {
         name: evaluate(function, inputs, output_grads)
         for name, function in implementations.items()
@@ -115,9 +127,9 @@ def benchmark_implementations(
         backward=True,
         output_grad_dtype=None,
         ):
-    with torch.no_grad():
-        sample = as_tuple(next(iter(implementations.values()))(*inputs))
+    sample = as_tuple(next(iter(implementations.values()))(*inputs))
     output_grads = make_output_grads(sample, dtype=output_grad_dtype)
+    del sample
     grad_inputs = differentiable_inputs(inputs)
 
     def forward(function):
@@ -126,14 +138,7 @@ def benchmark_implementations(
 
     def forward_backward(function):
         outputs = as_tuple(function(*inputs))
-        return torch.autograd.grad(
-            outputs,
-            grad_inputs,
-            tuple(
-                grad.to(output.dtype)
-                for output, grad in zip(outputs, output_grads, strict=True)
-            ),
-        )
+        return output_vjp(outputs, grad_inputs, output_grads)
 
     for function in implementations.values():
         forward(function)
@@ -174,64 +179,64 @@ def benchmark_memory(
         backward=True,
         output_grad_dtype=None,
         ):
-    """Measure incremental peak PyTorch-managed CUDA tensor allocation."""
-    with torch.no_grad():
-        sample = as_tuple(next(iter(implementations.values()))(*inputs))
-    output_grads = make_output_grads(sample, dtype=output_grad_dtype)
-    del sample
+    """Measure the first-execution CUDA footprint above caller-owned tensors.
+
+    This deliberately runs before the timing benchmark.  In particular, compiled
+    functions may establish CUDA-graph pools on their first forward/backward
+    execution; profiling a later replay attributes none of that persistent
+    residency to the operator.
+    """
     grad_inputs = differentiable_inputs(inputs)
 
-    def forward(function):
-        with torch.no_grad():
-            return function(*inputs)
+    def backward(outputs, output_grads):
+        return output_vjp(outputs, grad_inputs, output_grads)
 
-    def forward_backward(function):
-        outputs = as_tuple(function(*inputs))
-        return torch.autograd.grad(
-            outputs,
-            grad_inputs,
-            tuple(
-                grad.to(output.dtype)
-                for output, grad in zip(outputs, output_grads, strict=True)
-            ),
-        )
-
-    for function in implementations.values():
-        forward(function)
-        if backward:
-            forward_backward(function)
-    torch.cuda.synchronize()
-
-    def peak_delta(call):
+    def measure(function):
+        # Inputs exist at the call boundary, so exclude them from the result.
         gc.collect()
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
         baseline = torch.cuda.memory_allocated()
         torch.cuda.reset_peak_memory_stats()
-        result = call()
-        torch.cuda.synchronize()
-        peak = torch.cuda.max_memory_allocated() - baseline
-        del result
-        return peak
 
-    rows = []
-    for implementation, function in implementations.items():
-        forward_peak = peak_delta(lambda f=function: forward(f))
-        backward_peak = (
-            peak_delta(lambda f=function: forward_backward(f))
-            if backward else None
+        # This is also the first call.  Keep grad mode enabled so that it takes
+        # exactly the same output path that supplies the subsequent backward.
+        # (Some compiled custom-autograd functions omit saved values under
+        # no-grad.)
+        outputs = as_tuple(function(*inputs))
+        torch.cuda.synchronize()
+        forward_peak = torch.cuda.max_memory_allocated() - baseline
+        output_grads = make_output_grads(outputs, dtype=output_grad_dtype)
+        cotangent_bytes = sum(
+            grad.untyped_storage().nbytes()
+            for grad in output_grads if grad is not None
         )
-        rows.append((implementation, forward_peak, backward_peak))
+        if not backward:
+            del outputs, output_grads
+            return forward_peak, None, None
+
+        # Keep the original baseline and peak counter: this includes pools
+        # established by the first forward and by backward graph capture.  Only
+        # the cotangent supplied by the caller is excluded.
+        result = backward(outputs, output_grads)
+        torch.cuda.synchronize()
+        full_peak = torch.cuda.max_memory_allocated() - baseline - cotangent_bytes
+        del result, output_grads, outputs
+        torch.cuda.synchronize()
+        return forward_peak, full_peak, None
+
+    rows = [(implementation, *measure(function))
+            for implementation, function in implementations.items()]
 
     mib = 1024 ** 2
     label_width = max(len("Implementation"), *(len(row[0]) for row in rows))
-    print(f"{name} incremental peak CUDA allocation")
+    print(f"{name} first-execution CUDA memory above inputs/cotangents")
     if backward:
         print(
             f"{'Implementation'.ljust(label_width)}  "
-            f"{'Forward'.rjust(12)}  {'Forward + backward'.rjust(20)}"
+            f"{'VJP forward'.rjust(12)}  {'VJP forward + backward'.rjust(24)}"
         )
-        for implementation, forward_peak, backward_peak in rows:
+        for implementation, forward_peak, backward_peak, _ in rows:
             print(
                 f"{implementation.ljust(label_width)}  "
                 f"{forward_peak / mib:10.3f} MiB  "
@@ -239,7 +244,7 @@ def benchmark_memory(
             )
     else:
         print(f"{'Implementation'.ljust(label_width)}  {'Forward'.rjust(12)}")
-        for implementation, forward_peak, _ in rows:
+        for implementation, forward_peak, _, _ in rows:
             print(
                 f"{implementation.ljust(label_width)}  "
                 f"{forward_peak / mib:10.3f} MiB"
@@ -279,12 +284,12 @@ def validate_precision_matrix(
         "PyTorch FP32": torch.float32,
         "PyTorch FP64": torch.float64,
     }
-    with torch.no_grad():
-        outputs = as_tuple(function(*inputs))
+    outputs = as_tuple(function(*inputs))
     output_grads = (
         make_output_grads(outputs, dtype=output_grad_dtype)
         if backward else None
     )
+    del outputs
     implementation_outputs, implementation_grads = evaluate(
         function,
         inputs,

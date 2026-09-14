@@ -10,6 +10,7 @@ from .codegen import (
     StageFunctions,
 )
 from .fold import Fold, compile_fold_stage, make_fold_program
+from .embed import Embed, compile_embed_stage
 from .map import Map, compile_map_stage
 from .map_fold import (
     MapFold,
@@ -35,6 +36,7 @@ __all__ = [
     "BuiltStage",
     "BufferUse",
     "Fold",
+    "Embed",
     "Map",
     "MapFold",
     "MapFoldPartial",
@@ -47,6 +49,7 @@ __all__ = [
     "bind_buffer_uses",
     "batch_program_axes",
     "compile_fold_stage",
+    "compile_embed_stage",
     "make_fold_program",
     "compile_map_stage",
     "compile_map_fold_stage",

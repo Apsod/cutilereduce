@@ -33,6 +33,11 @@ def xentropy_spec():
             "z": buffer_spec("b", ct.float32, default=float("-inf")),
             "l": buffer_spec("b", ct.float32, default=0),
         },
+        embedded={
+            "z": buffer_spec("b", ct.float32, default=0),
+            "g_z": buffer_spec("b", ct.float32, default=0),
+            "g_l": buffer_spec("b", ct.float32, default=0),
+        },
         map_fold_intermediate={
             "logits": buffer_spec("b v", ct.float32),
         },

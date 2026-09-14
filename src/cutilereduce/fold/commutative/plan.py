@@ -20,15 +20,11 @@ def commutative_backward_stage(
         spec: FoldSpec,
         schedule: StageSchedule,
         *,
-        global_buffers: BufferBundle | None = None,
-        output_grad: BufferBundle | None = None,
         partition_axis: PartitionAxis | None = None,
         ):
     return RecomputeMapFinalizeGradWrite(
         spec=spec,
         schedule=schedule,
-        global_buffers=global_buffers or spec.semantic,
-        output_grad=output_grad or output_grad_buffers(spec),
         partition_axis=partition_axis,
     ).build()
 

@@ -42,6 +42,7 @@ class ExampleParser(argparse.ArgumentParser):
         self.add_argument("--quiet-tuning", action="store_true")
         self.add_argument("--forward-only", action="store_true")
         self.add_argument("--torch-compile", action="store_true")
+        self.add_argument("--programmatic-dependent-launch", action="store_true")
         self.add_argument("--benchmark-seconds", type=nonnegative_float,
                           default=benchmark_seconds)
         self.add_argument("--benchmark-memory", action="store_true")
@@ -53,6 +54,8 @@ class ExampleParser(argparse.ArgumentParser):
         parsed = super().parse_args(args, namespace)
         if parsed.torch_compile and parsed.forward_only:
             self.error("--torch-compile currently requires the autograd plan")
+        if parsed.programmatic_dependent_launch and parsed.forward_only:
+            self.error("--programmatic-dependent-launch requires the backward plan")
         return parsed
 
     def sizes(self, args):
@@ -93,14 +96,14 @@ def benchmark_full(name, inputs, implementations, *, min_run_time=1.0,
     from cutilereduce.util.runner import benchmark_implementations, benchmark_memory
 
     timings = memory = None
-    if min_run_time > 0:
-        timings = benchmark_implementations(
-            name, inputs, implementations, min_run_time=min_run_time,
-            backward=backward, output_grad_dtype=torch.bfloat16,
-        )
     if measure_memory:
         memory = benchmark_memory(
             name, inputs, implementations,
+            backward=backward, output_grad_dtype=torch.bfloat16,
+        )
+    if min_run_time > 0:
+        timings = benchmark_implementations(
+            name, inputs, implementations, min_run_time=min_run_time,
             backward=backward, output_grad_dtype=torch.bfloat16,
         )
     return timings, memory
@@ -123,16 +126,37 @@ def run_example(name, spec, sizes, function, *, args, reference, references,
         return
     torch.manual_seed(args.seed)
     inputs = make_inputs(spec, sizes, device=device, initializers=initializers)
+    implementations = None
+    if should_benchmark:
+        label = "CuTile torch.compile" if args.torch_compile else "CuTile eager"
+        if args.programmatic_dependent_launch:
+            label += " PDL"
+        benchmark_references = references
+        if args.torch_compile:
+            benchmark_references = {
+                f"{name} torch.compile": torch.compile(
+                    reference,
+                    fullgraph=True,
+                    mode="reduce-overhead",
+                )
+                for name, reference in references.items()
+            }
+        implementations = {label: function, **benchmark_references}
+    # Memory is specifically a cold-start measurement.  Validation exercises
+    # the CuTile function, so it must happen after this pass.
+    if args.benchmark_memory:
+        benchmark_full(
+            name, inputs, implementations,
+            min_run_time=0, measure_memory=True, backward=backward,
+        )
     if should_validate:
         validate(function, inputs, reference, spec=spec,
                  accuracy_matrix=args.accuracy_matrix, backward=backward)
-    if should_benchmark:
-        label = "CuTile torch.compile" if args.torch_compile else "CuTile eager"
-        implementations = {label: function, **references}
+    if args.benchmark_seconds > 0:
         benchmark_full(
             name, inputs, implementations,
             min_run_time=args.benchmark_seconds,
-            measure_memory=args.benchmark_memory, backward=backward,
+            measure_memory=False, backward=backward,
         )
 
 
@@ -162,7 +186,10 @@ def main(name, spec, functions, defaults, *, reference, references,
         operator.save_plan(plan, args.save_plan, metadata={"hardware": args.hardware})
     print_plan(plan)
     function = operator.build(
-        plan, backward=not args.forward_only, torch_compile=args.torch_compile,
+        plan,
+        backward=not args.forward_only,
+        torch_compile=args.torch_compile,
+        programmatic_dependent_launch=args.programmatic_dependent_launch,
     )
     run_example(
         name, spec, sizes, function, args=args, reference=reference,

@@ -185,9 +185,15 @@ class FoldOperator:
             backward=True,
             torch_compile=False,
             device="cuda",
+            programmatic_dependent_launch=False,
             ):
         function = (
-            mk_fold_autograd(plan, self.functions, device=device)
+            mk_fold_autograd(
+                plan,
+                self.functions,
+                device=device,
+                programmatic_dependent_launch=programmatic_dependent_launch,
+            )
             if backward else mk_fold_forward(plan, self.functions, device=device)
         )
         if torch_compile:

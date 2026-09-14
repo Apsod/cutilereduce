@@ -121,6 +121,7 @@ def xentropy_spec(*, algebra=AlgebraKind.commutative):
             "l": buffer_spec("b", ct.float32, default=0),
         },
         map_fold_work=workmodel(matmul(M="b", N="v", K="d")),
+        embedded={"g_y": buffer_spec("b", ct.float32, default=0)},
         batch="b",
         fold="v",
         algebra=algebra,
@@ -138,6 +139,7 @@ def add_spec():
         semantic={
             "y": buffer_spec("b", ct.float32, default=0),
         },
+        embedded={"g_y": buffer_spec("b", ct.float32, default=0)},
         batch="b",
         fold="v",
     )
@@ -155,6 +157,7 @@ def scaled_add_spec():
         semantic={
             "y": buffer_spec("b", ct.float32, default=0),
         },
+        embedded={"g_y": buffer_spec("b", ct.float32, default=0)},
         batch="b",
         fold="v",
     )
@@ -360,8 +363,6 @@ class FoldStageConstructionTests(unittest.TestCase):
         backward_full = RecomputeMapFinalizeGradWrite(
             spec,
             full_schedule,
-            global_buffers=spec.semantic,
-            output_grad=spec.semantic.as_output_grad(),
         ).build()
         self.assertEqual(backward_full.stage.name, "recompute_map_finalize_grad_write")
         self.assertTrue(backward_full.stage.cost.write_traffic.has(ATOMIC_ADD))
@@ -369,8 +370,6 @@ class FoldStageConstructionTests(unittest.TestCase):
         backward_partitioned = RecomputeMapFinalizeGradWrite(
             spec,
             partial_schedule,
-            global_buffers=spec.semantic,
-            output_grad=spec.semantic.as_output_grad(),
             partition_axis=partition_axis,
         ).build()
         self.assertEqual(backward_partitioned.partition_axis, partition_axis)
@@ -378,8 +377,6 @@ class FoldStageConstructionTests(unittest.TestCase):
         general_full = RecomputeFoldMapFinalizeGradWrite(
             general_spec,
             full_schedule,
-            global_buffers=general_spec.semantic,
-            output_grad=general_spec.semantic.as_output_grad(),
         ).build()
         self.assertEqual(general_full.stage.name, "recompute_fold_map_finalize_grad_write")
         self.assertIsNone(general_full.checkpoints)
@@ -390,8 +387,6 @@ class FoldStageConstructionTests(unittest.TestCase):
         general_prefix = RecomputePrefixFoldMapFinalizeGradWrite(
             general_spec,
             partial_schedule,
-            global_buffers=general_spec.semantic,
-            output_grad=general_spec.semantic.as_output_grad(),
             prefix=carriers,
             prefix_axis=partition_axis,
         ).build()
@@ -435,8 +430,6 @@ class FoldStageConstructionTests(unittest.TestCase):
         general_backward = RecomputeFoldMapFinalizeGradWrite(
             spec,
             schedule,
-            global_buffers=spec.semantic,
-            output_grad=spec.semantic.as_output_grad(),
         ).build()
         self.assertIsNotNone(
             general_backward.compile(
@@ -456,8 +449,6 @@ class FoldStageConstructionTests(unittest.TestCase):
         prefix_backward = RecomputePrefixFoldMapFinalizeGradWrite(
             spec,
             partial_schedule,
-            global_buffers=spec.semantic,
-            output_grad=spec.semantic.as_output_grad(),
             prefix=carriers,
             prefix_axis=spec.fold.partition_axis,
         ).build()

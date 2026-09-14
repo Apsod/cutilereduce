@@ -17,9 +17,11 @@ class WorkflowTests(unittest.TestCase):
         ])
         def function(*inputs):
             return reference(*inputs)
+        def compiled_reference(*inputs):
+            return reference(*inputs)
         with patch('examples.cli.validate') as check, patch(
             'examples.cli.benchmark_full'
-        ) as benchmark:
+        ) as benchmark, patch('torch.compile', return_value=compiled_reference) as compile:
             run_example(
                 'test', spec, sizes, function, args=args,
                 reference=reference, references={'PyTorch': reference},
@@ -30,7 +32,8 @@ class WorkflowTests(unittest.TestCase):
         implementations = benchmark.call_args.args[2]
         self.assertNotIn('CuTile eager', implementations)
         self.assertIs(implementations['CuTile torch.compile'], function)
-        self.assertIs(implementations['PyTorch'], reference)
+        self.assertIs(implementations['PyTorch torch.compile'], compiled_reference)
+        compile.assert_called_once_with(reference, fullgraph=True, mode='reduce-overhead')
         self.assertTrue(benchmark.call_args.kwargs['measure_memory'])
 
     def test_forward_only_validation_and_spec_gradient_names(self):

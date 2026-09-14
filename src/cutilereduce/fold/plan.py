@@ -35,6 +35,7 @@ class FoldSpec:
     semantic: BufferBundle
     map_fold_intermediate: BufferBundle
     map_finalize_intermediate: BufferBundle
+    embedded: BufferBundle
     batch: Axes
     fold: LogicalAxis
     map_fold_work: WorkModel = WorkModel()
@@ -53,6 +54,7 @@ class FoldSpec:
             self.input,
             self.execution,
             self.semantic,
+            self.embedded,
             self.map_fold_intermediate,
             self.map_finalize_intermediate,
         ):
@@ -75,6 +77,7 @@ class FoldSpec:
                 self.input,
                 self.execution,
                 self.semantic,
+                self.embedded,
                 self.map_fold_intermediate,
                 self.map_finalize_intermediate,
             )
@@ -90,6 +93,8 @@ class FoldSpec:
         invalid = tuple(b.id for b in self.semantic if self.fold in b.axes)
         if invalid:
             raise ValueError(f"semantic buffers must not depend on fold axis: {invalid}")
+        if any(self.fold in b.axes for b in self.embedded):
+            raise ValueError("embedded buffers must not depend on the fold axis")
 
     def axis_id(self, key: str | Axis | AxisId) -> AxisId:
         return resolve_axis_id(self, key)
@@ -153,6 +158,7 @@ def make_fold_spec(
         input: Mapping[str, BufferSpec],
         execution: Mapping[str, BufferSpec],
         semantic: Mapping[str, BufferSpec],
+        embedded: Mapping[str, BufferSpec] | None = None,
         map_fold_intermediate: Mapping[str, BufferSpec] | None = None,
         map_finalize_intermediate: Mapping[str, BufferSpec] | None = None,
         batch: str | Axes,
@@ -168,6 +174,7 @@ def make_fold_spec(
         input=bundle_spec(Input, **dict(input)),
         execution=bundle_spec(Internal("execution"), **dict(execution)),
         semantic=bundle_spec(Output, **dict(semantic)),
+        embedded=bundle_spec(Internal("embedded"), **dict(embedded or {})),
         map_fold_intermediate=bundle_spec(
             Internal("map_fold_intermediate"), **dict(map_fold_intermediate or {})
         ),
@@ -204,6 +211,14 @@ class FoldPlan:
             backward_stages: tuple[FoldStage, ...] = (),
             ) -> FoldPlan:
         spec.check()
+        backward_stages = tuple(backward_stages)
+        if backward_stages:
+            from cutilereduce.stages.embed import default_embed_stage
+
+            if len(backward_stages) == 1:
+                backward_stages = (default_embed_stage(spec, backward_stages[0]), *backward_stages)
+            if len(backward_stages) != 2 or backward_stages[0].stage.name != "embed":
+                raise ValueError("backward requires embed followed by map-finalize")
         return cls(spec=spec, stages=tuple(stages), backward_stages=tuple(backward_stages))
 
     @property

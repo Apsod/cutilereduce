@@ -20,7 +20,7 @@ from cutilereduce.stages import StageSchedule
 
 
 FORMAT = "cutilereduce.fold-plan"
-VERSION = 2
+VERSION = 3
 
 
 def _axis_key(axis: AxisId) -> str:
@@ -120,17 +120,17 @@ def _check_header(spec: FoldSpec, record: dict) -> None:
         raise ValueError("persisted plan axes do not match the fold specification")
 
 
-def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
+def _fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
     """Rebuild a plan against ``spec``; kernels remain owned/cached by CuTile."""
     _check_header(spec, record)
     forward = record.get("forward")
     backward = record.get("backward")
     if not isinstance(forward, list) or not isinstance(backward, list):
         raise ValueError("persisted forward/backward stages must be lists")
-    if len(backward) > 1:
-        raise ValueError("only single-stage fold backward plans are currently supported")
-    backward_schedule = None if not backward else _schedule(backward[0])
-    backward_kind = None if not backward else backward[0]["kind"]
+    if backward and (len(backward) != 2 or backward[0]["kind"] != "embed"):
+        raise ValueError("backward plans require embed followed by map-finalize")
+    backward_schedule = None if not backward else _schedule(backward[1])
+    backward_kind = None if not backward else backward[1]["kind"]
 
     kinds = tuple(stage["kind"] for stage in forward)
     if kinds == ("map_fold",):
@@ -175,6 +175,16 @@ def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
         backward_schedule=backward_schedule,
         checkpointed_backward=checkpointed,
     )
+
+
+def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
+    from cutilereduce.stages.embed import Embed
+
+    plan = _fold_plan_from_record(spec, record)
+    if plan.backward:
+        embed = Embed(spec, _schedule(record["backward"][0])).build()
+        plan = FoldPlan.make(spec, plan.forward, (embed, plan.backward[1]))
+    return plan
 
 
 def load_fold_plan(spec: FoldSpec, path) -> FoldPlan:

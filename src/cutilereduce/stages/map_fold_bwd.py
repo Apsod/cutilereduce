@@ -6,7 +6,7 @@ from typing import TYPE_CHECKING
 import cuda.tile as ct
 
 from cutilereduce.core.axis import PartitionAxis, axis_id
-from cutilereduce.core.buffer import BufferBundle, BufferRole, Input, Internal
+from cutilereduce.core.buffer import BufferBundle, BufferRole, Internal
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
 from cutilereduce.core.stage_domain import ProgramAxis, ProgramAxes, StageDomain
@@ -24,8 +24,6 @@ if TYPE_CHECKING:
 class RecomputeMapFinalizeGradWrite:
     spec: FoldSpec
     schedule: StageSchedule
-    global_buffers: BufferBundle
-    output_grad: BufferBundle
     grad_storage: BufferBundle | None = None
     partition_axis: PartitionAxis | None = None
 
@@ -62,8 +60,7 @@ class RecomputeMapFinalizeGradWrite:
         )
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
-            BufferUse.read_resident(self.global_buffers),
-            BufferUse.read_resident(self.output_grad),
+            BufferUse.read_resident(self.spec.embedded),
             BufferUse.resident(self.spec.execution),
             BufferUse.resident(self.spec.map_finalize_intermediate),
             BufferUse.write(grad_storage),
@@ -85,8 +82,6 @@ class RecomputeMapFinalizeGradWrite:
 class RecomputeFoldMapFinalizeGradWrite:
     spec: FoldSpec
     schedule: StageSchedule
-    global_buffers: BufferBundle
-    output_grad: BufferBundle
     grad_storage: BufferBundle | None = None
 
     def build(self) -> BuiltStage:
@@ -107,8 +102,7 @@ class RecomputeFoldMapFinalizeGradWrite:
         )
         uses = [
             BufferUse.read_resident(self.spec.input),
-            BufferUse.read_resident(self.global_buffers),
-            BufferUse.read_resident(self.output_grad),
+            BufferUse.read_resident(self.spec.embedded),
             BufferUse.resident(self.spec.execution),
             BufferUse.resident(self.spec.map_finalize_intermediate),
             BufferUse.write(grad_storage),
@@ -130,8 +124,6 @@ class RecomputeFoldMapFinalizeGradWrite:
 class RecomputePrefixFoldMapFinalizeGradWrite:
     spec: FoldSpec
     schedule: StageSchedule
-    global_buffers: BufferBundle
-    output_grad: BufferBundle
     prefix: BufferBundle
     prefix_axis: PartitionAxis
     grad_storage: BufferBundle | None = None
@@ -159,8 +151,7 @@ class RecomputePrefixFoldMapFinalizeGradWrite:
         )
         buffers = bind_buffer_uses(domain, (
             BufferUse.read_resident(self.spec.input),
-            BufferUse.read_resident(self.global_buffers),
-            BufferUse.read_resident(self.output_grad),
+            BufferUse.read_resident(self.spec.embedded),
             BufferUse.read_resident(
                 self.prefix,
                 BufferStorage.Materialized,
@@ -184,21 +175,35 @@ class RecomputePrefixFoldMapFinalizeGradWrite:
         )
 
 
-def _is_output_grad(buffer) -> bool:
-    return buffer.role == BufferRole.OutputGrad
+def _is_embedded(buffer) -> bool:
+    return buffer.role == Internal("embedded")
 
 
-def _is_global_read(buffer) -> bool:
-    return buffer.role != Input and not _is_output_grad(buffer)
-
-
-def compile_recompute_map_finalize_grad_write_stage(stage: BuiltStage, functions: StageFunctions):
-    grid = stage_grid_info(stage)
-    embed_buffers = tuple(
-        b for b in stage.stage.read_buffers
-        if _is_global_read(b) or _is_output_grad(b)
+def _persistent_loader(buffers, *, programmatic_dependent_launch):
+    if not programmatic_dependent_launch:
+        return make_buffer_helper(buffers).load
+    split = make_buffer_split(
+        buffers,
+        tuple(b for b in buffers if not _is_embedded(b)),
+        tuple(b for b in buffers if _is_embedded(b)),
     )
-    embed_is_persistent = all(b.is_persistent for b in embed_buffers)
+    project = split.functions
+    independent = make_buffer_helper(split.left_buffers).load
+    dependent = make_buffer_helper(split.right_buffers).load
+
+    @ct.function
+    def load(tid, raw_buffers):
+        inputs = independent(tid, project.left(raw_buffers))
+        ct.grid_dependency_control_wait()
+        embedded = dependent(tid, project.right(raw_buffers))
+        return project.merge(inputs, embedded)
+
+    return load
+
+
+def compile_recompute_map_finalize_grad_write_stage(
+        stage: BuiltStage, functions: StageFunctions, *, programmatic_dependent_launch=False):
+    grid = stage_grid_info(stage)
     read_split = make_buffer_split(
         stage.stage.read_buffers,
         stage.stage.read_buffers.persistent,
@@ -211,7 +216,9 @@ def compile_recompute_map_finalize_grad_write_stage(stage: BuiltStage, functions
     )
     read_split_functions = read_split.functions
     write_split_functions = write_split.functions
-    read_persistent = make_buffer_helper(read_split.left_buffers)
+    load_persistent = _persistent_loader(
+        read_split.left_buffers, programmatic_dependent_launch=programmatic_dependent_launch,
+    )
     read_streamed = make_buffer_helper(read_split.right_buffers)
     write_persistent = make_buffer_helper(write_split.left_buffers)
     write_streamed = make_buffer_helper(write_split.right_buffers)
@@ -219,58 +226,29 @@ def compile_recompute_map_finalize_grad_write_stage(stage: BuiltStage, functions
         stage.stage.read_buffers,
         tuple(b for b in stage.stage.read_buffers if b.role == BufferRole.Input),
     )
-    persistent_global_project = make_buffer_project(
-        read_split.left_buffers,
-        tuple(b for b in read_split.left_buffers if _is_global_read(b)),
-    )
-    persistent_output_grad_project = make_buffer_project(
-        read_split.left_buffers,
-        tuple(b for b in read_split.left_buffers if _is_output_grad(b)),
-    )
-    dynamic_global_project = make_buffer_project(
+    embedded_project = make_buffer_project(
         stage.stage.read_buffers,
-        tuple(b for b in stage.stage.read_buffers if _is_global_read(b)),
-    )
-    dynamic_output_grad_project = make_buffer_project(
-        stage.stage.read_buffers,
-        tuple(b for b in stage.stage.read_buffers if _is_output_grad(b)),
+        tuple(b for b in stage.stage.read_buffers if _is_embedded(b)),
     )
     map_finalize = functions.map_finalize
-    embed = functions.embed
-    if map_finalize is None or embed is None:
-        raise ValueError("recompute-map_finalize-grad-write stage requires embed and map_finalize functions")
+    if map_finalize is None:
+        raise ValueError("backward stage requires map_finalize")
 
-    if embed_is_persistent:
-        @ct.function
-        def loop_body(loop_tid, loop_stage_tid, persistent_grads, persistent_reads, streamed_views, streamed_grad_views, embedded):
-            streamed_reads = streamed_views.load(loop_stage_tid)
-            read_tiles = read_split_functions.merge(persistent_reads, streamed_reads)
-            input_tiles = input_project(read_tiles)
-            streamed_grads = write_streamed.init()
-            grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
-            grads = map_finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
-            persistent_grads = write_split_functions.left(grads)
-            streamed_grads = write_split_functions.right(grads)
-            streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
-            return persistent_grads
+    @ct.function
+    def loop_body(loop_tid, loop_stage_tid, persistent_grads, persistent_reads, streamed_views, streamed_grad_views):
+        streamed_reads = streamed_views.load(loop_stage_tid)
+        read_tiles = read_split_functions.merge(persistent_reads, streamed_reads)
+        input_tiles = input_project(read_tiles)
+        embedded = embedded_project(read_tiles)
+        streamed_grads = write_streamed.init()
+        grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
+        grads = map_finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
+        persistent_grads = write_split_functions.left(grads)
+        streamed_grads = write_split_functions.right(grads)
+        streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
+        return persistent_grads
 
-        loop = grid.loop_with_tail(loop_body)
-    else:
-        @ct.function
-        def loop_body(loop_tid, loop_stage_tid, persistent_grads, persistent_reads, streamed_views, streamed_grad_views):
-            streamed_reads = streamed_views.load(loop_stage_tid)
-            read_tiles = read_split_functions.merge(persistent_reads, streamed_reads)
-            input_tiles = input_project(read_tiles)
-            streamed_grads = write_streamed.init()
-            grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
-            embedded = embed(*dynamic_global_project(read_tiles), *dynamic_output_grad_project(read_tiles))
-            grads = map_finalize(grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded)
-            persistent_grads = write_split_functions.left(grads)
-            streamed_grads = write_split_functions.right(grads)
-            streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
-            return persistent_grads
-
-        loop = grid.loop_with_tail(loop_body)
+    loop = grid.loop_with_tail(loop_body)
 
     @ct.kernel
     def kernel(read_buffers, write_buffers):
@@ -280,59 +258,44 @@ def compile_recompute_map_finalize_grad_write_stage(stage: BuiltStage, functions
         streamed_read_buffers = read_split_functions.right(read_buffers)
         persistent_write_buffers = write_split_functions.left(write_buffers)
         streamed_write_buffers = write_split_functions.right(write_buffers)
-        persistent_reads = read_persistent.load(stage_tid, persistent_read_buffers)
+        persistent_reads = load_persistent(stage_tid, persistent_read_buffers)
         streamed_views = read_streamed.view(streamed_read_buffers)
         persistent_grad_views = write_persistent.view(persistent_write_buffers)
         streamed_grad_views = write_streamed.view(streamed_write_buffers)
         persistent_grads = write_persistent.init()
-        if embed_is_persistent:
-            embedded = embed(
-                *persistent_global_project(persistent_reads),
-                *persistent_output_grad_project(persistent_reads),
-            )
-            persistent_grads = loop(
-                tid,
-                program_tid,
-                persistent_grads,
-                persistent_reads,
-                streamed_views,
-                streamed_grad_views,
-                embedded,
-            )
-        else:
-            persistent_grads = loop(
-                tid,
-                program_tid,
-                persistent_grads,
-                persistent_reads,
-                streamed_views,
-                streamed_grad_views,
-            )
+        persistent_grads = loop(
+            tid, program_tid, persistent_grads, persistent_reads,
+            streamed_views, streamed_grad_views,
+        )
         persistent_grad_views.store_add(stage_tid, persistent_grads)
 
     return kernel
 
 
-def compile_recompute_fold_map_finalize_grad_write_stage(stage: BuiltStage, functions):
-    return _compile_ordered_fold_grad_write_stage(stage, functions, read_prefix=False)
+def compile_recompute_fold_map_finalize_grad_write_stage(stage: BuiltStage, functions, *, programmatic_dependent_launch=False):
+    return _compile_ordered_fold_grad_write_stage(
+        stage, functions, read_prefix=False, programmatic_dependent_launch=programmatic_dependent_launch,
+    )
 
 
-def compile_recompute_prefix_fold_map_finalize_grad_write_stage(stage: BuiltStage, functions):
-    return _compile_ordered_fold_grad_write_stage(stage, functions, read_prefix=True)
+def compile_recompute_prefix_fold_map_finalize_grad_write_stage(stage: BuiltStage, functions, *, programmatic_dependent_launch=False):
+    return _compile_ordered_fold_grad_write_stage(
+        stage, functions, read_prefix=True, programmatic_dependent_launch=programmatic_dependent_launch,
+    )
 
 
 def _is_prefix_buffer(stage: BuiltStage, buffer) -> bool:
     return stage.checkpoints is not None and buffer.id in stage.checkpoints
 
 
-def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFunctions, *, read_prefix: bool):
+def _compile_ordered_fold_grad_write_stage(
+        stage: BuiltStage, functions: StageFunctions, *, read_prefix: bool, programmatic_dependent_launch=False):
     grid = stage_grid_info(stage)
     # General-fold map_finalize is stateful: it consumes the exclusive fold
     # state before this tile and returns (gradients, inclusive state after it).
     map_finalize = functions.map_finalize
-    embed = functions.embed
-    if map_finalize is None or embed is None:
-        raise ValueError("ordered fold backward stage requires embed and stateful map_finalize functions")
+    if map_finalize is None:
+        raise ValueError("ordered fold backward stage requires stateful map_finalize")
 
     ordinary_read_buffers = tuple(
         b for b in stage.stage.read_buffers
@@ -361,7 +324,9 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
     )
     read_split_functions = read_split.functions
     write_split_functions = write_split.functions
-    read_persistent = make_buffer_helper(read_split.left_buffers)
+    load_persistent = _persistent_loader(
+        read_split.left_buffers, programmatic_dependent_launch=programmatic_dependent_launch,
+    )
     read_streamed = make_buffer_helper(read_split.right_buffers)
     write_persistent = make_buffer_helper(write_split.left_buffers)
     write_streamed = make_buffer_helper(write_split.right_buffers)
@@ -375,73 +340,29 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
         ordinary_read_buffers,
         tuple(b for b in ordinary_read_buffers if b.role == BufferRole.Input),
     )
-    embed_buffers = tuple(
-        b for b in ordinary_read_buffers
-        if _is_global_read(b) or _is_output_grad(b)
-    )
-    embed_is_persistent = all(b.is_persistent for b in embed_buffers)
-    persistent_global_project = make_buffer_project(
-        read_split.left_buffers,
-        tuple(b for b in read_split.left_buffers if _is_global_read(b)),
-    )
-    persistent_output_grad_project = make_buffer_project(
-        read_split.left_buffers,
-        tuple(b for b in read_split.left_buffers if _is_output_grad(b)),
-    )
-    dynamic_global_project = make_buffer_project(
+    embedded_project = make_buffer_project(
         ordinary_read_buffers,
-        tuple(b for b in ordinary_read_buffers if _is_global_read(b)),
-    )
-    dynamic_output_grad_project = make_buffer_project(
-        ordinary_read_buffers,
-        tuple(b for b in ordinary_read_buffers if _is_output_grad(b)),
+        tuple(b for b in ordinary_read_buffers if _is_embedded(b)),
     )
 
-    if embed_is_persistent:
-        @ct.function
-        def loop_body(loop_tid, loop_stage_tid, carry, persistent_reads, streamed_views, streamed_grad_views, embedded):
-            persistent_grads, prefix = carry
-            streamed_reads = streamed_views.load(loop_stage_tid)
-            read_tiles = read_split_functions.merge(persistent_reads, streamed_reads)
-            input_tiles = input_project(read_tiles)
-            streamed_grads = write_streamed.init()
-            grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
-            grad_tiles, prefix = map_finalize(
-                grid.tid_info(loop_tid),
-                *input_tiles,
-                *grad_tiles,
-                *embedded,
-                *prefix,
-            )
-            persistent_grads = write_split_functions.left(grad_tiles)
-            streamed_grads = write_split_functions.right(grad_tiles)
-            streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
-            return persistent_grads, prefix
+    @ct.function
+    def loop_body(loop_tid, loop_stage_tid, carry, persistent_reads, streamed_views, streamed_grad_views):
+        persistent_grads, prefix = carry
+        streamed_reads = streamed_views.load(loop_stage_tid)
+        read_tiles = read_split_functions.merge(persistent_reads, streamed_reads)
+        input_tiles = input_project(read_tiles)
+        embedded = embedded_project(read_tiles)
+        streamed_grads = write_streamed.init()
+        grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
+        grad_tiles, prefix = map_finalize(
+            grid.tid_info(loop_tid), *input_tiles, *grad_tiles, *embedded, *prefix,
+        )
+        persistent_grads = write_split_functions.left(grad_tiles)
+        streamed_grads = write_split_functions.right(grad_tiles)
+        streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
+        return persistent_grads, prefix
 
-        loop = grid.loop_with_tail(loop_body)
-    else:
-        @ct.function
-        def loop_body(loop_tid, loop_stage_tid, carry, persistent_reads, streamed_views, streamed_grad_views):
-            persistent_grads, prefix = carry
-            streamed_reads = streamed_views.load(loop_stage_tid)
-            read_tiles = read_split_functions.merge(persistent_reads, streamed_reads)
-            input_tiles = input_project(read_tiles)
-            streamed_grads = write_streamed.init()
-            grad_tiles = write_split_functions.merge(persistent_grads, streamed_grads)
-            embedded = embed(*dynamic_global_project(read_tiles), *dynamic_output_grad_project(read_tiles))
-            grad_tiles, prefix = map_finalize(
-                grid.tid_info(loop_tid),
-                *input_tiles,
-                *grad_tiles,
-                *embedded,
-                *prefix,
-            )
-            persistent_grads = write_split_functions.left(grad_tiles)
-            streamed_grads = write_split_functions.right(grad_tiles)
-            streamed_grad_views.store_add(loop_stage_tid, streamed_grads)
-            return persistent_grads, prefix
-
-        loop = grid.loop_with_tail(loop_body)
+    loop = grid.loop_with_tail(loop_body)
 
     @ct.kernel
     def kernel(read_buffers, write_buffers):
@@ -452,7 +373,7 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
         streamed_read_buffers = read_split_functions.right(ordinary_read_args)
         persistent_write_buffers = write_split_functions.left(write_buffers)
         streamed_write_buffers = write_split_functions.right(write_buffers)
-        persistent_reads = read_persistent.load(stage_tid, persistent_read_buffers)
+        persistent_reads = load_persistent(stage_tid, persistent_read_buffers)
         streamed_views = read_streamed.view(streamed_read_buffers)
         persistent_grad_views = write_persistent.view(persistent_write_buffers)
         streamed_grad_views = write_streamed.view(streamed_write_buffers)
@@ -464,29 +385,10 @@ def _compile_ordered_fold_grad_write_stage(stage: BuiltStage, functions: StageFu
         else:
             prefix = execution.init()
         carry = (persistent_grads, prefix)
-        if embed_is_persistent:
-            embedded = embed(
-                *persistent_global_project(persistent_reads),
-                *persistent_output_grad_project(persistent_reads),
-            )
-            persistent_grads, _ = loop(
-                tid,
-                program_tid,
-                carry,
-                persistent_reads,
-                streamed_views,
-                streamed_grad_views,
-                embedded,
-            )
-        else:
-            persistent_grads, _ = loop(
-                tid,
-                program_tid,
-                carry,
-                persistent_reads,
-                streamed_views,
-                streamed_grad_views,
-            )
+        persistent_grads, _ = loop(
+            tid, program_tid, carry, persistent_reads,
+            streamed_views, streamed_grad_views,
+        )
         persistent_grad_views.store_add(stage_tid, persistent_grads)
 
     return kernel

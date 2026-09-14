@@ -92,7 +92,29 @@ For general folds, `State` in `map_finalize` is the exclusive prefix state befor
 the current tile, and the returned `State` is the inclusive state after that
 tile.
 
+Backward plans always contain two stages: `embed`, then `map_finalize` with
+recomputation. Declare the `embed` results in `make_fold_spec(embedded={...})`,
+in callback return order, using their logical axes and storage dtypes. The
+`map_finalize` callback receives tiles with those logical shapes; any flattening
+for matrix multiplication belongs inside that callback. Embedded outputs must
+include every batch axis used by the embed stage.
+
+Embed is tiled independently over its batch axes, with inner reduction axes
+resident. Its analytical sweep ranks traffic and residency, followed by empirical
+tuning. The gradient stage loads this shared representation instead of repeating
+embedding in each program. Saved plans use format version 3; older plans need
+retuning.
+
+On CTK 13.4 or later, `FoldOperator.build(...,
+programmatic_dependent_launch=True)` uses the embed stage as a programmatic
+dependent-launch producer. Each embed block signals its dependent
+map-finalize block after its output is ready; the latter waits before reading
+embedded storage. The executor prepares all intermediate and gradient buffers
+before launching embed, leaving the two launches adjacent on the stream.
+
 ## Early Benchmarks
+
+These historical measurements predate the separate embed backward stage.
 
 The following measurements were collected on an NVIDIA GeForce RTX 5080. Each
 script used its built-in analytical sweep followed by empirical tuning over 20

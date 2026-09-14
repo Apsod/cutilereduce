@@ -38,21 +38,23 @@ def affine_attention_spec():
             "z": buffer_spec("h l g", ct.float32, default=float("-inf")),
             "mu": buffer_spec("h l g dv", ct.float32, default=0),
         },
-        # Logical tile-local values used by the map/map_finalize callbacks. These
-        # are heuristic residency declarations, not materialized buffers.
+        embedded={
+            "e_z": buffer_spec("h l g", ct.float32, default=0),
+            "w": buffer_spec("h l g", ct.float32, default=0),
+            "s": buffer_spec("h l g dv", ct.bfloat16, default=0),
+        },
+        # Peak-live tile-local scratch slots. These describe residency for the
+        # analytical sweep; the kernel reuses them across its computation phases.
         map_fold_intermediate={
             "logits": buffer_spec("h l g r", ct.float32),
             "alpha": buffer_spec("h l g r", ct.float32),
         },
         map_finalize_intermediate={
-            "logits": buffer_spec("h l g r", ct.float32),
-            "alpha": buffer_spec("h l g r", ct.float32),
-            "local_weights": buffer_spec("h l g r", ct.float32),
-            "probability": buffer_spec("h l g r", ct.float32),
-            "previous_mass": buffer_spec("h l g r", ct.float32),
-            "previous_projection": buffer_spec("h l g r", ct.float32),
-            "g_score": buffer_spec("h l g r", ct.bfloat16),
-            "g_bias_score": buffer_spec("h l g r", ct.bfloat16),
+            "scratch0": buffer_spec("h l g r", ct.float32),
+            "scratch1": buffer_spec("h l g r", ct.float32),
+            "scratch2": buffer_spec("h l g r", ct.float32),
+            "scratch3": buffer_spec("h l g r", ct.float32),
+            "scratch_bf16": buffer_spec("h l g r", ct.bfloat16),
         },
         batch="h l g",
         fold="r",
@@ -157,15 +159,10 @@ def to_output(alpha, z, mu):
 
 @ct.function
 def embed(alpha, z, mu, g_alpha, g_z, g_mu):
-    head, length, group = alpha.shape
-    dv = mu.shape[3]
     return (
-        (alpha * LOG2E).reshape((head, length * group)),
-        (z * LOG2E).reshape((head, length * group)),
-        (g_z - ct.sum(mu * g_mu, axis=3)).reshape(
-            (head, length * group)
-        ),
-        g_mu.astype(ct.bfloat16).reshape((head, length * group, dv)),
+        alpha * LOG2E - z * LOG2E,
+        g_z - ct.sum(mu * g_mu, axis=3),
+        g_mu.astype(ct.bfloat16),
     )
 
 
@@ -174,7 +171,7 @@ def map_finalize(
         tid,
         query, key, value, bias_query, bias_key,
         g_query, g_key, g_value, g_bias_query, g_bias_key,
-        total_alpha, total_z, accumulator_w, accumulator_s,
+        accumulator_z, accumulator_w, accumulator_s,
         prefix_alpha, prefix_m, prefix_e, prefix_u,
         ):
     length, group, head, right, dqk, dv, db = tid.shape(
@@ -188,18 +185,21 @@ def map_finalize(
     bias_query_flat = bias_query.reshape((head, length * group, db))
 
     prefix_alpha_flat = prefix_alpha.reshape((head, length * group))
-    total_alpha_flat = total_alpha
-    total_z_flat = total_z
+    accumulator_z = accumulator_z.reshape((head, length * group))
+    accumulator_w = accumulator_w.reshape((head, length * group))
+    accumulator_s = accumulator_s.reshape((head, length * group, dv))
     inclusive_local_alpha = ct.cumsum(alpha, axis=2)
     local_alpha = ct.sum(alpha, axis=2)
     adjusted_logits = (
         logits + local_alpha[:, :, None] - inclusive_local_alpha
     )
     local_m = ct.max(adjusted_logits, axis=2)
-    local_weights = ct.exp2(adjusted_logits - local_m[:, :, None])
+    # Padded query rows contain only -inf logits; their weights must be zero.
+    safe_local_m = ct.where(local_m == float("-inf"), 0.0, local_m)
+    local_weights = ct.exp2(adjusted_logits - safe_local_m[:, :, None])
     local_e = ct.sum(local_weights, axis=2)
-    global_shift = total_alpha_flat - prefix_alpha_flat - local_alpha
-    probability_scale = ct.exp2(local_m + global_shift - total_z_flat)
+    global_shift = accumulator_z - prefix_alpha_flat - local_alpha
+    probability_scale = ct.exp2(local_m + global_shift)
     probability = local_weights * probability_scale[:, :, None]
 
     prefix_valid = prefix_e != 0
@@ -213,9 +213,8 @@ def map_finalize(
     )
     prefix_mass = ct.exp2(
         prefix_z
-        + total_alpha_flat[:, :, None]
+        + accumulator_z[:, :, None]
         - prefix_alpha_flat[:, :, None]
-        - total_z_flat[:, :, None]
     )
     prefix_mass = ct.where(
         prefix_valid.reshape((head, length * group, 1)),
@@ -225,7 +224,6 @@ def map_finalize(
     prefix_mu = (prefix_u / safe_prefix_e[..., None]).reshape(
         (head, length * group, dv)
     )
-    previous_mass = prefix_mass + ct.cumsum(probability, axis=2) - probability
 
     accumulator_s_float = accumulator_s.astype(ct.float32)
     accumulator_w = accumulator_w[:, :, None]
@@ -233,31 +231,26 @@ def map_finalize(
         accumulator_s_float[:, :, None, :] * value[:, None, :, :],
         axis=3,
     )
-    weighted_projection = probability * value_projection
     prefix_projection = ct.sum(
         accumulator_s_float * prefix_mu,
         axis=2,
     )
-    previous_projection = (
-        prefix_mass * prefix_projection[:, :, None]
-        + ct.cumsum(weighted_projection, axis=2)
-        - weighted_projection
-    )
-    prior_grad = (
-        previous_mass * accumulator_w
-        + previous_projection
-    )
     g_score = probability * (accumulator_w + value_projection)
-    g_score_bf16 = g_score.astype(ct.bfloat16)
-    g_bias_score = prior_grad.astype(ct.bfloat16)
+    prefix_score = prefix_mass * (
+        accumulator_w + prefix_projection[:, :, None]
+    )
+    # Each affine score affects precisely the preceding ordinary scores.
+    prior_grad = prefix_score + ct.cumsum(g_score, axis=2) - g_score
 
     g_value = ct.mma(
         probability.transpose(1, 2).astype(ct.bfloat16),
         accumulator_s,
         g_value,
     )
+    g_score_bf16 = g_score.astype(ct.bfloat16)
     g_query = ct.mma(g_score_bf16, key, g_query.reshape((head, length * group, dqk)))
     g_key = ct.mma(g_score_bf16.transpose(1, 2), query_flat, g_key)
+    g_bias_score = prior_grad.astype(ct.bfloat16)
     g_bias_query = ct.mma(
         g_bias_score,
         bias_key,
@@ -330,7 +323,7 @@ INITIALIZERS = {
 
 def main():
     example_main(
-        'affine_attention', affine_attention_spec(), FUNCTIONS, {'h': 2, 'l': 4096, 'g': 2, 'r': 4096, 'dqk': 64, 'dv': 64, 'db': 32},
+        'affine_attention', affine_attention_spec(), FUNCTIONS, {'h': 2, 'l': 4096, 'g': 4, 'r': 4096, 'dqk': 64, 'dv': 64, 'db': 32},
         aliases={'h': 'heads', 'l': 'length', 'g': 'groups', 'r': 'right'}, benchmark_seconds=0.5,
         reference=reference, references={
             "PyTorch FP32": lambda *inputs: reference(*inputs, dtype=torch.float32),
