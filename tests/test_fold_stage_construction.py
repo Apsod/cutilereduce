@@ -572,8 +572,19 @@ class FoldStageConstructionTests(unittest.TestCase):
         self.assertEqual(tuple(chunk.height for chunk in chunks), (2, 1))
         evaluated = evaluate_stage(
             symbolic_stage,
-            attributes=("partial_storage_ratio", "write_traffic"),
+            attributes=(
+                "partial_storage_ratio",
+                "write_traffic",
+                "model_flops_utilization",
+            ),
             configs=configs,
+            symbols={
+                "SM_COUNT": 1,
+                "SMEM_PER_SM": 1024 * 1024,
+                "MAX_PROGRAMS_PER_SM": 8,
+                "PEAK_TENSOR_FLOPS": 1e12,
+                "BANDWIDTH": 1e9,
+            },
             chunk_size=2,
         )
         self.assertEqual(evaluated.height, 3)
@@ -582,6 +593,7 @@ class FoldStageConstructionTests(unittest.TestCase):
             pl.col("cfg:partition_count") == 2
         )["partial_storage_ratio"][0]
         self.assertEqual(vector, float(scalar))
+        self.assertGreater(evaluated["model_flops_utilization"][0], 0)
 
         pipeline_eval = evaluate_stage(
             symbolic_stage,

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import sympy
 import torch
 from cuda.tile.tune import exhaustive_search
 
+from cutilereduce.core.variables import PEAK_TENSOR_FLOPS
 from cutilereduce.fold.impl import CompiledStage
 
 
@@ -19,6 +21,37 @@ def stage_key(stage):
             (axis.name, axis.extent, axis.tile)
             for axis in stage.stage.domain.compute_axes
         ),
+    )
+
+
+def _evaluate_scalar(value, symbols):
+    if isinstance(value, sympy.Expr):
+        value = value.subs(symbols)
+    return float(value)
+
+
+def empirical_model_flops_utilization(stage, *, hardware, time_us):
+    if time_us <= 0:
+        return 0.0
+    flops = _evaluate_scalar(stage.stage.cost.total_work, hardware)
+    peak = _evaluate_scalar(PEAK_TENSOR_FLOPS, hardware)
+    if peak <= 0:
+        return 0.0
+    return flops / (time_us * 1e-6 * peak)
+
+
+def format_stage_timing(prefix, stage, time_us, *, hardware, suffix=""):
+    tiles = ", ".join(
+        f"{axis.name}={axis.tile}" for axis in stage.stage.domain.compute_axes
+    )
+    mfu = empirical_model_flops_utilization(
+        stage,
+        hardware=hardware,
+        time_us=time_us,
+    )
+    return (
+        f"  {prefix} {stage.stage.name} ({tiles}{suffix}): "
+        f"{time_us:.1f} us, {100 * mfu:.1f}% MFU"
     )
 
 
@@ -71,4 +104,9 @@ def tune_fold_stages(stages, functions, *, timeout=0, quiet=False):
     return {measurement.config: measurement.mean_us for measurement in result.successes}
 
 
-__all__ = ["stage_key", "tune_fold_stages"]
+__all__ = [
+    "empirical_model_flops_utilization",
+    "format_stage_timing",
+    "stage_key",
+    "tune_fold_stages",
+]

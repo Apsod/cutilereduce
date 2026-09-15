@@ -247,6 +247,8 @@ Sweep.default = Sweep(
         "estimated_time",
         "compute_time",
         "traffic_time",
+        "model_flops_per_second",
+        "model_flops_utilization",
         "work_efficiency",
         "mma_efficiency",
         "partial_storage_ratio",

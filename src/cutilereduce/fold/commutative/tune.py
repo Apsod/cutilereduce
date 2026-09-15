@@ -4,7 +4,7 @@ from collections import Counter
 
 from cutilereduce.fold.plan import FoldPlan
 from cutilereduce.fold.embed import tune_embed_stage
-from cutilereduce.fold.tune import stage_key, tune_fold_stages
+from cutilereduce.fold.tune import format_stage_timing, stage_key, tune_fold_stages
 
 from .sweep import (
     commutative_backward_stage_from_config,
@@ -147,19 +147,24 @@ def tune_commutative_fold_plan(
 
     print("isolated stage timings")
     for stage in plan.forward:
-        tiles = ", ".join(f"{axis.name}={axis.tile}" for axis in stage.stage.domain.compute_axes)
-        print(f"  forward {stage.stage.name} ({tiles}): {forward_stage_times[stage_key(stage)]:.1f} us")
+        print(format_stage_timing(
+            "forward",
+            stage,
+            forward_stage_times[stage_key(stage)],
+            hardware=hardware,
+        ))
     if backward:
         backward_stage = plan.backward[1]
-        tiles = ", ".join(f"{axis.name}={axis.tile}" for axis in backward_stage.stage.domain.compute_axes)
         loop_axis = backward_stage.stage.domain.loop_axis
         loop_program_axis = backward_stage.stage.domain.program_axis_for(loop_axis)
         groups = 1 if loop_program_axis is None else loop_program_axis.programs
-        print(
-            f"  backward {backward_stage.stage.name} "
-            f"({tiles}; loop={loop_axis.name}, groups={groups}): "
-            f"{backward_stage_times[stage_key(backward_stage)]:.1f} us"
-        )
+        print(format_stage_timing(
+            "backward",
+            backward_stage,
+            backward_stage_times[stage_key(backward_stage)],
+            hardware=hardware,
+            suffix=f"; loop={loop_axis.name}, groups={groups}",
+        ))
     return plan
 
 

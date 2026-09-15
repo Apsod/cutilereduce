@@ -185,6 +185,14 @@ class KernelStageCost:
         return self.effective_total_work / self.effective_peak_flops
 
     @property
+    def model_flops_per_second(self):
+        return self.total_work / self.estimated_time
+
+    @property
+    def model_flops_utilization(self):
+        return self.model_flops_per_second / PEAK_TENSOR_FLOPS
+
+    @property
     def streamed_bytes_per_tile(self):
         return self.stage.streamed_read_buffers.tile_bytes
 

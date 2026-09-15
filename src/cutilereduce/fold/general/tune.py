@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from cutilereduce.fold.plan import FoldPlan
 from cutilereduce.fold.embed import tune_embed_stage
-from cutilereduce.fold.tune import stage_key, tune_fold_stages
+from cutilereduce.fold.tune import format_stage_timing, stage_key, tune_fold_stages
 
 from .sweep import (
     general_backward_stage_from_config,
@@ -73,13 +73,12 @@ def tune_general_fold_plan(
 
     print("isolated stage timings")
     for stage in plan.forward:
-        tiles = ", ".join(
-            f"{axis.name}={axis.tile}" for axis in stage.stage.domain.compute_axes
-        )
-        print(
-            f"  forward {stage.stage.name} ({tiles}): "
-            f"{times[stage_key(stage)]:.1f} us"
-        )
+        print(format_stage_timing(
+            "forward",
+            stage,
+            times[stage_key(stage)],
+            hardware=hardware,
+        ))
     if not backward:
         return plan
 
@@ -131,14 +130,12 @@ def tune_general_fold_plan(
         viable_backward,
         key=lambda item: backward_times[stage_key(item[1])],
     )
-    tiles = ", ".join(
-        f"{axis.name}={axis.tile}"
-        for axis in backward_stage.stage.domain.compute_axes
-    )
-    print(
-        f"  backward {backward_path} ({tiles}): "
-        f"{backward_times[stage_key(backward_stage)]:.1f} us"
-    )
+    print(format_stage_timing(
+        f"backward {backward_path}",
+        backward_stage,
+        backward_times[stage_key(backward_stage)],
+        hardware=hardware,
+    ))
     embed_stage = tune_embed_stage(
         spec, sizes, functions, hardware=hardware,
         candidate_count=candidate_count, timeout=timeout, quiet=quiet_tuning,
