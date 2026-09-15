@@ -150,6 +150,7 @@ class FoldOperator:
             backward=True,
             max_tile=128,
             max_partition_count=4,
+            max_storage_ratio=4.0,
             quiet=False,
             ) -> FoldPlan:
         if self.spec.algebra == AlgebraKind.commutative:
@@ -160,6 +161,7 @@ class FoldOperator:
                 timeout,
                 functions=self.functions,
                 hardware=hardware,
+                max_storage_ratio=max_storage_ratio,
                 quiet_tuning=quiet,
                 backward=backward,
             )
@@ -173,6 +175,7 @@ class FoldOperator:
                 hardware=hardware,
                 max_tile=max_tile,
                 max_partition_count=max_partition_count,
+                max_storage_ratio=max_storage_ratio,
                 quiet_tuning=quiet,
                 backward=backward,
             )

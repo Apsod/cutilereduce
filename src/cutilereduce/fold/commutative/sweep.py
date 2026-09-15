@@ -299,11 +299,12 @@ def _evaluate_partial_path(
         hardware: Mapping,
         max_tile: int,
         max_partition_count: int,
+        max_storage_ratio: float = 4.0,
         sweep: Sweep = Sweep.default,
         ):
     partition_axis = spec.fold.partition_axis
     frontier_sweep = sweep.add_filters(
-        pl.col("partial_storage_ratio") <= 1,
+        pl.col("partial_storage_ratio") <= max_storage_ratio,
     ).with_frontier_keys(f"cfg:{symbols.partition_count}")
     partial = MapFoldPartial.make(
         spec,
@@ -351,6 +352,7 @@ def sweep_commutative_fold(
         max_tile: int = 256,
         max_fold_programs: int | None = None,
         max_partition_count: int | None = None,
+        max_storage_ratio: float = 4.0,
         sweep: Sweep = Sweep.default,
         configs: pl.DataFrame | None = None,
         ) -> pl.DataFrame:
@@ -381,6 +383,7 @@ def sweep_commutative_fold(
         hardware=hardware,
         max_tile=max_tile,
         max_partition_count=max_partition_count,
+        max_storage_ratio=max_storage_ratio,
         sweep=sweep,
     )
     frames = tuple(frame for frame in (single, partial) if not frame.is_empty())

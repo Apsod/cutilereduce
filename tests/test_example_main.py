@@ -17,6 +17,7 @@ class ExampleMainTests(unittest.TestCase):
                 argv = [
                     '--forward-only',
                     '--hardware', 'rtx5080',
+                    '--max-storage-ratio', '2.5',
                     '--save-plan', 'saved.json',
                 ]
                 if load:
@@ -29,6 +30,10 @@ class ExampleMainTests(unittest.TestCase):
                 else:
                     operator.load_plan.assert_not_called()
                     self.assertFalse(operator.tune.call_args.kwargs['backward'])
+                    self.assertEqual(
+                        operator.tune.call_args.kwargs['max_storage_ratio'],
+                        2.5,
+                    )
                     plan = operator.tune.return_value
                 operator.save_plan.assert_called_once_with(
                     plan, 'saved.json', metadata={'hardware': 'rtx5080'},

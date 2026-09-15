@@ -22,11 +22,18 @@ def tune_commutative_fold_plan(
         *,
         functions,
         hardware,
+        max_storage_ratio=4.0,
         quiet_tuning=False,
         backward=True,
         ):
     print("analytical sweep", flush=True)
-    swept = sweep_commutative_fold(spec, sizes=sizes, hardware=hardware, max_tile=128)
+    swept = sweep_commutative_fold(
+        spec,
+        sizes=sizes,
+        hardware=hardware,
+        max_tile=128,
+        max_storage_ratio=max_storage_ratio,
+    )
     backward_swept = None
     if backward:
         backward_swept = sweep_commutative_backward(

@@ -142,6 +142,7 @@ def sweep_general_fold(
         hardware: Mapping,
         max_tile: int = 128,
         max_partition_count: int = 4,
+        max_storage_ratio: float = 4.0,
         sweep: Sweep = Sweep.default,
         ) -> pl.DataFrame:
     sizes = _normalize_sizes(spec, sizes)
@@ -177,7 +178,7 @@ def sweep_general_fold(
         _map_schedule(spec, sizes, symbols, partial=True),
     )
     partial_frontier = sweep.add_filters(
-        pl.col("partial_storage_ratio") <= 1,
+        pl.col("partial_storage_ratio") <= max_storage_ratio,
     ).with_frontier_keys(count_name)
     mapped = partial_frontier.apply(
         partial.build().stage, partial_configs, symbols=hardware,

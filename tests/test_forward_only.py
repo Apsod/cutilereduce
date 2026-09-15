@@ -19,12 +19,13 @@ class ForwardOnlyTests(unittest.TestCase):
         ))
         forward = SimpleNamespace(forward=(stage,))
         with contextlib.ExitStack() as stack:
-            stack.enter_context(patch(f'{module}.sweep_commutative_fold',
+            sweep = stack.enter_context(patch(f'{module}.sweep_commutative_fold',
                                       return_value=pl.DataFrame({'path': ['single']})))
             backward = stack.enter_context(patch(f'{module}.sweep_commutative_backward'))
             stack.enter_context(patch(f'{module}.commutative_fold_plan_from_config',
                                       return_value=forward))
             stack.enter_context(patch(f'{module}.stage_key', return_value='fwd'))
+            stack.enter_context(patch(f'{module}.format_stage_timing', return_value='timing'))
             tune = stack.enter_context(patch(f'{module}.tune_fold_stages',
                                              return_value={'fwd': 1.0}))
             make = stack.enter_context(patch(f'{module}.FoldPlan.make', return_value=forward))
@@ -33,6 +34,7 @@ class ForwardOnlyTests(unittest.TestCase):
             tune_commutative_fold_plan(spec, {}, 1, 0, functions=None,
                                        hardware={}, backward=False)
         backward.assert_not_called()
+        self.assertEqual(sweep.call_args.kwargs['max_storage_ratio'], 4.0)
         tune.assert_called_once()
         self.assertEqual(make.call_args.args[2], ())
 

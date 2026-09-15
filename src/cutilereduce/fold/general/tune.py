@@ -22,6 +22,7 @@ def tune_general_fold_plan(
         hardware,
         max_tile=128,
         max_partition_count=4,
+        max_storage_ratio=4.0,
         quiet_tuning=False,
         backward=False,
         ):
@@ -32,6 +33,7 @@ def tune_general_fold_plan(
         hardware=hardware,
         max_tile=max_tile,
         max_partition_count=max_partition_count,
+        max_storage_ratio=max_storage_ratio,
     )
     if swept.is_empty():
         raise RuntimeError("general fold sweep produced no candidates")

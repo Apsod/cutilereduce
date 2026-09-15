@@ -48,6 +48,8 @@ class ExampleParser(argparse.ArgumentParser):
         self.add_argument("--benchmark-memory", action="store_true")
         self.add_argument("--load-plan", metavar="PATH")
         self.add_argument("--save-plan", metavar="PATH")
+        self.add_argument("--max-storage-ratio", type=nonnegative_float,
+                          default=4.0)
         self.add_argument("--hardware", choices=list(SPECMAP), required=True)
 
     def parse_args(self, args=None, namespace=None):
@@ -179,6 +181,7 @@ def main(name, spec, functions, defaults, *, reference, references,
         if args.load_plan
         else operator.tune(
             sizes, args.candidates, args.timeout, hardware=hardware,
+            max_storage_ratio=args.max_storage_ratio,
             quiet=args.quiet_tuning, backward=not args.forward_only,
         )
     )
