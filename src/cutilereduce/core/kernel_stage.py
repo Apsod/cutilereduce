@@ -14,6 +14,7 @@ from .variables import (
     SM_COUNT,
     SMEM_PER_SM,
     MAX_PROGRAMS_PER_SM,
+    PIPELINE_EFFICIENCY,
     WRITE,
     normal_write,
 )
@@ -131,8 +132,25 @@ class KernelStageCost:
         return Piecewise((0, self.pipeline_bytes <= 0), (slack, True))
 
     @property
+    def loop_tiles(self):
+        loop_axis = self.stage.domain.loop_axis
+        return 1 if loop_axis is None else self.stage.domain.max_span_tiles(loop_axis)
+
+    @property
+    def average_pipeline_stages(self):
+        loop_tiles = self.loop_tiles
+        capacity = Min(self.pipeline_stage_capacity, loop_tiles)
+        return Max(
+            0,
+            capacity / Max(1, loop_tiles) * (loop_tiles - (capacity + 1) / 2),
+        )
+
+    @property
     def pipeline_factor(self):
-        return Min(1, self.pipeline_stage_capacity * self.stream_compute_cover)
+        return PIPELINE_EFFICIENCY * Min(
+            1,
+            self.average_pipeline_stages * self.stream_compute_cover,
+        )
 
     @property
     def total_work(self):

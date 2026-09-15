@@ -9,6 +9,7 @@ import torch
 from cutilereduce.core import (
     ATOMIC_ADD,
     Axes,
+    PIPELINE_EFFICIENCY,
     atomic_add_write,
     chunked_evaluate_stage,
     evaluate_stage,
@@ -581,6 +582,31 @@ class FoldStageConstructionTests(unittest.TestCase):
             pl.col("cfg:partition_count") == 2
         )["partial_storage_ratio"][0]
         self.assertEqual(vector, float(scalar))
+
+        pipeline_eval = evaluate_stage(
+            symbolic_stage,
+            attributes=("estimated_time", "pipeline_factor"),
+            configs=pl.DataFrame({
+                "cfg:partition_count": [1, 1],
+                "pipeline": [1.0, 0.5],
+            }),
+            symbols={
+                "SM_COUNT": 1,
+                "SMEM_PER_SM": 1024,
+                "MAX_PROGRAMS_PER_SM": 8,
+                "PEAK_TENSOR_FLOPS": 1e12,
+                "BANDWIDTH": 1e9,
+                PIPELINE_EFFICIENCY: sympy.Symbol("pipeline"),
+            },
+        )
+        self.assertGreater(
+            pipeline_eval["pipeline_factor"][0],
+            pipeline_eval["pipeline_factor"][1],
+        )
+        self.assertLess(
+            pipeline_eval["estimated_time"][0],
+            pipeline_eval["estimated_time"][1],
+        )
 
         fold_sweep = sweep_commutative_fold(
             spec,

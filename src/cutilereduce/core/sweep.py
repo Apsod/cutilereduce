@@ -11,7 +11,7 @@ from numbers import Number
 from sympy import Function, Max, Min, Symbol, log
 
 from .kernel_stage import KernelStage
-from .variables import ATOMIC_ADD, BWD_CONTENTION, READ, WRITE
+from .variables import ATOMIC_ADD, BWD_CONTENTION, PIPELINE_EFFICIENCY, READ, WRITE
 
 
 def contention_penalty(alpha, cap, contention):
@@ -26,6 +26,7 @@ DEFAULT_SYMBOLS = {
     READ: 1,
     WRITE: 1,
     ATOMIC_ADD: 2,
+    PIPELINE_EFFICIENCY: 1,
 }
 
 DEFAULT_FUNCTIONS = {
@@ -252,6 +253,8 @@ Sweep.default = Sweep(
         "residency_bytes",
         "resident_programs_per_sm",
         "sm_utilization",
+        "average_pipeline_stages",
+        "pipeline_factor",
         "write_traffic",
         "streamed_traffic",
         "nonhiding_traffic",

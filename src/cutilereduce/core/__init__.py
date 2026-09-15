@@ -37,7 +37,7 @@ from .stage_domain import (
 )
 from .sweep import StageEstimate, Sweep, chunked_evaluate_stage, evaluate_stage
 from .typestuff import DType, to_torch_dtype
-from .variables import ATOMIC_ADD, atomic_add_write, normal_write
+from .variables import ATOMIC_ADD, PIPELINE_EFFICIENCY, atomic_add_write, normal_write
 from .work import MatMulWork, WorkModel, matmul, workmodel
 
 __all__ = [
@@ -66,6 +66,7 @@ __all__ = [
     "Output",
     "OutputGrad",
     "PartitionAxis",
+    "PIPELINE_EFFICIENCY",
     "ProgramAxis",
     "ProgramAxes",
     "READ",

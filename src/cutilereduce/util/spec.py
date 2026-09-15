@@ -1,4 +1,11 @@
-from cutilereduce.core.variables import PEAK_FLOPS, BANDWIDTH, SM_COUNT, MAX_PROGRAMS_PER_SM, SMEM_PER_SM
+from cutilereduce.core.variables import (
+    BANDWIDTH,
+    MAX_PROGRAMS_PER_SM,
+    PEAK_FLOPS,
+    PIPELINE_EFFICIENCY,
+    SM_COUNT,
+    SMEM_PER_SM,
+)
 
 SPECMAP = dict(
     l4 = {
@@ -7,6 +14,7 @@ SPECMAP = dict(
         SM_COUNT: 60,                    
         MAX_PROGRAMS_PER_SM: 32,        
         SMEM_PER_SM: 100 * 1024,        
+        PIPELINE_EFFICIENCY: 0.5,
     },
     l40s = {
         PEAK_FLOPS: 362e12,
@@ -14,6 +22,7 @@ SPECMAP = dict(
         SM_COUNT: 142,
         MAX_PROGRAMS_PER_SM: 32,
         SMEM_PER_SM: 100*1024,
+        PIPELINE_EFFICIENCY: 0.5,
     },
     a100 = {
         PEAK_FLOPS: 312e12,
@@ -21,6 +30,7 @@ SPECMAP = dict(
         SM_COUNT: 108,
         MAX_PROGRAMS_PER_SM: 32,
         SMEM_PER_SM: 164 * 1024,
+        PIPELINE_EFFICIENCY: 0.5,
     },
     h200 = {
         PEAK_FLOPS: 989.5e12,
@@ -28,6 +38,7 @@ SPECMAP = dict(
         SM_COUNT: 132,
         MAX_PROGRAMS_PER_SM: 32,
         SMEM_PER_SM: 228 * 1024,
+        PIPELINE_EFFICIENCY: 1.0,
     },
     rtx5090 = {
         PEAK_FLOPS: 419.2e12,
@@ -35,6 +46,7 @@ SPECMAP = dict(
         SM_COUNT: 170,
         MAX_PROGRAMS_PER_SM: 32,
         SMEM_PER_SM: 128 * 1024,
+        PIPELINE_EFFICIENCY: 1.0,
     },
     rtx5080 = {
         PEAK_FLOPS: 225.1e12,
@@ -42,6 +54,7 @@ SPECMAP = dict(
         SM_COUNT: 84,
         MAX_PROGRAMS_PER_SM: 32,
         SMEM_PER_SM: 100 * 1024,
+        PIPELINE_EFFICIENCY: 1.0,
     },
     rtx5070 = {
         PEAK_FLOPS: 123.5e12,
@@ -49,5 +62,6 @@ SPECMAP = dict(
         SM_COUNT: 48,
         MAX_PROGRAMS_PER_SM: 32,
         SMEM_PER_SM: 128 * 1024,
+        PIPELINE_EFFICIENCY: 1.0,
     },
 )
