@@ -326,7 +326,7 @@ def main():
         'affine_attention', affine_attention_spec(), FUNCTIONS, {'h': 2, 'l': 4096, 'g': 4, 'r': 4096, 'dqk': 64, 'dv': 64, 'db': 32},
         aliases={'h': 'heads', 'l': 'length', 'g': 'groups', 'r': 'right'}, benchmark_seconds=0.5,
         reference=reference, references={
-            "PyTorch FP32": lambda *inputs: reference(*inputs, dtype=torch.float32),
+        #    "PyTorch FP32": lambda *inputs: reference(*inputs, dtype=torch.float32),
             "PyTorch BF16": lambda *inputs: reference(*inputs, dtype=torch.bfloat16),
         },
         initializers=INITIALIZERS,

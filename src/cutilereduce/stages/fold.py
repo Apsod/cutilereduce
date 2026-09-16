@@ -34,7 +34,11 @@ class Fold:
             self.schedule,
             fold_axis=self.partition_axis,
             fold_extent=self.schedule.extent(self.partition_axis),
-            fold_tile=self.schedule.tile(self.partition_axis),
+            # Partials are materialized one partition per storage tile.  Keep
+            # the fold tile at one so the generated runtime loop calls the
+            # vectorized carrier combine once per partial; ``ct.reduce`` would
+            # instead invoke it on scalar slices.
+            fold_tile=1,
         )
         program_axes = batch_program_axes(self.schedule, compute_axes)
         program_axes.append(ProgramAxis(
@@ -83,29 +87,17 @@ def make_fold_program(stage: BuiltStage, combine, initial=None):
     if len(set(fold_positions)) != 1:
         raise ValueError(f"fold axis has inconsistent tile positions: {fold_positions}")
     tile_axis = fold_positions[0]
-    fold_tile = int(stage.domain.get(fold_axis).tile)
     reduced_shapes = tuple(
         info.tile.shape[:tile_axis] + info.tile.shape[tile_axis + 1:]
         for info in read_buffers
     )
-    identities = tuple(buffer.default for buffer in read_buffers)
 
-    if fold_tile > 1:
-        def load_carrier(tid, buffers):
-            factors = load(tid, buffers)
-            return ct.reduce(
-                factors,
-                axis=tile_axis,
-                func=combine,
-                identity=identities,
-            )
-    else:
-        def load_carrier(tid, buffers):
-            factors = load(tid, buffers)
-            ret = ()
-            for i, shape in ct.static_iter(enumerate(reduced_shapes)):
-                ret += (ct.reshape(factors[i], shape),)
-            return ret
+    def load_carrier(tid, buffers):
+        factors = load(tid, buffers)
+        ret = ()
+        for i, shape in ct.static_iter(enumerate(reduced_shapes)):
+            ret += (ct.reshape(factors[i], shape),)
+        return ret
 
     @ct.function
     def loop_body(loop_tid, loop_stage_tid, acc, read_buffers):

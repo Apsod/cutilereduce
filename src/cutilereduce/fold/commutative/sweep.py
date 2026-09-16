@@ -67,15 +67,13 @@ def _backward_loop_axes(spec: FoldSpec) -> tuple[LogicalAxis, ...]:
     )
 
 
-def _make_symbols(spec: FoldSpec, partition_axis: Axis | None = None) -> FoldSweepSymbols:
-    partition_axis = partition_axis or spec.fold.partition_axis
+def _make_symbols(spec: FoldSpec) -> FoldSweepSymbols:
     tile_axes = _tile_axes(spec)
     return FoldSweepSymbols(
         full_tiles={axis.id: sympy.Symbol(f"full_{axis.name}_tile") for axis in tile_axes},
         partial_tiles={axis.id: sympy.Symbol(f"partial_{axis.name}_tile") for axis in tile_axes},
         combine_tiles={
-            **{axis.id: sympy.Symbol(f"combine_{axis.name}_tile") for axis in spec.batch},
-            partition_axis.id: sympy.Symbol(f"combine_{partition_axis.name}_tile"),
+            axis.id: sympy.Symbol(f"combine_{axis.name}_tile") for axis in spec.batch
         },
         backward_tiles={
             axis.id: sympy.Symbol(f"backward_{axis.name}_tile")
@@ -141,7 +139,8 @@ def _combine_schedule(
                 for axis in spec.axes
                 if axis not in spec.batch and axis != spec.fold
             },
-            partition_axis.id: symbols.combine_tile(partition_axis),
+            # Materialized partials are read one partition at a time.
+            partition_axis.id: 1,
         }),
         programs=MappingProxyType({partition_axis.id: 1}),
         loop=partition_axis.id,
@@ -196,8 +195,7 @@ def generate_commutative_fold_configs(
         max_partition_count: int = 16,
         ) -> pl.DataFrame:
     normalized_sizes = _normalize_sizes(spec, sizes)
-    partition_axis = spec.fold.partition_axis
-    symbols = _make_symbols(spec, partition_axis)
+    symbols = _make_symbols(spec)
     tile_axes = _tile_axes(spec)
     names = tuple(f"cfg:{symbols.partial_tile(axis)}" for axis in tile_axes)
     tile_values = tuple(_config_values(normalized_sizes[axis.id], max_tile) for axis in tile_axes)
@@ -251,16 +249,14 @@ def _combine_configs(
         spec: FoldSpec,
         sizes: Mapping[AxisId, int],
         symbols: FoldSweepSymbols,
-        partition_axis: Axis,
         max_tile: int,
         max_partition_count: int,
         ) -> pl.DataFrame:
-    axes = (*spec.batch, partition_axis)
-    config_sizes = dict(sizes) | {partition_axis.id: max_partition_count}
+    axes = tuple(spec.batch)
     configs = _stage_tile_configs(
         axes,
         tuple(f"cfg:{symbols.combine_tile(axis)}" for axis in axes),
-        config_sizes,
+        sizes,
         max_tile,
     )
     counts = pl.DataFrame({f"cfg:{symbols.partition_count}": range(2, max_partition_count + 1)})
@@ -318,7 +314,6 @@ def _evaluate_partial_path(
         spec,
         sizes,
         symbols,
-        partition_axis,
         max_tile,
         max_partition_count,
     )
@@ -358,8 +353,7 @@ def sweep_commutative_fold(
         ) -> pl.DataFrame:
     max_partition_count = max_partition_count or max_fold_programs or 16
     normalized_sizes = _normalize_sizes(spec, sizes)
-    partition_axis = spec.fold.partition_axis
-    symbols = _make_symbols(spec, partition_axis)
+    symbols = _make_symbols(spec)
 
     single_configs = _single_configs(spec, normalized_sizes, symbols, max_tile)
     partial_configs = (
@@ -463,7 +457,7 @@ def commutative_fold_plan_from_config(
     """Build a concrete full or partial plan from one sweep result row."""
     normalized_sizes = _normalize_sizes(spec, sizes)
     partition_axis = spec.fold.partition_axis
-    symbols = _make_symbols(spec, partition_axis)
+    symbols = _make_symbols(spec)
     path = config["path"]
 
     def map_schedule(kind: str, *, partition_count: int | None = None):
@@ -510,7 +504,7 @@ def commutative_fold_plan_from_config(
                 for axis in spec.axes
                 if axis not in spec.batch and axis != spec.fold
             },
-            partition_axis.id: _config_value(config, symbols.combine_tile(partition_axis)),
+            partition_axis.id: 1,
         }),
         programs=MappingProxyType({partition_axis.id: 1}),
         loop=partition_axis.id,
