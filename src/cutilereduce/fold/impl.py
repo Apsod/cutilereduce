@@ -376,9 +376,27 @@ def mk_fold_autograd(
         semantic_outputs = tuple(forward_op(list(inputs))[:len(output_ids)])
         return _apply_to_output(functions, semantic_outputs)
 
-    apply.forward_op = forward_op
-    apply.backward_op = backward_op
+    setattr(apply, "forward_op", forward_op)
+    setattr(apply, "backward_op", backward_op)
     return apply
+
+
+def build_fold(
+        plan, functions, *, backward=True, torch_compile=False, device="cuda",
+        programmatic_dependent_launch=False,
+        ):
+    """Compile and wrap a concrete plan as a callable."""
+    function = (
+        mk_fold_autograd(
+            plan, functions, device=device,
+            programmatic_dependent_launch=programmatic_dependent_launch,
+        ) if backward else mk_fold_forward(plan, functions, device=device)
+    )
+    if torch_compile:
+        if not backward:
+            raise ValueError("torch.compile currently requires an autograd fold")
+        function = torch.compile(function, fullgraph=True, mode="reduce-overhead")
+    return function
 
 
 __all__ = [
@@ -389,4 +407,5 @@ __all__ = [
     "fold_functions",
     "mk_fold_autograd",
     "mk_fold_forward",
+    "build_fold",
 ]

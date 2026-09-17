@@ -34,7 +34,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIs(implementations['CuTile torch.compile'], function)
         self.assertIs(implementations['PyTorch torch.compile'], compiled_reference)
         compile.assert_called_once_with(reference, fullgraph=True, mode='reduce-overhead')
-        self.assertTrue(benchmark.call_args.kwargs['measure_memory'])
+        self.assertTrue(benchmark.call_args_list[0].kwargs['measure_memory'])
 
     def test_forward_only_validation_and_spec_gradient_names(self):
         spec = xentropy_spec()

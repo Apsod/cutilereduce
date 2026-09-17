@@ -42,7 +42,8 @@ def tune_commutative_fold_plan(
             hardware=hardware,
             max_tile=128,
         )
-    if swept.is_empty() or (backward and backward_swept.is_empty()):
+        assert backward_swept is not None
+    if swept.is_empty() or (backward_swept is not None and backward_swept.is_empty()):
         raise RuntimeError("commutative fold sweep produced no candidates")
 
     forward_candidates = []
@@ -61,6 +62,7 @@ def tune_commutative_fold_plan(
             break
     backward_candidates = []
     if backward:
+        assert backward_swept is not None
         backward_candidates_by_loop = {
             axis: [] for axis in sorted(set(backward_swept["loop_axis"].to_list()))
         }

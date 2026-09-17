@@ -105,7 +105,7 @@ tuning. The gradient stage loads this shared representation instead of repeating
 embedding in each program. Saved plans use format version 3; older plans need
 retuning.
 
-On CTK 13.4 or later, `FoldOperator.build(...,
+On CTK 13.4 or later, `build_fold(...,
 programmatic_dependent_launch=True)` uses the embed stage as a programmatic
 dependent-launch producer. Each embed block signals its dependent
 map-finalize block after its output is ready; the latter waits before reading
@@ -178,6 +178,47 @@ and that local factor, without carrying a prefix. This is the theoretical case
 targeted by the commutative examples in the current implementation.
 
 ## Constructing inputs and running examples
+
+### Inspecting plans and analytical costs
+
+The plan topology is independent of tuning. Starting from a `FoldSpec`, enumerate
+symbolic forward, backward, or compatible joint plans:
+
+```python
+from cutilereduce.fold import forward_plans, backward_plans, joint_plan_templates
+from cutilereduce.util.spec import SPECMAP
+from examples.xentropy import xentropy_spec
+
+spec = xentropy_spec()
+print([path.name for path in forward_plans(spec)])   # full, partial
+print([path.name for path in backward_plans(spec)])  # commutative
+templates = joint_plan_templates(spec)
+for template in templates:
+    print(template.name, [name for name, _ in template.stage_costs])
+    print(template.estimated_time)  # Symbolic sum of stage times, in seconds.
+
+template = next(t for t in templates if t.name == "full+commutative")
+values = {
+    "b": 32, "v": 128, "d": 64,
+    "full_b_tile": 16, "full_v_tile": 32,
+    "backward_b_tile": 16, "backward_v_tile": 32,
+    "backward_group_count": 1, "embed_b_tile": 16,
+}
+print(template.parameters)  # Names of sizes and tiling parameters.
+print(template.evaluate({"v": 128}))  # Remaining parameters stay symbolic.
+print(float(template.evaluate(values, hardware=SPECMAP["rtx5080"])) * 1e3)
+plan = template.bind(values)  # Concrete FoldPlan, ready to build or save.
+```
+
+Each path object owns its stage sequence and lowering. A commutative backward
+path can select another eligible loop axis with `path.with_loop("b")`.
+`compose_plans(forward, backward)` validates dependencies; general checkpointed
+backward requires a partial scan forward plan and shares its partition count
+and fold tile. `plan_fold(spec, sizes, tiles=...)` is a convenience for manual
+selection, while `tune_fold_plan(spec, functions, sizes,
+hardware=...)` searches concrete choices. `build_fold(plan, functions)` creates
+the executable callable. Saved version 3 plans remain loadable with
+`load_fold_plan(spec, path, sizes)`.
 
 `FoldSpec.mk_inputs` takes all logical axis sizes and returns tensors in input
 spec order. Shapes, dtypes, and `requires_grad` come from the spec. Floating

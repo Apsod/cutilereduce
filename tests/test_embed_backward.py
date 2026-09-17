@@ -5,7 +5,7 @@ import cuda.tile as ct
 import torch
 
 from cutilereduce.core.buffer import BufferRole
-from cutilereduce.fold import FoldOperator, FoldPlan
+from cutilereduce.fold import FoldPlan, build_fold, plan_fold
 from cutilereduce.fold.embed import embed_candidates
 from cutilereduce.fold.persistence import fold_plan_from_record, plan_record
 from cutilereduce.stages.base import StageSchedule
@@ -27,8 +27,7 @@ class EmbedPlanTests(unittest.TestCase):
         for module, spec, sizes, tiles in example_cases():
             for path in ("full", "partial"):
                 with self.subTest(example=module.__name__, path=path):
-                    op = FoldOperator(spec, module.FUNCTIONS)
-                    plan = op.plan(sizes, path=path, tiles=tiles, partitions=2 if path == "partial" else 1)
+                    plan = plan_fold(spec, sizes, path=path, tiles=tiles, partitions=2 if path == "partial" else 1)
                     embed, finalize = plan.backward
                     self.assertEqual(embed.stage.name, "embed")
                     self.assertEqual(tuple(b.id for b in embed.stage.write_buffers), spec.embedded.keys)
@@ -47,10 +46,9 @@ class EmbedPlanTests(unittest.TestCase):
     def test_missing_embedded_spec_is_only_an_error_for_backward(self):
         module, spec, sizes, tiles = example_cases()[0]
         spec = replace(spec, embedded=type(spec.embedded)(values=()))
-        op = FoldOperator(spec, module.FUNCTIONS)
-        self.assertFalse(op.plan(sizes, tiles=tiles, backward=False).backward)
+        self.assertFalse(plan_fold(spec, sizes, tiles=tiles, backward=False).backward)
         with self.assertRaisesRegex(ValueError, "embedded buffers"):
-            op.plan(sizes, tiles=tiles)
+            plan_fold(spec, sizes, tiles=tiles)
 
     def test_analytical_embed_candidates_have_unique_writers(self):
         for _, spec, sizes, _ in example_cases():
@@ -71,7 +69,7 @@ class EmbedCudaTests(unittest.TestCase):
     def test_programmatic_dependent_launch_matches_sequential_backward(self):
         torch.manual_seed(23)
         module, spec, sizes, tiles = example_cases()[0]
-        plan = FoldOperator(spec, module.FUNCTIONS).plan(
+        plan = plan_fold(spec,
             sizes, path="partial", tiles=tiles, partitions=2,
         )
         inputs = spec.mk_inputs(sizes, device="cuda", **module.INITIALIZERS)
@@ -82,8 +80,8 @@ class EmbedCudaTests(unittest.TestCase):
                 tensor.detach().clone().requires_grad_(tensor.requires_grad)
                 for tensor in inputs
             )
-            output, = FoldOperator(spec, module.FUNCTIONS).build(
-                plan,
+            output, = build_fold(
+                plan, module.FUNCTIONS,
                 programmatic_dependent_launch=programmatic_dependent_launch,
             )(*operator_inputs)
             gradients = torch.autograd.grad(
@@ -112,12 +110,11 @@ class EmbedCudaTests(unittest.TestCase):
                 variants.append(("partial", False, "b" if module is xentropy else "l"))
             for path, checkpointed, loop in variants:
                 with self.subTest(example=module.__name__, path=path, checkpoints=checkpointed, loop=loop):
-                    op = FoldOperator(spec, module.FUNCTIONS)
-                    plan = op.plan(
+                    plan = plan_fold(spec,
                         sizes, path=path, tiles=tiles, partitions=2 if path == "partial" else 1,
                         checkpointed_backward=checkpointed, backward_loop=loop,
                     )
-                    actual, = op.build(plan)(*inputs)
+                    actual, = build_fold(plan, module.FUNCTIONS)(*inputs)
                     actual_grads = torch.autograd.grad(actual, tuple(x for x in inputs if x.requires_grad), cotangent)
                     torch.testing.assert_close(actual, expected, atol=0.025, rtol=0.025, check_dtype=False)
                     for grad, expected_grad in zip(actual_grads, expected_grads, strict=True):

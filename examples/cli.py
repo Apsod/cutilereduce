@@ -166,7 +166,8 @@ def main(name, spec, functions, defaults, *, reference, references,
          initializers=None, aliases=None, benchmark_seconds=1.0, argv=None):
     """Run an example from its kernel definition and example-specific settings."""
     import torch
-    from cutilereduce.fold import FoldOperator
+    from cutilereduce.fold import build_fold, tune_fold_plan
+    from cutilereduce.fold.persistence import load_fold_plan, save_fold_plan
     from cutilereduce.util.runner import print_plan
 
     parser = ExampleParser(spec, defaults, aliases=aliases,
@@ -175,21 +176,20 @@ def main(name, spec, functions, defaults, *, reference, references,
     sizes = parser.sizes(args)
     hardware = SPECMAP[args.hardware]
     torch.manual_seed(args.seed)
-    operator = FoldOperator(spec, functions)
     plan = (
-        operator.load_plan(args.load_plan, sizes)
+        load_fold_plan(spec, args.load_plan, sizes)
         if args.load_plan
-        else operator.tune(
-            sizes, args.candidates, args.timeout, hardware=hardware,
+        else tune_fold_plan(
+            spec, functions, sizes, args.candidates, args.timeout, hardware=hardware,
             max_storage_ratio=args.max_storage_ratio,
             quiet=args.quiet_tuning, backward=not args.forward_only,
         )
     )
     if args.save_plan:
-        operator.save_plan(plan, args.save_plan, metadata={"hardware": args.hardware})
+        save_fold_plan(plan, args.save_plan, metadata={"hardware": args.hardware})
     print_plan(plan)
-    function = operator.build(
-        plan,
+    function = build_fold(
+        plan, functions,
         backward=not args.forward_only,
         torch_compile=args.torch_compile,
         programmatic_dependent_launch=args.programmatic_dependent_launch,

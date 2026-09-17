@@ -5,17 +5,10 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import cuda.tile as ct
+import sympy
 
 from cutilereduce.core.axis import AxisId, AxisType
-from cutilereduce.fold.commutative.plan import (
-    full_fold_plan as commutative_full_fold_plan,
-    partial_fold_plan as commutative_partial_fold_plan,
-)
-from cutilereduce.fold.general.plan import (
-    full_fold_plan as general_full_fold_plan,
-    partial_fold_plan as general_partial_fold_plan,
-)
-from cutilereduce.fold.plan import AlgebraKind, FoldPlan, FoldSpec
+from cutilereduce.fold.plan import FoldPlan, FoldSpec
 from cutilereduce.stages import StageSchedule
 
 
@@ -120,75 +113,69 @@ def _check_header(spec: FoldSpec, record: dict) -> None:
         raise ValueError("persisted plan axes do not match the fold specification")
 
 
-def _fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
-    """Rebuild a plan against ``spec``; kernels remain owned/cached by CuTile."""
+def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
+    from cutilereduce.fold.paths import BACKWARD_RECORD_TYPES, FORWARD_RECORD_TYPES
+    from cutilereduce.fold.templates import FoldPlanTemplate
+
     _check_header(spec, record)
     forward = record.get("forward")
     backward = record.get("backward")
     if not isinstance(forward, list) or not isinstance(backward, list):
         raise ValueError("persisted forward/backward stages must be lists")
-    if backward and (len(backward) != 2 or backward[0]["kind"] != "embed"):
-        raise ValueError("backward plans require embed followed by map-finalize")
-    backward_schedule = None if not backward else _schedule(backward[1])
-    backward_kind = None if not backward else backward[1]["kind"]
-
-    kinds = tuple(stage["kind"] for stage in forward)
-    if kinds == ("map_fold",):
-        constructor = (
-            commutative_full_fold_plan
-            if spec.algebra == AlgebraKind.commutative
-            else general_full_fold_plan
-        )
-        expected_backward = (
-            "recompute_map_finalize_grad_write"
-            if spec.algebra == AlgebraKind.commutative
-            else "recompute_fold_map_finalize_grad_write"
-        )
-        if backward_kind not in (None, expected_backward):
-            raise ValueError(f"invalid backward stage {backward_kind!r} for full fold")
-        return constructor(spec, _schedule(forward[0]), backward_schedule=backward_schedule)
-
-    expected_second = "fold" if spec.algebra == AlgebraKind.commutative else "scan"
-    if kinds != ("map_fold_partial", expected_second):
-        raise ValueError(f"unsupported persisted forward stage sequence: {kinds}")
-    if spec.algebra == AlgebraKind.commutative:
-        if backward_kind not in (None, "recompute_map_finalize_grad_write"):
-            raise ValueError(f"invalid backward stage {backward_kind!r} for commutative fold")
-        return commutative_partial_fold_plan(
-            spec,
-            _schedule(forward[0]),
-            _schedule(forward[1]),
-            backward_schedule=backward_schedule,
-        )
-
-    checkpointed = backward_kind == "recompute_prefix_fold_map_finalize_grad_write"
-    if backward_kind not in (
-        None,
-        "recompute_fold_map_finalize_grad_write",
-        "recompute_prefix_fold_map_finalize_grad_write",
-    ):
-        raise ValueError(f"invalid backward stage {backward_kind!r} for general fold")
-    return general_partial_fold_plan(
-        spec,
-        _schedule(forward[0]),
-        _schedule(forward[1]),
-        backward_schedule=backward_schedule,
-        checkpointed_backward=checkpointed,
-    )
-
-
-def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
-    from cutilereduce.stages.embed import Embed
-
-    plan = _fold_plan_from_record(spec, record)
-    if plan.backward:
-        embed = Embed(spec, _schedule(record["backward"][0])).build()
-        plan = FoldPlan.make(spec, plan.forward, (embed, plan.backward[1]))
+    matches = tuple(path for cls in FORWARD_RECORD_TYPES
+                    if (path := cls.from_record(spec, forward)) is not None)
+    if len(matches) != 1:
+        raise ValueError(f"unsupported persisted forward stage sequence: {tuple(s['kind'] for s in forward)}")
+    forward_path, = matches
+    if backward:
+        matches = tuple(path for cls in BACKWARD_RECORD_TYPES
+                        if (path := cls.from_record(spec, backward)) is not None)
+        if len(matches) != 1:
+            raise ValueError(f"unsupported persisted backward stage sequence: {tuple(s['kind'] for s in backward)}")
+        backward_path, = matches
+    else:
+        backward_path = None
+    template = FoldPlanTemplate(spec, forward_path, backward_path)
+    values = {}
+    for symbolic, saved in zip(template.stages, (*forward, *backward), strict=True):
+        if symbolic.stage.name != saved["kind"]:
+            raise ValueError(f"persisted stage {saved['kind']!r} does not match plan topology")
+        _schedule(saved)  # Validate the recorded axes and integer values.
+        for axis in symbolic.domain.compute_axes:
+            key = _axis_key(axis.id)
+            for symbolic_value, persisted in (
+                (axis.extent, saved["extents"][key]),
+                (axis.tile, saved["tiles"][key]),
+            ):
+                if isinstance(symbolic_value, sympy.Symbol):
+                    values[str(symbolic_value)] = _integer(persisted, "schedule value")
+        for axis in symbolic.domain.program_axes:
+            if isinstance(axis.programs, sympy.Symbol):
+                values[str(axis.programs)] = _integer(
+                    saved["programs"].get(_axis_key(axis.id), 1), "program count",
+                )
+    if backward_path is not None and backward_path.name == "commutative":
+        values.setdefault("backward_group_count", 1)
+    plan = template.bind(values)
+    if [ _stage_record(stage) for stage in plan.forward ] != forward or [
+        _stage_record(stage) for stage in plan.backward
+    ] != backward:
+        raise ValueError("persisted stage schedules do not match the reconstructed plan")
     return plan
 
 
-def load_fold_plan(spec: FoldSpec, path) -> FoldPlan:
-    return fold_plan_from_record(spec, json.loads(Path(path).read_text()))
+def load_fold_plan(spec: FoldSpec, path, sizes=None) -> FoldPlan:
+    plan = fold_plan_from_record(spec, json.loads(Path(path).read_text()))
+    if sizes is not None:
+        expected = {spec.axis_id(name): size for name, size in sizes.items()}
+        for stage in (*plan.forward, *plan.backward):
+            for axis in stage.domain.compute_axes:
+                if axis.id in expected and axis.extent != expected[axis.id]:
+                    raise ValueError(
+                        f"persisted extent for {axis.name!r} is {axis.extent}, "
+                        f"but the requested size is {expected[axis.id]}"
+                    )
+    return plan
 
 
 __all__ = [

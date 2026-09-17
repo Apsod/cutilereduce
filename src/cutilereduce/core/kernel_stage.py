@@ -220,7 +220,10 @@ class KernelStageCost:
 
     @property
     def resident_programs_per_sm(self):
-        return Min(MAX_PROGRAMS_PER_SM, floor(SMEM_PER_SM / Max(1, self.residency_bytes)))
+        capacity = floor(SMEM_PER_SM / Max(1, self.residency_bytes))
+        # SymPy can prematurely reduce Min to MAX_PROGRAMS_PER_SM when the
+        # symbolic residency expression has several positive tile terms.
+        return Piecewise((MAX_PROGRAMS_PER_SM, MAX_PROGRAMS_PER_SM <= capacity), (capacity, True))
 
     @property
     def active_programs(self):

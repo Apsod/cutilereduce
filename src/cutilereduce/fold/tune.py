@@ -104,9 +104,37 @@ def tune_fold_stages(stages, functions, *, timeout=0, quiet=False):
     return {measurement.config: measurement.mean_us for measurement in result.successes}
 
 
+def tune_fold_plan(
+        spec, functions, sizes, candidate_count=20, timeout=0, *, hardware,
+        backward=True, max_tile=128, max_partition_count=4,
+        max_storage_ratio=4.0, quiet=False,
+        ):
+    """Search and benchmark concrete instances of the plan paths."""
+    from cutilereduce.fold.plan import AlgebraKind
+
+    if spec.algebra == AlgebraKind.commutative:
+        from cutilereduce.fold.commutative.tune import tune_commutative_fold_plan
+        return tune_commutative_fold_plan(
+            spec, sizes, candidate_count, timeout, functions=functions,
+            hardware=hardware, max_storage_ratio=max_storage_ratio,
+            quiet_tuning=quiet, backward=backward,
+        )
+    if spec.algebra == AlgebraKind.general:
+        from cutilereduce.fold.general.tune import tune_general_fold_plan
+        return tune_general_fold_plan(
+            spec, sizes, candidate_count, timeout, functions=functions,
+            hardware=hardware, max_tile=max_tile,
+            max_partition_count=max_partition_count,
+            max_storage_ratio=max_storage_ratio,
+            quiet_tuning=quiet, backward=backward,
+        )
+    raise ValueError(f"unsupported fold algebra: {spec.algebra}")
+
+
 __all__ = [
     "empirical_model_flops_utilization",
     "format_stage_timing",
     "stage_key",
     "tune_fold_stages",
+    "tune_fold_plan",
 ]

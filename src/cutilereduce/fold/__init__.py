@@ -29,8 +29,27 @@ from .impl import (
     fold_functions,
     mk_fold_autograd,
     mk_fold_forward,
+    build_fold,
 )
-from .operator import FoldOperator
+from .tune import tune_fold_plan
+from .templates import (
+    FoldPlanTemplate,
+    backward_plan_templates,
+    forward_plan_templates,
+    joint_plan_templates,
+    compose_plans,
+    plan_fold,
+)
+from .paths import (
+    FullForwardPlan,
+    CommutativePartialForwardPlan,
+    GeneralPartialForwardPlan,
+    CommutativeBackwardPlan,
+    GeneralFullBackwardPlan,
+    GeneralCheckpointedBackwardPlan,
+    forward_plans,
+    backward_plans,
+)
 from .persistence import (
     fold_plan_from_record,
     load_fold_plan,
@@ -61,7 +80,22 @@ __all__ = [
     "CompiledStage",
     "FoldForwardEstimate",
     "FoldPlan",
-    "FoldOperator",
+    "FoldPlanTemplate",
+    "FullForwardPlan",
+    "CommutativePartialForwardPlan",
+    "GeneralPartialForwardPlan",
+    "CommutativeBackwardPlan",
+    "GeneralFullBackwardPlan",
+    "GeneralCheckpointedBackwardPlan",
+    "forward_plans",
+    "backward_plans",
+    "build_fold",
+    "plan_fold",
+    "tune_fold_plan",
+    "forward_plan_templates",
+    "backward_plan_templates",
+    "joint_plan_templates",
+    "compose_plans",
     "FoldSchedule",
     "FoldSpec",
     "FoldStage",

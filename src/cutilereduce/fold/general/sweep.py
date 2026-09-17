@@ -11,14 +11,8 @@ import sympy
 from cutilereduce.core.axis import Axis, AxisId, axis_id
 from cutilereduce.core.sweep import Sweep
 from cutilereduce.fold.plan import FoldSpec, StageSchedule
-from cutilereduce.stages import MapFold, MapFoldPartial, Scan, normalize_axis_mapping
+from cutilereduce.stages import normalize_axis_mapping
 
-from .plan import (
-    full_fold_plan,
-    full_recompute_backward_stage,
-    partial_fold_plan,
-    prefix_recompute_backward_stage,
-)
 
 
 @dataclass(frozen=True)
@@ -70,7 +64,7 @@ def _symbols(spec) -> GeneralFoldSweepSymbols:
             for axis in _map_axes(spec)
         },
         scan_tiles={
-            axis.id: sympy.Symbol(f"scan_{axis.name}_tile")
+            axis.id: sympy.Symbol(f"combine_{axis.name}_tile")
             for axis in spec.batch
         },
         backward_tiles={
@@ -83,45 +77,6 @@ def _symbols(spec) -> GeneralFoldSweepSymbols:
 def _extents(spec, sizes, extra=None):
     return MappingProxyType(
         {axis.id: sizes[axis.id] for axis in spec.axes} | dict(extra or {})
-    )
-
-
-def _map_schedule(spec, sizes, symbols, *, partial):
-    tile = symbols.partial_tile if partial else symbols.full_tile
-    partition_axis = spec.fold.partition_axis
-    return StageSchedule(
-        extents=_extents(spec, sizes),
-        tiles=MappingProxyType({
-            axis.id: tile(axis)
-            if axis in _map_axes(spec)
-            else sizes[axis.id]
-            for axis in spec.axes
-        }),
-        programs=MappingProxyType(
-            {partition_axis.id: symbols.partition_count} if partial else {}
-        ),
-        loop=spec.fold.id,
-    )
-
-
-def _scan_schedule(spec, sizes, symbols):
-    partition_axis = spec.fold.partition_axis
-    return StageSchedule(
-        extents=_extents(spec, sizes, {partition_axis.id: symbols.partition_count}),
-        tiles=MappingProxyType({
-            **{
-                axis.id: symbols.scan_tile(axis)
-                for axis in spec.batch
-            },
-            **{
-                axis.id: sizes[axis.id]
-                for axis in spec.axes
-                if axis not in spec.batch and axis != spec.fold
-            },
-            partition_axis.id: 1,
-        }),
-        programs=MappingProxyType({partition_axis.id: 1}),
-        loop=partition_axis.id,
     )
 
 
@@ -156,8 +111,11 @@ def sweep_general_fold(
         sizes,
         max_tile,
     ).with_columns(pl.lit(1, dtype=pl.Int64).alias(count_name))
-    full_stage = MapFold(spec, _map_schedule(spec, sizes, symbols, partial=False)).build()
-    full = sweep.apply(full_stage.stage, full_configs, symbols=hardware)
+    from cutilereduce.fold.paths import FullForwardPlan, GeneralPartialForwardPlan, sizes_for
+
+    size_values = {symbol: sizes[axis_id] for axis_id, symbol in sizes_for(spec).items()}
+    full_stage = FullForwardPlan(spec).stages[0]
+    full = sweep.apply(full_stage.stage, full_configs, symbols=dict(hardware) | size_values)
     if not full.is_empty():
         full = full.with_columns(
             pl.lit("full").alias("path"),
@@ -172,16 +130,17 @@ def sweep_general_fold(
         tuple(f"cfg:{symbols.partial_tile(axis)}" for axis in map_axes),
         sizes,
         max_tile,
-    ).join(counts, how="cross")
-    partial = MapFoldPartial.make(
-        spec,
-        _map_schedule(spec, sizes, symbols, partial=True),
+    ).join(counts, how="cross").filter(
+        pl.col(count_name)
+        <= (sizes[spec.fold.id] + pl.col(f"cfg:{symbols.partial_tile(spec.fold)}") - 1)
+        // pl.col(f"cfg:{symbols.partial_tile(spec.fold)}")
     )
+    partial_stage, scan_stage = GeneralPartialForwardPlan(spec).stages
     partial_frontier = sweep.add_filters(
         pl.col("partial_storage_ratio") <= max_storage_ratio,
     ).with_frontier_keys(count_name)
     mapped = partial_frontier.apply(
-        partial.build().stage, partial_configs, symbols=hardware,
+        partial_stage.stage, partial_configs, symbols=dict(hardware) | size_values,
     )
 
     scan_configs = _tile_configs(
@@ -190,17 +149,10 @@ def sweep_general_fold(
         sizes,
         max_tile,
     ).join(counts, how="cross")
-    scan = Scan.make(
-        spec,
-        _scan_schedule(spec, sizes, symbols),
-        scan_axis=spec.fold.partition_axis,
-        inputs=partial.partials,
-        outputs=spec.semantic,
-    ).build()
     # Scan reuses the materialized partial allocation; it does not make the
     # partition-count storage decision, so do not prune it by that ratio again.
     scanned = sweep.with_frontier_keys(count_name).apply(
-        scan.stage, scan_configs, symbols=hardware,
+        scan_stage.stage, scan_configs, symbols=dict(hardware) | size_values,
     )
 
     partial_frame = pl.DataFrame()
@@ -230,78 +182,24 @@ def _config_value(config, symbol):
 
 
 def general_fold_plan_from_config(spec, *, sizes, config):
+    from cutilereduce.fold.paths import forward_plans
+    from cutilereduce.fold.templates import FoldPlanTemplate
+
     sizes = _normalize_sizes(spec, sizes)
+    path = config["path"]
+    if path not in ("full", "partial"):
+        raise ValueError(f"unknown general fold path: {path!r}")
     symbols = _symbols(spec)
-    map_axes = set(axis.id for axis in _map_axes(spec))
-
-    def concrete_map_schedule(*, partial):
-        tile = symbols.partial_tile if partial else symbols.full_tile
-        partition_axis = spec.fold.partition_axis
-        count = _config_value(config, symbols.partition_count)
-        return StageSchedule(
-            extents=_extents(spec, sizes),
-            tiles=MappingProxyType({
-                axis.id: _config_value(config, tile(axis))
-                if axis.id in map_axes
-                else sizes[axis.id]
-                for axis in spec.axes
-            }),
-            programs=MappingProxyType(
-                {partition_axis.id: count} if partial else {}
-            ),
-            loop=spec.fold.id,
-        )
-
-    if config["path"] == "full":
-        return full_fold_plan(spec, concrete_map_schedule(partial=False))
-    if config["path"] != "partial":
-        raise ValueError(f"unknown general fold path: {config['path']!r}")
-
-    partition_axis = spec.fold.partition_axis
-    count = _config_value(config, symbols.partition_count)
-    scan_schedule = StageSchedule(
-        extents=_extents(spec, sizes, {partition_axis.id: count}),
-        tiles=MappingProxyType({
-            **{
-                axis.id: _config_value(config, symbols.scan_tile(axis))
-                for axis in spec.batch
-            },
-            **{
-                axis.id: sizes[axis.id]
-                for axis in spec.axes
-                if axis not in spec.batch and axis != spec.fold
-            },
-            partition_axis.id: 1,
-        }),
-        programs=MappingProxyType({partition_axis.id: 1}),
-        loop=partition_axis.id,
-    )
-    return partial_fold_plan(
-        spec,
-        concrete_map_schedule(partial=True),
-        scan_schedule,
-    )
-
-
-def _backward_schedule(spec, sizes, symbols, *, fold_tile=None, partition_count=None):
-    tile_axes = set(axis.id for axis in _map_axes(spec))
-    partition_axis = spec.fold.partition_axis
-    return StageSchedule(
-        extents=_extents(spec, sizes),
-        tiles=MappingProxyType({
-            axis.id: (
-                (
-                    symbols.backward_tile(axis)
-                    if fold_tile is None else fold_tile
-                ) if axis == spec.fold else symbols.backward_tile(axis)
-            ) if axis.id in tile_axes else sizes[axis.id]
-            for axis in spec.axes
-        }),
-        programs=MappingProxyType(
-            {} if partition_count is None else {partition_axis.id: partition_count}
-        ),
-        loop=spec.fold.id,
-    )
+    values = {axis.name.upper(): sizes[axis.id] for axis in spec.axes}
+    tile = symbols.full_tile if path == "full" else symbols.partial_tile
+    for axis in _map_axes(spec):
+        values[f"{path}_{axis.name}_tile"] = _config_value(config, tile(axis))
+    if path == "partial":
+        values["partition_count"] = _config_value(config, symbols.partition_count)
+        for axis in spec.batch:
+            values[f"combine_{axis.name}_tile"] = _config_value(config, symbols.scan_tile(axis))
+    forward = next(plan for plan in forward_plans(spec) if plan.name == path)
+    return FoldPlanTemplate(spec, forward).bind(values)
 
 
 def sweep_general_backward(
@@ -314,6 +212,9 @@ def sweep_general_backward(
         sweep=Sweep.default,
         ):
     sizes = _normalize_sizes(spec, sizes)
+    from cutilereduce.fold.paths import backward_plans, sizes_for, symbol
+
+    size_values = {sym: sizes[axis_id] for axis_id, sym in sizes_for(spec).items()}
     symbols = _symbols(spec)
     axes = _map_axes(spec)
     full_configs = _tile_configs(
@@ -322,10 +223,9 @@ def sweep_general_backward(
         sizes,
         max_tile,
     )
-    full = full_recompute_backward_stage(
-        spec, _backward_schedule(spec, sizes, symbols)
-    )
-    full_frame = sweep.apply(full.stage, full_configs, symbols=hardware)
+    full_path, checkpoint_path = backward_plans(spec)
+    full = full_path.stages[1]
+    full_frame = sweep.apply(full.stage, full_configs, symbols=dict(hardware) | size_values)
     frames = []
     if not full_frame.is_empty():
         frames.append(full_frame.with_columns(pl.lit("full_recompute").alias("backward_path")))
@@ -345,19 +245,12 @@ def sweep_general_backward(
                 f"cfg:{symbols.backward_tile(spec.fold)}"
             )
         )
-        prefix = prefix_recompute_backward_stage(
-            spec,
-            _backward_schedule(
-                spec,
-                sizes,
-                symbols,
-                fold_tile=int(fold_tile),
-                partition_count=int(partition_count),
-            ),
-            checkpoints=scan_stage.carriers,
-            partition_axis=partition_axis,
-        )
-        prefix_frame = sweep.apply(prefix.stage, batch_configs, symbols=hardware)
+        prefix = checkpoint_path.stages[1]
+        prefix_values = dict(hardware) | size_values | {
+            symbol(f"partial_{spec.fold.name}_tile"): int(fold_tile),
+            symbol("partition_count"): int(partition_count),
+        }
+        prefix_frame = sweep.apply(prefix.stage, batch_configs, symbols=prefix_values)
         if not prefix_frame.is_empty():
             frames.append(prefix_frame.with_columns(pl.lit("checkpointed").alias("backward_path")))
     if not frames:
@@ -366,6 +259,8 @@ def sweep_general_backward(
 
 
 def general_backward_stage_from_config(spec, *, sizes, forward_plan, config):
+    from cutilereduce.fold.paths import backward_plans
+
     sizes = _normalize_sizes(spec, sizes)
     symbols = _symbols(spec)
     tiles = {
@@ -379,7 +274,7 @@ def general_backward_stage_from_config(spec, *, sizes, forward_plan, config):
             extents=_extents(spec, sizes), tiles=MappingProxyType(tiles),
             programs=MappingProxyType({}), loop=spec.fold.id,
         )
-        return full_recompute_backward_stage(spec, schedule)
+        return backward_plans(spec)[0].finalize(schedule)
     if path != "checkpointed" or len(forward_plan.forward) <= 1:
         raise ValueError(f"invalid general backward path: {path!r}")
     partial_stage, scan_stage = forward_plan.forward
@@ -390,10 +285,7 @@ def general_backward_stage_from_config(spec, *, sizes, forward_plan, config):
         programs=MappingProxyType({partition_axis.id: partition_count}),
         loop=spec.fold.id,
     )
-    return prefix_recompute_backward_stage(
-        spec, schedule, checkpoints=scan_stage.carriers,
-        partition_axis=partition_axis,
-    )
+    return backward_plans(spec)[1].finalize(schedule, scan_stage.carriers)
 
 
 __all__ = [
