@@ -6,16 +6,24 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from functools import cached_property
 
-import sympy
+from cutilereduce.core import symbolic as expr
 
-from cutilereduce.core.sweep import DEFAULT_FUNCTIONS, DEFAULT_SYMBOLS
+from cutilereduce.core.sweep import DEFAULT_SYMBOLS
 from cutilereduce.core.variables import (
-    BANDWIDTH, MAX_PROGRAMS_PER_SM, PEAK_TENSOR_FLOPS, SM_COUNT, SMEM_PER_SM,
+    BANDWIDTH,
+    MAX_PROGRAMS_PER_SM,
+    PEAK_TENSOR_FLOPS,
+    SM_COUNT,
+    SMEM_PER_SM,
 )
 from cutilereduce.fold.paths import (
-    CommutativeBackwardPlan, CommutativePartialForwardPlan,
-    GeneralPartialForwardPlan, ForwardPath, BackwardPath,
-    backward_plans, forward_plans,
+    CommutativeBackwardPlan,
+    CommutativePartialForwardPlan,
+    GeneralPartialForwardPlan,
+    ForwardPath,
+    BackwardPath,
+    backward_plans,
+    forward_plans,
 )
 from cutilereduce.fold.plan import FoldPlan, FoldSpec
 from cutilereduce.stages import StageSchedule
@@ -24,7 +32,11 @@ from cutilereduce.fold.plan import AlgebraKind
 
 
 _COST_SYMBOLS = set(DEFAULT_SYMBOLS) | {
-    BANDWIDTH, MAX_PROGRAMS_PER_SM, PEAK_TENSOR_FLOPS, SM_COUNT, SMEM_PER_SM,
+    BANDWIDTH,
+    MAX_PROGRAMS_PER_SM,
+    PEAK_TENSOR_FLOPS,
+    SM_COUNT,
+    SMEM_PER_SM,
 }
 
 
@@ -34,7 +46,9 @@ def _normalize_values(spec: FoldSpec, values: Mapping):
     for key, value in values.items():
         name = str(key)
         if name in axis_names:
-            name = name.upper()
+            name = name
+        elif name.lower() in axis_names:
+            name = name.lower()
         if name in normalized and normalized[name] != value:
             raise ValueError(f"conflicting values for plan parameter {name!r}")
         normalized[name] = value
@@ -55,12 +69,20 @@ class FoldPlanTemplate:
         if self.backward_plan is not None:
             if self.backward_plan.spec != self.spec:
                 raise ValueError("backward path belongs to a different spec")
-            if self.forward_plan is not None and not self.backward_plan.compatible(self.forward_plan):
-                raise ValueError(f"{self.backward_plan.name} backward is incompatible with {self.forward_plan.name} forward")
+            if self.forward_plan is not None and not self.backward_plan.compatible(
+                self.forward_plan
+            ):
+                raise ValueError(
+                    f"{self.backward_plan.name} backward is incompatible with {self.forward_plan.name} forward"
+                )
 
     @property
     def name(self):
-        return "+".join(path.name for path in (self.forward_plan, self.backward_plan) if path is not None)
+        return "+".join(
+            path.name
+            for path in (self.forward_plan, self.backward_plan)
+            if path is not None
+        )
 
     @property
     def forward(self):
@@ -94,24 +116,55 @@ class FoldPlanTemplate:
     def parameters(self):
         symbols = set(self.estimated_time.free_symbols)
         for stage in self.stages:
-            for axis in stage.domain.compute_axes:
-                for value in (axis.extent, axis.tile):
-                    symbols.update(getattr(value, "free_symbols", ()))
-            for axis in stage.domain.program_axes:
-                symbols.update(getattr(axis.programs, "free_symbols", ()))
-        return {str(symbol): symbol for symbol in symbols if symbol not in _COST_SYMBOLS}
+            symbols.update(stage.domain.parameters.values())
+        return {
+            str(symbol): symbol for symbol in symbols if symbol not in _COST_SYMBOLS
+            and not str(symbol).endswith(
+                (
+                    "_num_tiles",
+                    "_tiles_per_program",
+                    "_span_tiles",
+                    "_span",
+                    "_resident_programs_per_sm",
+                )
+            )
+        }
 
-    def evaluate(self, values: Mapping | None = None, *, hardware: Mapping | None = None):
+    def evaluate(
+        self, values: Mapping | None = None, *, hardware: Mapping | None = None
+    ):
         """Substitute known values, leaving all other parameters symbolic."""
         expression = self.estimated_time
-        for function, replacement in DEFAULT_FUNCTIONS.items():
-            expression = expression.replace(function, replacement)
         substitutions = DEFAULT_SYMBOLS | dict(hardware or {})
-        substitutions.update({
-            self.parameters.get(name, sympy.Symbol(name)): value
-            for name, value in _normalize_values(self.spec, values or {}).items()
-        })
+        substitutions.update(
+            {
+                self.parameters.get(name, expr.Symbol(name)): value
+                for name, value in _normalize_values(self.spec, values or {}).items()
+            }
+        )
+        for stage in self.stages:
+            substitutions.update(stage.stage.cost.derived_measure_substitutions(substitutions))
         return expression.subs(substitutions)
+
+    def evaluate_sizes(
+        self,
+        sizes: Mapping,
+        *,
+        hardware: Mapping | None = None,
+    ):
+        """Evaluate a template after fixing every logical spec extent."""
+        normalized = _normalize_values(self.spec, sizes)
+        expected = {axis.name for axis in self.spec.axes}
+        if set(normalized) != expected:
+            missing = sorted(expected - set(normalized))
+            unknown = sorted(set(normalized) - expected)
+            detail = []
+            if missing:
+                detail.append(f"missing sizes: {missing}")
+            if unknown:
+                detail.append(f"unknown sizes: {unknown}")
+            raise ValueError("invalid holistic sizes (" + "; ".join(detail) + ")")
+        return self.evaluate(normalized, hardware=hardware)
 
     def bind(self, values: Mapping) -> FoldPlan:
         """Lower fully specified paths to an executable plan."""
@@ -122,42 +175,84 @@ class FoldPlanTemplate:
         missing = required - supplied.keys()
         if missing:
             raise ValueError(f"missing plan parameters: {sorted(missing)}")
-        if any(type(supplied[name]) is not int or supplied[name] <= 0 for name in required):
-            raise ValueError("plan sizes, tiles, and program counts must be positive integers")
-        if isinstance(self.forward_plan, (CommutativePartialForwardPlan, GeneralPartialForwardPlan)):
+        if any(
+            type(supplied[name]) is not int or supplied[name] <= 0 for name in required
+        ):
+            raise ValueError(
+                "plan sizes, tiles, and program counts must be positive integers"
+            )
+        if isinstance(
+            self.forward_plan,
+            (CommutativePartialForwardPlan, GeneralPartialForwardPlan),
+        ):
             if supplied["partition_count"] < 2:
                 raise ValueError("partial plans require at least two partitions")
             fold_tile = supplied[f"partial_{self.spec.fold.name}_tile"]
-            fold_extent = supplied[self.spec.fold.name.upper()]
+            fold_extent = supplied[self.spec.fold.name]
             if supplied["partition_count"] > (fold_extent + fold_tile - 1) // fold_tile:
                 raise ValueError("partition count exceeds fold tile count")
         if isinstance(self.backward_plan, CommutativeBackwardPlan):
             loop = self.backward_plan.loop_axis.name
-            if supplied["backward_group_count"] > (
-                supplied[loop.upper()] + supplied[f"backward_{loop}_tile"] - 1
-            ) // supplied[f"backward_{loop}_tile"]:
+            if (
+                supplied["backward_group_count"]
+                > (supplied[loop] + supplied[f"backward_{loop}_tile"] - 1)
+                // supplied[f"backward_{loop}_tile"]
+            ):
                 raise ValueError("backward group count exceeds loop tile count")
 
         def concrete(value):
-            if isinstance(value, sympy.Expr):
-                value = value.subs({symbol: supplied[str(symbol)] for symbol in value.free_symbols})
+            if isinstance(value, expr.Expr):
+                value = value.subs(
+                    {symbol: supplied[str(symbol)] for symbol in value.free_symbols}
+                )
             return int(value)
 
         def bound_schedule(stage):
             domain = stage.domain
+            extents = {
+                axis.id: concrete(axis.extent) for axis in domain.compute_axes
+            }
+            tiles = {
+                axis.id: concrete(axis.tile) for axis in domain.compute_axes
+            }
+
+            def concrete_program(axis):
+                value = axis.programs
+                if isinstance(value, expr.Expr):
+                    names = {str(symbol) for symbol in value.free_symbols}
+                    derived = next(
+                        (name for name in names if name.endswith("_num_tiles")),
+                        None,
+                    )
+                    if derived is not None:
+                        source = domain.get(axis.source)
+                        return (extents[source.id] + tiles[source.id] - 1) // tiles[source.id]
+                return concrete(value)
+
             return StageSchedule(
-                extents={axis.id: concrete(axis.extent) for axis in domain.compute_axes},
-                tiles={axis.id: concrete(axis.tile) for axis in domain.compute_axes},
-                programs={axis.id: concrete(axis.programs) for axis in domain.program_axes},
+                extents=extents,
+                tiles=tiles,
+                programs={
+                    axis.id: concrete_program(axis) for axis in domain.program_axes
+                },
                 loop=domain.loop,
             )
 
-        forward = () if self.forward_plan is None else self.forward_plan.lower(
-            tuple(bound_schedule(stage) for stage in self.forward)
+        forward = (
+            ()
+            if self.forward_plan is None
+            else self.forward_plan.lower(
+                tuple(bound_schedule(stage) for stage in self.forward)
+            )
         )
-        backward = () if self.backward_plan is None else self.backward_plan.lower(
-            tuple(bound_schedule(stage) for stage in self.backward),
-            self.forward_plan, forward,
+        backward = (
+            ()
+            if self.backward_plan is None
+            else self.backward_plan.lower(
+                tuple(bound_schedule(stage) for stage in self.backward),
+                self.forward_plan,
+                forward,
+            )
         )
         return FoldPlan.make(self.spec, forward, backward)
 
@@ -185,10 +280,20 @@ def joint_plan_templates(spec: FoldSpec):
 
 
 def plan_fold(
-        spec, sizes, *, path="full", tiles, partitions=1, combine_tiles=None,
-        backward=True, backward_tiles=None, backward_loop=None,
-        backward_groups=1, embed_tiles=None, checkpointed_backward=False,
-        ):
+    spec,
+    sizes,
+    *,
+    path="full",
+    tiles,
+    partitions=1,
+    combine_tiles=None,
+    backward=True,
+    backward_tiles=None,
+    backward_loop=None,
+    backward_groups=1,
+    embed_tiles=None,
+    checkpointed_backward=False,
+):
     """Convenience lowering for one selected path and concrete tile mapping."""
     if path not in ("full", "partial"):
         raise ValueError(f"unknown fold path: {path!r}")
@@ -206,24 +311,30 @@ def plan_fold(
             loop_name = loop if isinstance(loop, str) else loop.name
             backward_kind = "commutative"
         else:
-            if backward_loop is not None and backward_loop not in (spec.fold, spec.fold.name):
+            if backward_loop is not None and backward_loop not in (
+                spec.fold,
+                spec.fold.name,
+            ):
                 raise ValueError("general backward plans loop over the fold axis")
-            backward_kind = "checkpointed" if checkpointed_backward else "full_recompute"
+            backward_kind = (
+                "checkpointed" if checkpointed_backward else "full_recompute"
+            )
     else:
         backward_kind = None
     forward_path = next(plan for plan in forward_plans(spec) if plan.name == path)
     if backward_kind is None:
         backward_path = None
     else:
-        backward_path = next((plan for plan in backward_plans(spec)
-                              if plan.name == backward_kind), None)
+        backward_path = next(
+            (plan for plan in backward_plans(spec) if plan.name == backward_kind), None
+        )
         if backward_path is None:
             raise ValueError(f"unsupported backward path: {backward_kind}")
         if backward_kind == "commutative":
             backward_path = backward_path.with_loop(loop_name)
     template = FoldPlanTemplate(spec, forward_path, backward_path)
     params = template.parameters
-    values = {axis.name.upper(): sizes[axis.name] for axis in spec.axes}
+    values = {axis.name: sizes[axis.name] for axis in spec.axes}
     forward_tiles = dict(tiles)
     backward_tiles = dict(backward_tiles or tiles)
     combine_tiles = dict(combine_tiles or {})
@@ -231,7 +342,8 @@ def plan_fold(
     for axis in spec.axes:
         name = axis.name
         for prefix, mapping in (
-            ("full", forward_tiles), ("partial", forward_tiles),
+            ("full", forward_tiles),
+            ("partial", forward_tiles),
             ("backward", backward_tiles),
         ):
             key = f"{prefix}_{name}_tile"
@@ -257,6 +369,10 @@ def plan_fold(
 
 
 __all__ = [
-    "FoldPlanTemplate", "forward_plan_templates", "backward_plan_templates",
-    "joint_plan_templates", "compose_plans", "plan_fold",
+    "FoldPlanTemplate",
+    "forward_plan_templates",
+    "backward_plan_templates",
+    "joint_plan_templates",
+    "compose_plans",
+    "plan_fold",
 ]

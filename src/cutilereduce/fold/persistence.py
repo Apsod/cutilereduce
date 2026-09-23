@@ -5,7 +5,7 @@ from importlib.metadata import PackageNotFoundError, version
 from pathlib import Path
 
 import cuda.tile as ct
-import sympy
+from cutilereduce.core import symbolic as expr
 
 from cutilereduce.core.axis import AxisId, AxisType
 from cutilereduce.fold.plan import FoldPlan, FoldSpec
@@ -30,7 +30,9 @@ def _axis_from_key(value: str) -> AxisId:
 
 def _integer(value, field: str) -> int:
     if type(value) is not int:
-        raise ValueError(f"persisted plans require resolved integer {field}, got {value!r}")
+        raise ValueError(
+            f"persisted plans require resolved integer {field}, got {value!r}"
+        )
     return value
 
 
@@ -90,9 +92,17 @@ def _schedule(record: dict) -> StageSchedule:
     if missing:
         raise ValueError(f"persisted stage is missing fields: {sorted(missing)}")
     return StageSchedule(
-        extents={_axis_from_key(k): _integer(v, "extent") for k, v in record["extents"].items()},
-        tiles={_axis_from_key(k): _integer(v, "tile") for k, v in record["tiles"].items()},
-        programs={_axis_from_key(k): _integer(v, "program count") for k, v in record["programs"].items()},
+        extents={
+            _axis_from_key(k): _integer(v, "extent")
+            for k, v in record["extents"].items()
+        },
+        tiles={
+            _axis_from_key(k): _integer(v, "tile") for k, v in record["tiles"].items()
+        },
+        programs={
+            _axis_from_key(k): _integer(v, "program count")
+            for k, v in record["programs"].items()
+        },
         loop=None if record["loop"] is None else _axis_from_key(record["loop"]),
     )
 
@@ -122,24 +132,36 @@ def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
     backward = record.get("backward")
     if not isinstance(forward, list) or not isinstance(backward, list):
         raise ValueError("persisted forward/backward stages must be lists")
-    matches = tuple(path for cls in FORWARD_RECORD_TYPES
-                    if (path := cls.from_record(spec, forward)) is not None)
+    matches = tuple(
+        path
+        for cls in FORWARD_RECORD_TYPES
+        if (path := cls.from_record(spec, forward)) is not None
+    )
     if len(matches) != 1:
-        raise ValueError(f"unsupported persisted forward stage sequence: {tuple(s['kind'] for s in forward)}")
-    forward_path, = matches
+        raise ValueError(
+            f"unsupported persisted forward stage sequence: {tuple(s['kind'] for s in forward)}"
+        )
+    (forward_path,) = matches
     if backward:
-        matches = tuple(path for cls in BACKWARD_RECORD_TYPES
-                        if (path := cls.from_record(spec, backward)) is not None)
+        matches = tuple(
+            path
+            for cls in BACKWARD_RECORD_TYPES
+            if (path := cls.from_record(spec, backward)) is not None
+        )
         if len(matches) != 1:
-            raise ValueError(f"unsupported persisted backward stage sequence: {tuple(s['kind'] for s in backward)}")
-        backward_path, = matches
+            raise ValueError(
+                f"unsupported persisted backward stage sequence: {tuple(s['kind'] for s in backward)}"
+            )
+        (backward_path,) = matches
     else:
         backward_path = None
     template = FoldPlanTemplate(spec, forward_path, backward_path)
     values = {}
     for symbolic, saved in zip(template.stages, (*forward, *backward), strict=True):
         if symbolic.stage.name != saved["kind"]:
-            raise ValueError(f"persisted stage {saved['kind']!r} does not match plan topology")
+            raise ValueError(
+                f"persisted stage {saved['kind']!r} does not match plan topology"
+            )
         _schedule(saved)  # Validate the recorded axes and integer values.
         for axis in symbolic.domain.compute_axes:
             key = _axis_key(axis.id)
@@ -147,20 +169,23 @@ def fold_plan_from_record(spec: FoldSpec, record: dict) -> FoldPlan:
                 (axis.extent, saved["extents"][key]),
                 (axis.tile, saved["tiles"][key]),
             ):
-                if isinstance(symbolic_value, sympy.Symbol):
+                if expr.is_symbol(symbolic_value):
                     values[str(symbolic_value)] = _integer(persisted, "schedule value")
         for axis in symbolic.domain.program_axes:
-            if isinstance(axis.programs, sympy.Symbol):
+            if expr.is_symbol(axis.programs):
                 values[str(axis.programs)] = _integer(
-                    saved["programs"].get(_axis_key(axis.id), 1), "program count",
+                    saved["programs"].get(_axis_key(axis.id), 1),
+                    "program count",
                 )
     if backward_path is not None and backward_path.name == "commutative":
         values.setdefault("backward_group_count", 1)
     plan = template.bind(values)
-    if [ _stage_record(stage) for stage in plan.forward ] != forward or [
+    if [_stage_record(stage) for stage in plan.forward] != forward or [
         _stage_record(stage) for stage in plan.backward
     ] != backward:
-        raise ValueError("persisted stage schedules do not match the reconstructed plan")
+        raise ValueError(
+            "persisted stage schedules do not match the reconstructed plan"
+        )
     return plan
 
 

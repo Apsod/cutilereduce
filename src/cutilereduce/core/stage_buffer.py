@@ -9,6 +9,8 @@ from .axis import AxisId
 from .buffer import Buffer, BufferBundle, BufferId, ShapeData
 from .stage_domain import ComputeAxis, ProgramAxis, StageDomain, StageAxes
 from .utilities import TupleSet, forward, prod
+from .measure import Measure
+from . import symbolic as expr
 
 import torch
 
@@ -145,6 +147,21 @@ class StageBuffer:
     def accessed_bytes(self):
         return self.accessed_elems * self.bytes_per_elem
 
+    def measure(self, measure: Measure):
+        """Return the symbolic expression for a buffer storage measure."""
+        if measure not in (Measure.extent, Measure.tile, Measure.span, Measure.programs):
+            raise ValueError(measure)
+        result = self.bytes_per_elem
+        for axis in self.storage_axes:
+            if isinstance(axis, ComputeAxis):
+                value = self.domain.measure(axis.id, measure)
+            elif measure is Measure.programs:
+                value = axis.programs
+            else:
+                value = 1
+            result = result * value
+        return expr.sympify(result)
+
     @property
     def residual_multiplicity(self):
         absent = self.absent_axes.ids
@@ -169,17 +186,17 @@ class StageBuffer:
 
     def storage_tile_extent(self, axis: ComputeAxis | ProgramAxis):
         if isinstance(axis, ComputeAxis):
-            return axis.tile
+            return self.domain.measure(axis.id, Measure.tile)
         return 1
 
     def storage_num_tiles(self, axis: ComputeAxis | ProgramAxis):
         if isinstance(axis, ComputeAxis):
-            return axis.num_tiles
+            return self.domain.measure(axis.id, Measure.num_tiles)
         return axis.programs
 
     def storage_span_extent(self, axis: ComputeAxis | ProgramAxis):
         if isinstance(axis, ComputeAxis):
-            return self.domain.max_span(axis)
+            return self.domain.measure(axis.id, Measure.span)
         return 1
 
     @property

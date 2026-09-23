@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
-import sympy
+from cutilereduce.core import symbolic as expr
 
 from cutilereduce.core.kernel_stage import KernelStageCost
 from cutilereduce.fold.plan import FoldPlan, FoldStage
@@ -16,7 +16,7 @@ class FoldStageEstimate:
 
     def value(self, name: str, substitutions: Mapping[object, object] | None = None):
         value = getattr(self.cost, name)
-        if substitutions and isinstance(value, sympy.Expr):
+        if substitutions and isinstance(value, expr.Expr):
             return value.subs(dict(substitutions))
         return value
 
@@ -38,4 +38,6 @@ def estimate_fold_stage(stage: FoldStage) -> FoldStageEstimate:
 
 
 def estimate_fold_forward(plan: FoldPlan) -> FoldForwardEstimate:
-    return FoldForwardEstimate(stages=tuple(estimate_fold_stage(stage) for stage in plan.forward))
+    return FoldForwardEstimate(
+        stages=tuple(estimate_fold_stage(stage) for stage in plan.forward)
+    )

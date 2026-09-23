@@ -1,4 +1,4 @@
-from sympy import Function, Piecewise, Symbol
+from .symbolic import Piecewise, Symbol
 
 READ = Symbol("READ")
 WRITE = Symbol("WRITE")
@@ -13,10 +13,6 @@ SMEM_PER_SM = Symbol("SMEM_PER_SM")
 PIPELINE_EFFICIENCY = Symbol("PIPELINE_EFFICIENCY")
 ATOMIC_ADD = Symbol("ATOMIC_ADD")
 
-FWD_CONTENTION = Function("FWD_CONTENTION")
-BWD_CONTENTION = Function("BWD_CONTENTION")
-
-
 def normal_write(residual_multiplicity, active_multiplicity):
     return 1
 
@@ -24,8 +20,9 @@ def normal_write(residual_multiplicity, active_multiplicity):
 def atomic_add_write(residual_multiplicity, active_multiplicity):
     return Piecewise(
         (1, residual_multiplicity <= 1),
-        (ATOMIC_ADD + BWD_CONTENTION(active_multiplicity), True),
+        (ATOMIC_ADD, True),
     )
+
 
 __all__ = [
     "READ",
@@ -39,8 +36,6 @@ __all__ = [
     "SMEM_PER_SM",
     "PIPELINE_EFFICIENCY",
     "ATOMIC_ADD",
-    "FWD_CONTENTION",
-    "BWD_CONTENTION",
     "normal_write",
     "atomic_add_write",
 ]

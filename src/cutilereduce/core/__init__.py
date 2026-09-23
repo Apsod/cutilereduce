@@ -1,4 +1,14 @@
 from .axis import Axis, AxisId, AxisType, Axes, LogicalAxis, PartitionAxis, axis_id
+from . import symbolic as expr
+from .symbolic import (
+    CSEProgram,
+    Expr,
+    Reciprocal,
+    SaturateSub,
+    cse,
+)
+from .measure import Measure, MeasureRef
+from .poly import Exponents, Monomial, Polynomial, mono, polynomial_upper_bound
 from .buffer import (
     Buffer,
     BufferBundle,
@@ -35,7 +45,16 @@ from .stage_domain import (
     StageAxes,
     StageDomain,
 )
-from .sweep import StageEstimate, Sweep, chunked_evaluate_stage, evaluate_stage
+from .sweep import (
+    StageEstimate,
+    StageInstantiation,
+    Sweep,
+    bounded_tile_configs,
+    canonicalize_grouped_configs,
+    chunked_evaluate_stage,
+    evaluate_stage,
+    partition_configs_for_tiles,
+)
 from .typestuff import DType, to_torch_dtype
 from .variables import ATOMIC_ADD, PIPELINE_EFFICIENCY, atomic_add_write, normal_write
 from .work import MatMulWork, WorkModel, matmul, workmodel
@@ -78,17 +97,34 @@ __all__ = [
     "StageBuffer",
     "StageDomain",
     "StageEstimate",
+    "StageInstantiation",
     "Sweep",
+    "bounded_tile_configs",
+    "canonicalize_grouped_configs",
     "WRITE",
     "WorkModel",
     "ComputeAxis",
     "ComputeAxes",
+    "Expr",
+    "CSEProgram",
+    "expr",
+    "Measure",
+    "MeasureRef",
+    "Exponents",
+    "Monomial",
+    "Polynomial",
+    "mono",
+    "polynomial_upper_bound",
+    "Reciprocal",
+    "SaturateSub",
+    "cse",
     "axis_id",
     "atomic_add_write",
     "buffer_spec",
     "bundle_spec",
     "chunked_evaluate_stage",
     "evaluate_stage",
+    "partition_configs_for_tiles",
     "matmul",
     "normal_write",
     "to_torch_dtype",

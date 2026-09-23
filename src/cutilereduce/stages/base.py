@@ -5,12 +5,19 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Callable
 
-import sympy
+from cutilereduce.core import symbolic as expr
 
 from cutilereduce.core.axis import Axis, AxisId, axis_id
 from cutilereduce.core.buffer import BufferBundle
 from cutilereduce.core.kernel_stage import KernelStage
-from cutilereduce.core.stage_buffer import BufferStorage, KernelBuffers, READ, RESIDENT, WRITE, StageAccess
+from cutilereduce.core.stage_buffer import (
+    BufferStorage,
+    KernelBuffers,
+    READ,
+    RESIDENT,
+    WRITE,
+    StageAccess,
+)
 from cutilereduce.core.stage_domain import StageDomain
 
 
@@ -33,7 +40,9 @@ def resolve_axis_id(space, key: str | Axis | AxisId) -> AxisId:
             raise KeyError(f"unsupported axis key: {key!r}")
 
 
-def normalize_axis_mapping(space, mapping: Mapping[str | Axis | AxisId, Any]) -> dict[AxisId, Any]:
+def normalize_axis_mapping(
+    space, mapping: Mapping[str | Axis | AxisId, Any]
+) -> dict[AxisId, Any]:
     return {resolve_axis_id(space, k): v for k, v in mapping.items()}
 
 
@@ -46,19 +55,39 @@ class BufferUse:
     storage_axis_map: Mapping[AxisId, AxisId] = MappingProxyType({})
 
     @classmethod
-    def read(cls, bundle: BufferBundle, storage: BufferStorage = BufferStorage.Ordinary, **kwargs) -> BufferUse:
+    def read(
+        cls,
+        bundle: BufferBundle,
+        storage: BufferStorage = BufferStorage.Ordinary,
+        **kwargs,
+    ) -> BufferUse:
         return cls(bundle=bundle, access=READ, storage=storage, **kwargs)
 
     @classmethod
-    def write(cls, bundle: BufferBundle, storage: BufferStorage = BufferStorage.Ordinary, **kwargs) -> BufferUse:
+    def write(
+        cls,
+        bundle: BufferBundle,
+        storage: BufferStorage = BufferStorage.Ordinary,
+        **kwargs,
+    ) -> BufferUse:
         return cls(bundle=bundle, access=WRITE, storage=storage, **kwargs)
 
     @classmethod
-    def read_resident(cls, bundle: BufferBundle, storage: BufferStorage = BufferStorage.Ordinary, **kwargs) -> BufferUse:
+    def read_resident(
+        cls,
+        bundle: BufferBundle,
+        storage: BufferStorage = BufferStorage.Ordinary,
+        **kwargs,
+    ) -> BufferUse:
         return cls(bundle=bundle, access=READ | RESIDENT, storage=storage, **kwargs)
 
     @classmethod
-    def resident(cls, bundle: BufferBundle, storage: BufferStorage = BufferStorage.Intermediate, **kwargs) -> BufferUse:
+    def resident(
+        cls,
+        bundle: BufferBundle,
+        storage: BufferStorage = BufferStorage.Intermediate,
+        **kwargs,
+    ) -> BufferUse:
         return cls(bundle=bundle, access=RESIDENT, storage=storage, **kwargs)
 
     def bind(self, domain: StageDomain) -> KernelBuffers:
@@ -81,36 +110,40 @@ def bind_buffer_uses(domain: StageDomain, uses: tuple[BufferUse, ...]) -> Kernel
 
 @dataclass(frozen=True)
 class StageSchedule:
-    extents: Mapping[AxisId, int | sympy.Expr]
-    tiles: Mapping[AxisId, int | sympy.Expr]
-    programs: Mapping[AxisId, int | sympy.Expr]
+    extents: Mapping[AxisId, int | expr.Expr]
+    tiles: Mapping[AxisId, int | expr.Expr]
+    programs: Mapping[AxisId, int | expr.Expr]
     loop: AxisId | None = None
+    namespace: str = "stage"
 
     @classmethod
     def make(
-            cls,
-            space,
-            *,
-            extents: Mapping[str | Axis | AxisId, int | sympy.Expr],
-            tiles: Mapping[str | Axis | AxisId, int | sympy.Expr],
-            programs: Mapping[str | Axis | AxisId, int | sympy.Expr] | None = None,
-            loop: str | Axis | AxisId | None = None,
-            ) -> StageSchedule:
+        cls,
+        space,
+        *,
+        extents: Mapping[str | Axis | AxisId, int | expr.Expr],
+        tiles: Mapping[str | Axis | AxisId, int | expr.Expr],
+        programs: Mapping[str | Axis | AxisId, int | expr.Expr] | None = None,
+        loop: str | Axis | AxisId | None = None,
+        namespace: str = "stage",
+    ) -> StageSchedule:
         return cls(
             extents=MappingProxyType(normalize_axis_mapping(space, extents)),
             tiles=MappingProxyType(normalize_axis_mapping(space, tiles)),
             programs=MappingProxyType(normalize_axis_mapping(space, programs or {})),
             loop=None if loop is None else resolve_axis_id(space, loop),
+            namespace=namespace,
         )
 
-    def extent(self, axis: Axis) -> int | sympy.Expr:
-        return self.extents.get(axis.id, sympy.Symbol(axis.name.upper()))
+    def extent(self, axis: Axis) -> int | expr.Expr:
+        return expr.sympify(self.extents.get(axis.id, expr.Symbol(axis.name)))
 
-    def tile(self, axis: Axis) -> int | sympy.Expr:
-        return self.tiles.get(axis.id, sympy.Symbol(f"{axis.name}_tile"))
+    def tile(self, axis: Axis) -> int | expr.Expr | None:
+        value = self.tiles.get(axis.id)
+        return None if value is None else expr.sympify(value)
 
-    def program(self, axis: Axis, default=1) -> int | sympy.Expr:
-        return self.programs.get(axis.id, default)
+    def program(self, axis: Axis, default=1) -> int | expr.Expr:
+        return expr.sympify(self.programs.get(axis.id, default))
 
 
 @dataclass(frozen=True)
@@ -128,7 +161,9 @@ class BuiltStage:
 
     def compile(self, functions=None, **options):
         if self.compiler is None:
-            raise NotImplementedError(f"no compiler registered for stage {self.stage.name}")
+            raise NotImplementedError(
+                f"no compiler registered for stage {self.stage.name}"
+            )
         return self.compiler(self, functions, **options)
 
 

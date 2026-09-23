@@ -1,6 +1,7 @@
 import unittest
 
 from cutilereduce.core.sweep import DEFAULT_FUNCTIONS, DEFAULT_SYMBOLS, evaluate_stage
+from cutilereduce.core import expr
 from cutilereduce.fold import (
     backward_plan_templates,
     compose_plans,
@@ -54,11 +55,11 @@ class PlanTemplateTests(unittest.TestCase):
             template.estimated_time,
             template.forward_estimated_time + template.backward_estimated_time,
         )
-        self.assertIn("V", template.parameters)
+        self.assertIn("v", template.parameters)
         self.assertIn("full_v_tile", template.parameters)
         self.assertNotIn("BANDWIDTH", template.parameters)
         partially_bound = template.evaluate({"v": 128}, hardware=SPECMAP["rtx5080"])
-        self.assertNotIn("V", {str(symbol) for symbol in partially_bound.free_symbols})
+        self.assertNotIn("v", {str(symbol) for symbol in partially_bound.free_symbols})
         self.assertIn("full_v_tile", {str(symbol) for symbol in partially_bound.free_symbols})
 
         values = {
@@ -80,8 +81,15 @@ class PlanTemplateTests(unittest.TestCase):
     def test_partial_plan_constraints(self):
         spec = xentropy_spec()
         template = FoldPlanTemplate(spec, forward_plans(spec)[1])
+        partial_stage = template.forward[0]
+        self.assertIn("partition_count", template.parameters)
+        self.assertEqual(
+            partial_stage.domain.program_axis_for(spec.fold).programs,
+            expr.Symbol("partition_count"),
+        )
+        self.assertNotIn("partial_partition_count", template.parameters)
         values = {
-            "B": 32, "V": 128, "D": 64,
+            "b": 32, "v": 128, "d": 64,
             "partial_b_tile": 16, "partial_v_tile": 32,
             "combine_b_tile": 16, "partition_count": 2,
         }
@@ -125,7 +133,7 @@ class PlanTemplateTests(unittest.TestCase):
     def test_checkpointed_path_owns_carrier_and_persistence(self):
         spec = affine_attention_spec()
         template = compose_plans(forward_plans(spec)[1], backward_plans(spec)[1])
-        sizes = {"H": 1, "L": 33, "G": 2, "R": 65, "DQK": 32, "DV": 32, "DB": 16}
+        sizes = {"h": 1, "l": 33, "g": 2, "r": 65, "dqk": 32, "dv": 32, "db": 16}
         values = {
             key: sizes[key] if key in sizes else (
                 2 if key == "partition_count" else 32 if key == "partial_r_tile" else 1

@@ -10,7 +10,8 @@ from .typestuff import DType, to_torch_dtype
 from .utilities import TupleSet, prod, forward
 
 import cuda.tile as ct
-import sympy
+from . import symbolic as expr
+
 
 class BufferRole(Enum):
     Input = "input"
@@ -18,10 +19,12 @@ class BufferRole(Enum):
     InputGrad = "input_grad"
     OutputGrad = "output_grad"
 
+
 Input = BufferRole.Input
 Output = BufferRole.Output
 InputGrad = BufferRole.InputGrad
 OutputGrad = BufferRole.OutputGrad
+
 
 @dataclass(frozen=True, order=True)
 class Internal:
@@ -39,10 +42,10 @@ class BufferId:
     role: BufferRole | Internal
     name: str
 
-    def tag(self, tag: str): 
+    def tag(self, tag: str):
         assert isinstance(self.role, Internal)
-        return replace(self, role = self.role.tag(tag))
-    
+        return replace(self, role=self.role.tag(tag))
+
     @property
     def as_input_grad(self):
         assert self.role == BufferRole.Input
@@ -57,10 +60,11 @@ class BufferId:
     def as_grad(self):
         return self.as_input_grad
 
+
 @dataclass(frozen=True)
 class ShapeData:
     bytes_per_elem: Fraction
-    shape: tuple[int | sympy.Expr,...]
+    shape: tuple[int | expr.Expr, ...]
 
     @property
     def numel(self):
@@ -70,6 +74,7 @@ class ShapeData:
     def bytes(self):
         return self.numel * self.bytes_per_elem
 
+
 @dataclass(frozen=True)
 class Buffer:
     id: BufferId
@@ -78,7 +83,7 @@ class Buffer:
     req_grad: bool = False
     default: Any = None
 
-    role = forward('id', 'role')
+    role = forward("id", "role")
 
     def as_grad(self, dtype=ct.float32) -> Self:
         assert self.role == BufferRole.Input
@@ -101,12 +106,9 @@ class Buffer:
             default=0,
         )
 
-    def with_prefix_axes(self, group:str, axes: Axes) -> Self:
+    def with_prefix_axes(self, group: str, axes: Axes) -> Self:
         return replace(
-                self,
-                id=self.id.tag(group),
-                axes=axes | self.axes,
-                req_grad=False
+            self, id=self.id.tag(group), axes=axes | self.axes, req_grad=False
         )
 
     @property
@@ -120,22 +122,29 @@ class Buffer:
     @property
     def padding_mode(self):
         match self.default:
-            case 0: return ct.PaddingMode.ZERO                      # noqa: E701
-            case -0: return ct.PaddingMode.NEG_ZERO                 # noqa: E701
-            case float('inf'): return ct.PaddingMode.POS_INF        # noqa: E701
-            case float('-inf'): return ct.PaddingMode.NEG_INF       # noqa: E701
-            case _: return ct.PaddingMode.UNDETERMINED              # noqa: E701
+            case 0:
+                return ct.PaddingMode.ZERO  # noqa: E701
+            case -0:
+                return ct.PaddingMode.NEG_ZERO  # noqa: E701
+            case float("inf"):
+                return ct.PaddingMode.POS_INF  # noqa: E701
+            case float("-inf"):
+                return ct.PaddingMode.NEG_INF  # noqa: E701
+            case _:
+                return ct.PaddingMode.UNDETERMINED  # noqa: E701
+
 
 @dataclass(frozen=True, kw_only=True)
 class BufferBundle(TupleSet[Buffer]):
-
     def contention_axes(self, contribution_axes: Axes) -> Axes:
         """Axes whose independent contributions can target the same buffer."""
-        return Axes(values=tuple(
-            axis
-            for axis in contribution_axes
-            if any(axis not in buffer.axes for buffer in self)
-        ))
+        return Axes(
+            values=tuple(
+                axis
+                for axis in contribution_axes
+                if any(axis not in buffer.axes for buffer in self)
+            )
+        )
 
     def as_grad(self, dtype=ct.float32):
         assert all(b.role == Input for b in self)
@@ -161,13 +170,15 @@ class BufferBundle(TupleSet[Buffer]):
             case Buffer():
                 return x.id
             case _:
-                raise KeyError(f'{type(x)} not BufferId')
-    
+                raise KeyError(f"{type(x)} not BufferId")
+
     @property
     def buffers(self) -> tuple[Buffer, ...]:
         return self.values
 
+
 bundle_spec = BufferBundle.make
+
 
 @dataclass(frozen=True)
 class BufferSpec:
@@ -178,7 +189,9 @@ class BufferSpec:
 
     @classmethod
     def make(cls, axes: str, dtype: DType, req_grad=False, default=None):
-        return cls(axes=Axes.make(axes), dtype=dtype, req_grad=req_grad, default=default)
+        return cls(
+            axes=Axes.make(axes), dtype=dtype, req_grad=req_grad, default=default
+        )
 
     def bind(self, id: BufferId) -> Buffer:
         return Buffer(
@@ -188,5 +201,6 @@ class BufferSpec:
             req_grad=self.req_grad,
             default=self.default,
         )
+
 
 buffer_spec = BufferSpec.make

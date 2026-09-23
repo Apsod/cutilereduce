@@ -10,7 +10,7 @@ from cutilereduce.core.buffer import BufferBundle, BufferRole, Internal
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_buffer import BufferStorage
 from cutilereduce.core.stage_domain import ProgramAxis, ProgramAxes, StageDomain
-from cutilereduce.core.utilities import ceil_div
+from cutilereduce.core.measure import Measure
 from cutilereduce.core.variables import atomic_add_write
 from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.codegen import StageFunctions, make_buffer_helper, make_buffer_project, make_buffer_split, stage_grid_info
@@ -41,7 +41,13 @@ class RecomputeMapFinalizeGradWrite:
             ProgramAxis(
                 axis=a.axis,
                 source=a.id,
-                programs=self.schedule.program(a.axis, ceil_div(a.extent, a.tile)),
+                programs=self.schedule.program(
+                    a.axis,
+                    StageDomain.measure_symbol(
+                        "recompute_map_finalize_grad_write", a.axis, Measure.num_tiles,
+                        extent=a.extent, tile=a.tile,
+                    ),
+                ),
             )
             for a in compute_axes.outer
             if a.id != axis_id(loop_axis)
@@ -93,7 +99,9 @@ class RecomputeFoldMapFinalizeGradWrite:
             fold_extent=self.schedule.extent(self.spec.fold),
             fold_tile=self.schedule.tile(self.spec.fold),
         )
-        program_axes = batch_program_axes(self.schedule, compute_axes)
+        program_axes = batch_program_axes(
+            self.schedule, compute_axes, "recompute_fold_map_finalize_grad_write"
+        )
         domain = StageDomain(
             name="recompute_fold_map_finalize_grad_write",
             compute_axes=compute_axes,
@@ -137,7 +145,9 @@ class RecomputePrefixFoldMapFinalizeGradWrite:
             fold_extent=self.schedule.extent(self.spec.fold),
             fold_tile=self.schedule.tile(self.spec.fold),
         )
-        program_axes = batch_program_axes(self.schedule, compute_axes)
+        program_axes = batch_program_axes(
+            self.schedule, compute_axes, "recompute_prefix_fold_map_finalize_grad_write"
+        )
         program_axes.append(ProgramAxis(
             axis=self.prefix_axis,
             source=self.spec.fold.id,

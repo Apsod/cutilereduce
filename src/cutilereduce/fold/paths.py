@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import ClassVar
 
-import sympy
+from cutilereduce.core import symbolic as expr
 
 from cutilereduce.core.axis import Axes, LogicalAxis
 from cutilereduce.fold.plan import AlgebraKind, FoldSpec
@@ -20,34 +20,38 @@ from cutilereduce.stages.map_fold import MapFold, MapFoldPartial, partial_buffer
 
 
 def symbol(name):
-    return sympy.Symbol(name, integer=True, positive=True)
+    return expr.Symbol(name, integer=True, positive=True)
 
 
 def sizes_for(spec):
-    return {axis.id: symbol(axis.name.upper()) for axis in spec.axes}
+    return {axis.id: symbol(axis.name) for axis in spec.axes}
 
 
 def tiles_for(spec, prefix, sizes):
     return {
-        axis.id: symbol(f"{prefix}_{axis.name}_tile")
-        if axis in (*spec.batch, spec.fold) else sizes[axis.id]
+        axis.id: sizes[axis.id]
         for axis in spec.axes
+        if axis not in (*spec.batch, spec.fold)
     }
 
 
-def schedule(sizes, tiles, *, programs=None, loop=None, extra=None):
+def schedule(sizes, tiles, *, programs=None, loop=None, extra=None, namespace="stage"):
     return StageSchedule(
-        extents=sizes | (extra or {}), tiles=tiles,
-        programs=programs or {}, loop=loop,
+        extents=sizes | (extra or {}),
+        tiles=tiles,
+        programs=programs or {},
+        loop=loop,
+        namespace=namespace,
     )
 
 
 def symbolic_embed(spec, sizes):
     tiles = {
-        axis.id: symbol(f"embed_{axis.name}_tile") if axis in spec.batch else sizes[axis.id]
+        axis.id: sizes[axis.id]
         for axis in embed_axes(spec)
+        if axis not in spec.batch
     }
-    return Embed(spec, schedule(sizes, tiles)).build()
+    return Embed(spec, schedule(sizes, tiles, namespace="embed")).build()
 
 
 def stage_kinds(records):
@@ -71,6 +75,7 @@ class ForwardPath:
     @cached_property
     def template(self):
         from cutilereduce.fold.templates import FoldPlanTemplate
+
         return FoldPlanTemplate(self.spec, forward_plan=self)
 
     @property
@@ -87,6 +92,9 @@ class ForwardPath:
 
     def evaluate(self, values=None, *, hardware=None):
         return self.template.evaluate(values, hardware=hardware)
+
+    def evaluate_sizes(self, sizes, *, hardware=None):
+        return self.template.evaluate_sizes(sizes, hardware=hardware)
 
     def bind(self, values):
         return self.template.bind(values)
@@ -118,6 +126,7 @@ class BackwardPath:
     @cached_property
     def template(self):
         from cutilereduce.fold.templates import FoldPlanTemplate
+
         return FoldPlanTemplate(self.spec, backward_plan=self)
 
     @property
@@ -135,6 +144,9 @@ class BackwardPath:
     def evaluate(self, values=None, *, hardware=None):
         return self.template.evaluate(values, hardware=hardware)
 
+    def evaluate_sizes(self, sizes, *, hardware=None):
+        return self.template.evaluate_sizes(sizes, hardware=hardware)
+
 
 @dataclass(frozen=True)
 class FullForwardPlan(ForwardPath):
@@ -144,10 +156,15 @@ class FullForwardPlan(ForwardPath):
     @cached_property
     def stages(self):
         sizes = sizes_for(self.spec)
-        return (MapFold(
-            self.spec,
-            schedule(sizes, tiles_for(self.spec, "full", sizes), loop=self.spec.fold.id),
-        ).build(),)
+        return (
+            MapFold(
+                self.spec,
+                schedule(
+                    sizes, tiles_for(self.spec, "full", sizes), loop=self.spec.fold.id,
+                    namespace="full"
+                ),
+            ).build(),
+        )
 
     def lower(self, schedules):
         return (MapFold(self.spec, schedules[0]).build(),)
@@ -173,17 +190,25 @@ class _PartialForwardPlan(ForwardPath):
         partial = MapFoldPartial.make(
             self.spec,
             schedule(
-                sizes, tiles_for(self.spec, "partial", sizes),
-                programs={partition_axis.id: count}, loop=self.spec.fold.id,
+                sizes,
+                tiles_for(self.spec, "partial", sizes),
+                programs={partition_axis.id: count},
+                loop=self.spec.fold.id,
+                namespace="partial",
             ),
         )
         combine_tiles = {
-            axis.id: symbol(f"combine_{axis.name}_tile") if axis in self.spec.batch else sizes[axis.id]
-            for axis in self.spec.axes if axis != self.spec.fold
+            axis.id: sizes[axis.id]
+            for axis in self.spec.axes
+            if axis not in (*self.spec.batch, self.spec.fold)
         } | {partition_axis.id: 1}
         combine_schedule = schedule(
-            sizes, combine_tiles, programs={partition_axis.id: 1},
-            loop=partition_axis.id, extra={partition_axis.id: count},
+            sizes,
+            combine_tiles,
+            programs={partition_axis.id: 1},
+            loop=partition_axis.id,
+            extra={partition_axis.id: count},
+            namespace="combine",
         )
         return (partial.build(), self.combine(partial, combine_schedule))
 
@@ -196,31 +221,54 @@ class _PartialForwardPlan(ForwardPath):
 class CommutativePartialForwardPlan(_PartialForwardPlan):
     def combine(self, partial, combine_schedule):
         from cutilereduce.stages.fold import Fold
+
         return Fold(
-            self.spec, combine_schedule, partial.partition_axis, partial.partials,
+            self.spec,
+            combine_schedule,
+            partial.partition_axis,
+            partial.partials,
         ).build()
 
     @classmethod
     def from_record(cls, spec, records):
-        return cls(spec) if spec.algebra == AlgebraKind.commutative and stage_kinds(records) == (
-            "map_fold_partial", "fold",
-        ) else None
+        return (
+            cls(spec)
+            if spec.algebra == AlgebraKind.commutative
+            and stage_kinds(records)
+            == (
+                "map_fold_partial",
+                "fold",
+            )
+            else None
+        )
 
 
 @dataclass(frozen=True)
 class GeneralPartialForwardPlan(_PartialForwardPlan):
     def combine(self, partial, combine_schedule):
         from cutilereduce.stages.scan import Scan
+
         return Scan.make(
-            self.spec, combine_schedule, scan_axis=partial.partition_axis,
-            inputs=partial.partials, outputs=self.spec.semantic, exclusive=True,
+            self.spec,
+            combine_schedule,
+            scan_axis=partial.partition_axis,
+            inputs=partial.partials,
+            outputs=self.spec.semantic,
+            exclusive=True,
         ).build()
 
     @classmethod
     def from_record(cls, spec, records):
-        return cls(spec) if spec.algebra == AlgebraKind.general and stage_kinds(records) == (
-            "map_fold_partial", "scan",
-        ) else None
+        return (
+            cls(spec)
+            if spec.algebra == AlgebraKind.general
+            and stage_kinds(records)
+            == (
+                "map_fold_partial",
+                "scan",
+            )
+            else None
+        )
 
 
 @dataclass(frozen=True)
@@ -238,8 +286,14 @@ class CommutativeBackwardPlan(BackwardPath):
         return tuple(self.spec.grad_storage.contention_axes(axes))
 
     def with_loop(self, axis):
-        selected = next((candidate for candidate in self.loop_axes
-                         if candidate == axis or candidate.name == axis), None)
+        selected = next(
+            (
+                candidate
+                for candidate in self.loop_axes
+                if candidate == axis or candidate.name == axis
+            ),
+            None,
+        )
         if selected is None:
             raise ValueError(f"invalid commutative backward loop axis {axis!r}")
         return CommutativeBackwardPlan(self.spec, selected)
@@ -253,9 +307,11 @@ class CommutativeBackwardPlan(BackwardPath):
         finalize = commutative_backward_stage(
             self.spec,
             schedule(
-                sizes, tiles_for(self.spec, "backward", sizes),
+                sizes,
+                tiles_for(self.spec, "backward", sizes),
                 programs={group_axis.id: symbol("backward_group_count")},
                 loop=self.loop_axis.id,
+                namespace="backward",
             ),
             partition_axis=group_axis,
         )
@@ -271,21 +327,29 @@ class CommutativeBackwardPlan(BackwardPath):
         group_axis = self.loop_axis.partition_axis
         groups = finalize_schedule.program(group_axis)
         return commutative_backward_stage(
-            self.spec, finalize_schedule,
+            self.spec,
+            finalize_schedule,
             partition_axis=group_axis if groups > 1 else None,
         )
 
     @classmethod
     def from_record(cls, spec, records):
         if spec.algebra != AlgebraKind.commutative or stage_kinds(records) != (
-            "embed", "recompute_map_finalize_grad_write",
+            "embed",
+            "recompute_map_finalize_grad_write",
         ):
             return None
         loop = records[1]["loop"]
         if loop is None:
             raise ValueError("commutative backward stage requires a loop axis")
-        axis = next((a for a in (*spec.batch, spec.fold)
-                     if loop == f"{a.id.tag.value}:{a.name}"), None)
+        axis = next(
+            (
+                a
+                for a in (*spec.batch, spec.fold)
+                if loop == f"{a.id.tag.value}:{a.name}"
+            ),
+            None,
+        )
         if axis is None:
             raise ValueError(f"invalid commutative backward loop axis {loop!r}")
         return cls(spec, axis)
@@ -303,7 +367,10 @@ class GeneralFullBackwardPlan(BackwardPath):
         sizes = sizes_for(self.spec)
         finalize = full_recompute_backward_stage(
             self.spec,
-            schedule(sizes, tiles_for(self.spec, "backward", sizes), loop=self.spec.fold.id),
+            schedule(
+                sizes, tiles_for(self.spec, "backward", sizes), loop=self.spec.fold.id,
+                namespace="backward"
+            ),
         )
         return (symbolic_embed(self.spec, sizes), finalize)
 
@@ -316,20 +383,30 @@ class GeneralFullBackwardPlan(BackwardPath):
 
     def finalize(self, finalize_schedule):
         from cutilereduce.fold.general.plan import full_recompute_backward_stage
+
         return full_recompute_backward_stage(self.spec, finalize_schedule)
 
     @classmethod
     def from_record(cls, spec, records):
-        return cls(spec) if spec.algebra == AlgebraKind.general and stage_kinds(records) == (
-            "embed", "recompute_fold_map_finalize_grad_write",
-        ) else None
+        return (
+            cls(spec)
+            if spec.algebra == AlgebraKind.general
+            and stage_kinds(records)
+            == (
+                "embed",
+                "recompute_fold_map_finalize_grad_write",
+            )
+            else None
+        )
 
 
 @dataclass(frozen=True)
 class GeneralCheckpointedBackwardPlan(BackwardPath):
     spec: FoldSpec
     name = "checkpointed"
-    required_forward_plan: ClassVar[type[ForwardPath] | None] = GeneralPartialForwardPlan
+    required_forward_plan: ClassVar[type[ForwardPath] | None] = (
+        GeneralPartialForwardPlan
+    )
 
     @cached_property
     def stages(self):
@@ -343,8 +420,11 @@ class GeneralCheckpointedBackwardPlan(BackwardPath):
         finalize = prefix_recompute_backward_stage(
             self.spec,
             schedule(
-                sizes, tiles, programs={partition_axis.id: symbol("partition_count")},
+                sizes,
+                tiles,
+                programs={partition_axis.id: symbol("partition_count")},
                 loop=self.spec.fold.id,
+                namespace="backward",
             ),
             checkpoints=partial_buffers(self.spec, partition_axis),
             partition_axis=partition_axis,
@@ -361,16 +441,26 @@ class GeneralCheckpointedBackwardPlan(BackwardPath):
 
     def finalize(self, finalize_schedule, checkpoints):
         from cutilereduce.fold.general.plan import prefix_recompute_backward_stage
+
         return prefix_recompute_backward_stage(
-            self.spec, finalize_schedule, checkpoints=checkpoints,
+            self.spec,
+            finalize_schedule,
+            checkpoints=checkpoints,
             partition_axis=self.spec.fold.partition_axis,
         )
 
     @classmethod
     def from_record(cls, spec, records):
-        return cls(spec) if spec.algebra == AlgebraKind.general and stage_kinds(records) == (
-            "embed", "recompute_prefix_fold_map_finalize_grad_write",
-        ) else None
+        return (
+            cls(spec)
+            if spec.algebra == AlgebraKind.general
+            and stage_kinds(records)
+            == (
+                "embed",
+                "recompute_prefix_fold_map_finalize_grad_write",
+            )
+            else None
+        )
 
 
 def forward_plans(spec):
@@ -395,7 +485,13 @@ def backward_plans(spec):
     return (GeneralFullBackwardPlan(spec), GeneralCheckpointedBackwardPlan(spec))
 
 
-FORWARD_RECORD_TYPES = (FullForwardPlan, CommutativePartialForwardPlan, GeneralPartialForwardPlan)
+FORWARD_RECORD_TYPES = (
+    FullForwardPlan,
+    CommutativePartialForwardPlan,
+    GeneralPartialForwardPlan,
+)
 BACKWARD_RECORD_TYPES = (
-    CommutativeBackwardPlan, GeneralFullBackwardPlan, GeneralCheckpointedBackwardPlan,
+    CommutativeBackwardPlan,
+    GeneralFullBackwardPlan,
+    GeneralCheckpointedBackwardPlan,
 )

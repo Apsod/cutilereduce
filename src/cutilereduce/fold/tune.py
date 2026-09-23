@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import sympy
+from cutilereduce.core import symbolic as expr
 import torch
 from cuda.tile.tune import exhaustive_search
 
@@ -25,7 +25,7 @@ def stage_key(stage):
 
 
 def _evaluate_scalar(value, symbols):
-    if isinstance(value, sympy.Expr):
+    if isinstance(value, expr.Expr):
         value = value.subs(symbols)
     return float(value)
 
@@ -93,9 +93,7 @@ def tune_fold_stages(stages, functions, *, timeout=0, quiet=False):
     )
     for key, error_type, message in result.failures:
         detail = " | ".join(
-            line.strip()
-            for line in message.splitlines()[:4]
-            if line.strip()
+            line.strip() for line in message.splitlines()[:4] if line.strip()
         )
         print(
             f"  skipped {key}: {error_type.__name__}: {detail}",
@@ -105,28 +103,51 @@ def tune_fold_stages(stages, functions, *, timeout=0, quiet=False):
 
 
 def tune_fold_plan(
-        spec, functions, sizes, candidate_count=20, timeout=0, *, hardware,
-        backward=True, max_tile=128, max_partition_count=4,
-        max_storage_ratio=4.0, quiet=False,
-        ):
+    spec,
+    functions,
+    sizes,
+    candidate_count=20,
+    timeout=0,
+    *,
+    hardware,
+    backward=True,
+    max_tile=None,
+    max_partition_count=None,
+    max_storage_ratio=4.0,
+    quiet=False,
+):
     """Search and benchmark concrete instances of the plan paths."""
     from cutilereduce.fold.plan import AlgebraKind
 
     if spec.algebra == AlgebraKind.commutative:
         from cutilereduce.fold.commutative.tune import tune_commutative_fold_plan
+
         return tune_commutative_fold_plan(
-            spec, sizes, candidate_count, timeout, functions=functions,
-            hardware=hardware, max_storage_ratio=max_storage_ratio,
-            quiet_tuning=quiet, backward=backward,
+            spec,
+            sizes,
+            candidate_count,
+            timeout,
+            functions=functions,
+            hardware=hardware,
+            max_storage_ratio=max_storage_ratio,
+            quiet_tuning=quiet,
+            backward=backward,
         )
     if spec.algebra == AlgebraKind.general:
         from cutilereduce.fold.general.tune import tune_general_fold_plan
+
         return tune_general_fold_plan(
-            spec, sizes, candidate_count, timeout, functions=functions,
-            hardware=hardware, max_tile=max_tile,
+            spec,
+            sizes,
+            candidate_count,
+            timeout,
+            functions=functions,
+            hardware=hardware,
+            max_tile=max_tile,
             max_partition_count=max_partition_count,
             max_storage_ratio=max_storage_ratio,
-            quiet_tuning=quiet, backward=backward,
+            quiet_tuning=quiet,
+            backward=backward,
         )
     raise ValueError(f"unsupported fold algebra: {spec.algebra}")
 

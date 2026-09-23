@@ -17,7 +17,7 @@ from cutilereduce.core.stage_domain import (
     StageAxes,
     StageDomain,
 )
-from cutilereduce.core.utilities import ceil_div
+from cutilereduce.core.measure import Measure
 from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, make_buffer_split, stage_grid_info
 
@@ -26,11 +26,12 @@ if TYPE_CHECKING:
 
 
 def stage_axis(schedule: StageSchedule, axis: Axis, role: AxisRole) -> StageAxis:
-    return StageAxis(
+    return StageAxis.make(
         axis=axis,
         role=role,
         extent=schedule.extent(axis),
         tile=schedule.tile(axis),
+        namespace=schedule.namespace,
     )
 
 
@@ -49,21 +50,32 @@ def fold_compute_axes(
             continue
         role = AxisRole.Batch if axis in spec.batch else AxisRole.Inner
         axes.append(stage_axis(schedule, axis, role))
-    axes.append(StageAxis(
+    axes.append(StageAxis.make(
         axis=fold_axis,
         role=fold_role,
         extent=fold_extent,
         tile=fold_tile,
+        namespace=schedule.namespace,
     ))
     return StageAxes(values=tuple(axes))
 
 
-def batch_program_axes(schedule: StageSchedule, compute_axes: StageAxes) -> list[ProgramAxis]:
+def batch_program_axes(
+    schedule: StageSchedule,
+    compute_axes: StageAxes,
+    stage_name: str = "map_fold",
+) -> list[ProgramAxis]:
     return [
-        ProgramAxis(
+        ProgramAxis.make(
             axis=a.axis,
             source=a.id,
-            programs=schedule.program(a.axis, ceil_div(a.extent, a.tile)),
+            programs=schedule.program(
+                a.axis,
+                StageDomain.measure_symbol(
+                    stage_name, a.axis, Measure.num_tiles,
+                    extent=a.extent, tile=a.tile,
+                ),
+            ),
         )
         for a in compute_axes.outer
         if a.role == AxisRole.Batch
@@ -162,7 +174,9 @@ class MapFoldPartial:
             fold_extent=self.schedule.extent(self.spec.fold),
             fold_tile=self.schedule.tile(self.spec.fold),
         )
-        program_axes = batch_program_axes(self.schedule, compute_axes)
+        program_axes = batch_program_axes(
+            self.schedule, compute_axes, "map_fold_partial"
+        )
         program_axes.append(ProgramAxis(
             axis=self.partition_axis,
             source=self.spec.fold.id,

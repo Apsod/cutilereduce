@@ -40,7 +40,7 @@ class Fold:
             # instead invoke it on scalar slices.
             fold_tile=1,
         )
-        program_axes = batch_program_axes(self.schedule, compute_axes)
+        program_axes = batch_program_axes(self.schedule, compute_axes, "fold")
         program_axes.append(ProgramAxis(
             axis=self.partition_axis,
             source=self.partition_axis.id,

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from cutilereduce.core.axis import AxisId, Axes
 from cutilereduce.core.kernel_stage import KernelStage
 from cutilereduce.core.stage_domain import AxisRole, ProgramAxis, ProgramAxes, StageAxis, StageAxes, StageDomain
-from cutilereduce.core.utilities import ceil_div
+from cutilereduce.core.measure import Measure
 from cutilereduce.core.work import WorkModel
 from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 
@@ -23,19 +23,26 @@ class Map:
     def build(self) -> BuiltStage:
         roles = self.roles or {}
         compute_axes = StageAxes(values=tuple(
-            StageAxis(
+            StageAxis.make(
                 axis=axis,
                 role=roles.get(axis.id, AxisRole.Batch),
                 extent=self.schedule.extent(axis),
                 tile=self.schedule.tile(axis),
+                namespace=self.schedule.namespace,
             )
             for axis in self.axes
         ))
         program_axes = ProgramAxes(values=tuple(
-            ProgramAxis(
+            ProgramAxis.make(
                 axis=axis.axis,
                 source=axis.id,
-                programs=self.schedule.program(axis.axis, ceil_div(axis.extent, axis.tile)),
+                programs=self.schedule.program(
+                    axis.axis,
+                    StageDomain.measure_symbol(
+                        self.name, axis.axis, Measure.num_tiles,
+                        extent=axis.extent, tile=axis.tile,
+                    ),
+                ),
             )
             for axis in compute_axes.outer
         ))

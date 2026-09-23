@@ -3,7 +3,7 @@ import unittest
 
 import cuda.tile as ct
 import polars as pl
-import sympy
+from cutilereduce.core import expr
 import torch
 
 from cutilereduce.core import (
@@ -551,7 +551,7 @@ class FoldStageConstructionTests(unittest.TestCase):
         )
         self.assertEqual(atomic_eval.height, 1)
 
-        partition_count = sympy.Symbol("partition_count")
+        partition_count = expr.Symbol("partition_count")
         symbolic_schedule = StageSchedule.make(
             spec,
             extents={"b": 8, "v": 17, "d": 16},
@@ -608,7 +608,7 @@ class FoldStageConstructionTests(unittest.TestCase):
                 "MAX_PROGRAMS_PER_SM": 8,
                 "PEAK_TENSOR_FLOPS": 1e12,
                 "BANDWIDTH": 1e9,
-                PIPELINE_EFFICIENCY: sympy.Symbol("pipeline"),
+                PIPELINE_EFFICIENCY: expr.Symbol("pipeline"),
             },
         )
         self.assertGreater(

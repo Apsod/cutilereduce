@@ -31,7 +31,7 @@ def tune_commutative_fold_plan(
         spec,
         sizes=sizes,
         hardware=hardware,
-        max_tile=128,
+        max_tile=None,
         max_storage_ratio=max_storage_ratio,
     )
     backward_swept = None
@@ -40,7 +40,7 @@ def tune_commutative_fold_plan(
             spec,
             sizes=sizes,
             hardware=hardware,
-            max_tile=128,
+            max_tile=None,
         )
         assert backward_swept is not None
     if swept.is_empty() or (backward_swept is not None and backward_swept.is_empty()):

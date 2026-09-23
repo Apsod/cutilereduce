@@ -1,16 +1,19 @@
 import math
-import sympy
+from . import symbolic as expr
 from dataclasses import dataclass
 from copy import replace
 from typing import Self
 
+
 def ceil_div(a, b):
-  if isinstance(a, int) and isinstance(b, int):
-      return (a + b - 1) // b
-  return sympy.ceiling(sympy.sympify(a) / sympy.sympify(b))
+    if isinstance(a, int) and isinstance(b, int):
+        return (a + b - 1) // b
+    return expr.ceiling(expr.sympify(a) / expr.sympify(b))
+
 
 def prod(xs):
     return math.prod(xs)
+
 
 def forward(*chain):
     if not chain:
@@ -24,9 +27,10 @@ def forward(*chain):
 
     return property(_get)
 
+
 def match_one(xs, key):
     iterator = (x for x in xs if key(x))
-    
+
     try:
         first = next(iterator)
     except StopIteration:
@@ -38,9 +42,11 @@ def match_one(xs, key):
         return first
     raise KeyError("Multiple matching elements found")
 
+
 def index_one(xs, key):
     i, _ = match_one(enumerate(xs), lambda x: key(x[1]))
     return i
+
 
 def partition_by(predicate, xs):
     satisfies = []
@@ -52,13 +58,15 @@ def partition_by(predicate, xs):
             fails.append(x)
     return tuple(satisfies), tuple(fails)
 
+
 def flat_tuple(ts):
     return tuple(x for t in ts for x in t)
+
 
 @dataclass(frozen=True, kw_only=True)
 class TupleSet[T]:
     values: tuple[T, ...]
-    
+
     @staticmethod
     def key(x):
         return x
@@ -107,18 +115,11 @@ class TupleSet[T]:
 
     def __or__(self, other: Self) -> Self:
         return replace(
-            self,
-            values=(*self.values, *other.subset(lambda x: x not in self).values)
+            self, values=(*self.values, *other.subset(lambda x: x not in self).values)
         )
 
     def __and__(self, other: Self) -> Self:
-        return replace(
-            self,
-            values=self.subset(lambda x: x in other).values
-        )
+        return replace(self, values=self.subset(lambda x: x in other).values)
 
     def __sub__(self, other: Self) -> Self:
-        return replace(
-            self,
-            values=self.subset(lambda x: x not in other).values
-        )
+        return replace(self, values=self.subset(lambda x: x not in other).values)

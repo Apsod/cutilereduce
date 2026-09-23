@@ -69,7 +69,7 @@ class Scan:
             fold_tile=self.schedule.tile(self.scan_axis),
             fold_role=AxisRole.Scan,
         )
-        program_axes = batch_program_axes(self.schedule, compute_axes)
+        program_axes = batch_program_axes(self.schedule, compute_axes, "scan")
         program_axes.append(ProgramAxis(
             axis=self.scan_axis,
             source=self.scan_axis.id,
