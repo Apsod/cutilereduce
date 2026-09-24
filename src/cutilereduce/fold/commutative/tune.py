@@ -156,11 +156,17 @@ def tune_commutative_fold_plan(
 
     print("isolated stage timings")
     for stage in plan.forward:
+        suffix = ""
+        if stage.stage.name == "map_fold_partial":
+            partition_axis = stage.partition_axis
+            partitions = stage.stage.domain.program_axes.get(partition_axis).programs
+            suffix = f"; partitions={partitions}"
         print(format_stage_timing(
             "forward",
             stage,
             forward_stage_times[stage_key(stage)],
             hardware=hardware,
+            suffix=suffix,
         ))
     if backward:
         backward_stage = plan.backward[1]

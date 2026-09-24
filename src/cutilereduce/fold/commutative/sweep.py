@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import itertools
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -12,6 +13,7 @@ from cutilereduce.core import symbolic as expr
 from cutilereduce.core.axis import Axis, AxisId, Axes, LogicalAxis, axis_id
 from cutilereduce.core.stage_domain import AxisRole, ComputeAxis
 from cutilereduce.core.sweep import (
+    StageInstantiation,
     Sweep,
     bounded_tile_configs,
     partition_configs_for_tiles,
@@ -453,7 +455,7 @@ def sweep_commutative_backward(
     sizes: Mapping[str | Axis | AxisId, int],
     hardware: Mapping,
     max_tile: int | None = None,
-    max_group_count: int = 4,
+    max_group_count: int | None = None,
     sweep: Sweep = Sweep.default,
 ) -> BackwardSweepResult:
     normalized_sizes = _normalize_sizes(spec, sizes)
@@ -475,21 +477,42 @@ def sweep_commutative_backward(
             stage=stage.stage,
             symbols=dict(hardware) | size_values,
         )
-        counts = pl.DataFrame(
-            {
-                f"cfg:{symbols.partition_count}": range(1, max_group_count + 1),
-            }
+        count_name = f"cfg:{symbols.partition_count}"
+        one_group = tile_configs.with_columns(
+            pl.lit(1, dtype=pl.Int64).alias(count_name)
         )
-        configs = tile_configs.join(counts, how="cross")
-        loop_configs = configs.filter(
-            pl.col(f"cfg:{symbols.partition_count}")
-            <= (
-                normalized_sizes[loop_axis.id]
-                + pl.col(f"cfg:{symbols.backward_tile(loop_axis)}")
-                - 1
+        substitutions = (
+            dict(hardware)
+            | size_values
+            | {symbol("backward_group_count"): symbols.partition_count}
+        )
+        capacity = StageInstantiation.make(
+            stage.stage,
+            attributes=("active_programs", "resident_programs"),
+            symbols=substitutions,
+        ).evaluate(one_group)
+        rows = []
+        loop_tile_name = f"cfg:{symbols.backward_tile(loop_axis)}"
+        for row in capacity.to_dicts():
+            loop_tiles = math.ceil(
+                normalized_sizes[loop_axis.id] / int(row[loop_tile_name])
             )
-            // pl.col(f"cfg:{symbols.backward_tile(loop_axis)}")
-        )
+            active = max(1, int(row["active_programs"]))
+            resident = max(1, int(row["resident_programs"]))
+            # Once the one-group grid has been multiplied enough to fill all
+            # resident slots, further groups cannot improve modeled device
+            # utilization.  They can only add atomic writes, padding, and
+            # shorten the pipelined loop span.
+            upper = min(loop_tiles, math.ceil(resident / active))
+            if max_group_count is not None:
+                upper = min(upper, max_group_count)
+            base = {
+                name: value
+                for name, value in row.items()
+                if name not in (count_name, "active_programs", "resident_programs")
+            }
+            rows.extend(base | {count_name: count} for count in range(1, upper + 1))
+        loop_configs = pl.DataFrame(rows)
         loop_sweep = replace(
             sweep,
             # Group count is a tuning dimension within this loop-axis family;
@@ -500,11 +523,7 @@ def sweep_commutative_backward(
         evaluated = loop_sweep.apply(
             stage.stage,
             loop_configs,
-            symbols=dict(hardware)
-            | size_values
-            | {
-                symbol("backward_group_count"): symbols.partition_count,
-            },
+            symbols=substitutions,
         )
         if not evaluated.is_empty():
             frames.append(
