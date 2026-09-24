@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 
+from cutilereduce.core.sweep import Sweep
 from cutilereduce.fold.plan import FoldPlan
 from cutilereduce.fold.embed import tune_embed_stage
 from cutilereduce.fold.tune import format_stage_timing, stage_key, tune_fold_stages
@@ -24,15 +26,16 @@ def tune_commutative_fold_plan(
         hardware,
         max_storage_ratio=4.0,
         quiet_tuning=False,
-        backward=True,
+    backward=True,
         ):
     print("analytical sweep", flush=True)
+    tuning_sweep = replace(Sweep.default, top_k=candidate_count)
     swept = sweep_commutative_fold(
         spec,
         sizes=sizes,
         hardware=hardware,
-        max_tile=None,
         max_storage_ratio=max_storage_ratio,
+        sweep=tuning_sweep,
     )
     backward_swept = None
     if backward:
@@ -40,7 +43,7 @@ def tune_commutative_fold_plan(
             spec,
             sizes=sizes,
             hardware=hardware,
-            max_tile=None,
+            sweep=tuning_sweep,
         )
         assert backward_swept is not None
     if swept.is_empty() or (backward_swept is not None and backward_swept.is_empty()):

@@ -129,59 +129,43 @@ def _extent_mapping(
     )
 
 
-def _config_values(extent: int, max_tile: int | None) -> tuple[int, ...]:
-    return powers_of_two(min(extent, max_tile) if max_tile else extent)
-
-
-def _tile_rows(names: tuple[str, ...], values: tuple[tuple[int, ...], ...]):
-    for row in itertools.product(*values):
-        yield dict(zip(names, row, strict=True))
-
-
 def _stage_tile_configs(
     axes: tuple[Axis, ...],
     names: tuple[str, ...],
     sizes: Mapping[AxisId, int],
-    max_tile: int,
     *,
-    stage=None,
+    stage,
     symbols=None,
 ) -> pl.DataFrame:
-    if stage is not None:
-        return bounded_tile_configs(
-            stage,
-            axes,
-            names,
-            sizes,
-            max_tile,
-            symbols=symbols,
-        )
-    values = tuple(_config_values(sizes[axis.id], max_tile) for axis in axes)
-    return pl.DataFrame(_tile_rows(names, values))
+    return bounded_tile_configs(
+        stage,
+        axes,
+        names,
+        sizes,
+        symbols=symbols,
+    )
 
 
 def generate_commutative_fold_configs(
     spec: FoldSpec,
     *,
     sizes: Mapping[str | Axis | AxisId, int],
-    max_tile: int | None = None,
-    max_partition_count: int = 16,
 ) -> pl.DataFrame:
     normalized_sizes = _normalize_sizes(spec, sizes)
     symbols = _make_symbols(spec)
     tile_axes = _tile_axes(spec)
     names = tuple(f"cfg:{symbols.partial_tile(axis)}" for axis in tile_axes)
-    tile_values = tuple(
-        _config_values(normalized_sizes[axis.id], max_tile) for axis in tile_axes
-    )
+    tile_values = tuple(powers_of_two(normalized_sizes[axis.id]) for axis in tile_axes)
     rows = []
-    for values in itertools.product(*tile_values, range(1, max_partition_count + 1)):
-        *tiles, partition_count = values
-        rows.append(
+    for tiles in itertools.product(*tile_values):
+        fold_tile = tiles[tile_axes.index(spec.fold)]
+        partition_count = math.ceil(normalized_sizes[spec.fold.id] / fold_tile)
+        rows.extend(
             {
                 **dict(zip(names, tiles, strict=True)),
-                f"cfg:{symbols.partition_count}": partition_count,
+                f"cfg:{symbols.partition_count}": count,
             }
+            for count in range(1, partition_count + 1)
         )
     return pl.DataFrame(rows)
 
@@ -190,9 +174,8 @@ def _single_configs(
     spec: FoldSpec,
     sizes: Mapping[AxisId, int],
     symbols: FoldSweepSymbols,
-    max_tile: int,
     *,
-    stage=None,
+    stage,
     substitutions=None,
 ) -> pl.DataFrame:
     axes = _tile_axes(spec)
@@ -200,7 +183,6 @@ def _single_configs(
         axes,
         tuple(f"cfg:{symbols.full_tile(axis)}" for axis in axes),
         sizes,
-        max_tile,
         stage=stage,
         symbols=substitutions,
     )
@@ -213,10 +195,8 @@ def _partial_configs(
     spec: FoldSpec,
     sizes: Mapping[AxisId, int],
     symbols: FoldSweepSymbols,
-    max_tile: int,
-    max_partition_count: int | None,
     *,
-    stage=None,
+    stage,
     substitutions=None,
     max_storage_ratio: float = 4.0,
 ) -> pl.DataFrame:
@@ -225,26 +205,17 @@ def _partial_configs(
         axes,
         tuple(f"cfg:{symbols.partial_tile(axis)}" for axis in axes),
         sizes,
-        max_tile,
+        stage=stage,
+        symbols=substitutions,
     )
-    if stage is not None:
-        return partition_configs_for_tiles(
-            stage,
-            configs,
-            count_name=f"cfg:{symbols.partition_count}",
-            fold_tile_name=f"cfg:{symbols.partial_tile(spec.fold)}",
-            fold_extent=sizes[spec.fold.id],
-            max_storage_ratio=max_storage_ratio,
-            symbols=substitutions,
-            explicit_cap=max_partition_count,
-        )
-    counts = pl.DataFrame(
-        {f"cfg:{symbols.partition_count}": range(2, max_partition_count + 1)}
-    )
-    return configs.join(counts, how="cross").filter(
-        pl.col(f"cfg:{symbols.partition_count}")
-        <= (sizes[spec.fold.id] + pl.col(f"cfg:{symbols.partial_tile(spec.fold)}") - 1)
-        // pl.col(f"cfg:{symbols.partial_tile(spec.fold)}")
+    return partition_configs_for_tiles(
+        stage,
+        configs,
+        count_name=f"cfg:{symbols.partition_count}",
+        fold_tile_name=f"cfg:{symbols.partial_tile(spec.fold)}",
+        fold_extent=sizes[spec.fold.id],
+        max_storage_ratio=max_storage_ratio,
+        symbols=substitutions,
     )
 
 
@@ -252,10 +223,8 @@ def _combine_configs(
     spec: FoldSpec,
     sizes: Mapping[AxisId, int],
     symbols: FoldSweepSymbols,
-    max_tile: int,
-    max_partition_count: int | None,
     *,
-    stage=None,
+    stage,
     substitutions=None,
     partition_counts=None,
 ) -> pl.DataFrame:
@@ -264,14 +233,11 @@ def _combine_configs(
         axes,
         tuple(f"cfg:{symbols.combine_tile(axis)}" for axis in axes),
         sizes,
-        max_tile,
         stage=stage,
         symbols=substitutions,
     )
     if partition_counts is None:
-        if max_partition_count is None:
-            return configs
-        partition_counts = range(2, max_partition_count + 1)
+        return configs
     counts = pl.DataFrame({f"cfg:{symbols.partition_count}": partition_counts})
     return configs.join(counts, how="cross")
 
@@ -308,8 +274,6 @@ def _evaluate_partial_path(
     configs: pl.DataFrame,
     *,
     hardware: Mapping,
-    max_tile: int,
-    max_partition_count: int,
     max_storage_ratio: float = 4.0,
     sweep: Sweep = Sweep.default,
 ):
@@ -338,8 +302,6 @@ def _evaluate_partial_path(
         spec,
         sizes,
         symbols,
-        max_tile,
-        max_partition_count,
         stage=combine_stage.stage,
         substitutions=dict(hardware) | size_values,
         partition_counts=(
@@ -383,14 +345,10 @@ def sweep_commutative_fold(
     *,
     sizes: Mapping[str | Axis | AxisId, int],
     hardware: Mapping,
-    max_tile: int | None = None,
-    max_fold_programs: int | None = None,
-    max_partition_count: int | None = None,
     max_storage_ratio: float = 4.0,
     sweep: Sweep = Sweep.default,
     configs: pl.DataFrame | None = None,
 ) -> ForwardSweepResult:
-    max_partition_count = max_partition_count or max_fold_programs
     normalized_sizes = _normalize_sizes(spec, sizes)
     symbols = _make_symbols(spec)
 
@@ -401,7 +359,6 @@ def sweep_commutative_fold(
         spec,
         normalized_sizes,
         symbols,
-        max_tile,
         stage=full_stage,
         substitutions=hardware,
     )
@@ -409,7 +366,7 @@ def sweep_commutative_fold(
         configs
         if configs is not None
         else _partial_configs(
-            spec, normalized_sizes, symbols, max_tile, max_partition_count,
+            spec, normalized_sizes, symbols,
             stage=partial_stage.stage,
             substitutions=hardware,
             max_storage_ratio=max_storage_ratio,
@@ -429,8 +386,6 @@ def sweep_commutative_fold(
         symbols,
         partial_configs,
         hardware=hardware,
-        max_tile=max_tile,
-        max_partition_count=max_partition_count,
         max_storage_ratio=max_storage_ratio,
         sweep=sweep,
     )
@@ -454,8 +409,6 @@ def sweep_commutative_backward(
     *,
     sizes: Mapping[str | Axis | AxisId, int],
     hardware: Mapping,
-    max_tile: int | None = None,
-    max_group_count: int | None = None,
     sweep: Sweep = Sweep.default,
 ) -> BackwardSweepResult:
     normalized_sizes = _normalize_sizes(spec, sizes)
@@ -473,7 +426,6 @@ def sweep_commutative_backward(
             axes,
             tuple(f"cfg:{symbols.backward_tile(axis)}" for axis in axes),
             normalized_sizes,
-            max_tile,
             stage=stage.stage,
             symbols=dict(hardware) | size_values,
         )
@@ -504,8 +456,6 @@ def sweep_commutative_backward(
             # utilization.  They can only add atomic writes, padding, and
             # shorten the pipelined loop span.
             upper = min(loop_tiles, math.ceil(resident / active))
-            if max_group_count is not None:
-                upper = min(upper, max_group_count)
             base = {
                 name: value
                 for name, value in row.items()

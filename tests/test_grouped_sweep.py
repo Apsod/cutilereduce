@@ -136,7 +136,6 @@ def test_bounded_tiles_prune_coupled_residency_products():
         (SimpleNamespace(id="l"), SimpleNamespace(id="g")),
         ("cfg:l_tile", "cfg:g_tile"),
         {"l": 8, "g": 8},
-        8,
         symbols={SMEM_PER_SM: 16},
     )
     assert result.height > 0

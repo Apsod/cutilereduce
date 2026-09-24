@@ -1,18 +1,16 @@
 from __future__ import annotations
 
 from dataclasses import replace
-from itertools import product
 
-import polars as pl
 from cutilereduce.core import symbolic as expr
 
-from cutilereduce.core.sweep import Sweep
+from cutilereduce.core.sweep import Sweep, bounded_tile_configs
 from cutilereduce.fold.tune import stage_key, tune_fold_stages
 from cutilereduce.stages.base import StageSchedule, normalize_axis_mapping
 from cutilereduce.stages.embed import Embed, embed_axes
 
 
-def embed_candidates(spec, sizes, *, hardware, candidate_count=20, max_tile=256):
+def embed_candidates(spec, sizes, *, hardware, candidate_count=20):
     """Rank independent batch tiles using traffic and residency, without MMA work."""
     sizes = normalize_axis_mapping(spec, sizes)
     axes = embed_axes(spec)
@@ -25,26 +23,22 @@ def embed_candidates(spec, sizes, *, hardware, candidate_count=20, max_tile=256)
     }
     schedule = StageSchedule(extents=sizes, tiles=fixed_tiles | symbols, programs={})
     stage = Embed(spec, schedule).build()
-    values = [
-        tuple(1 << n for n in range(min(int(sizes[axis.id]), max_tile).bit_length()))
-        for axis in batch
-    ]
-    rows = [
-        {
-            f"cfg:{symbols[axis.id]}": tile
-            for axis, tile in zip(batch, tiles, strict=True)
-        }
-        for tiles in product(*values)
-    ]
     if not batch:
         return (
             Embed(
                 spec, StageSchedule(extents=sizes, tiles=fixed_tiles, programs={})
             ).build(),
         )
+    configs = bounded_tile_configs(
+        stage.stage,
+        batch,
+        tuple(f"cfg:{symbols[axis.id]}" for axis in batch),
+        sizes,
+        symbols=hardware,
+    )
     ranked = replace(Sweep.default, top_k=candidate_count).apply(
         stage.stage,
-        pl.DataFrame(rows),
+        configs,
         symbols=hardware,
     )
     return tuple(

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -47,15 +46,6 @@ class GeneralFoldSweepSymbols:
         return self.backward_tiles[axis_id(axis)]
 
 
-def _powers_of_two(stop: int) -> tuple[int, ...]:
-    values = []
-    value = 1
-    while value <= stop:
-        values.append(value)
-        value *= 2
-    return tuple(values)
-
-
 def _normalize_sizes(spec, sizes):
     return normalize_axis_mapping(spec, sizes)
 
@@ -95,23 +85,11 @@ def _extents(spec, sizes, extra=None):
     )
 
 
-def _tile_configs(axes, names, sizes, max_tile=None):
-    values = tuple(
-        _powers_of_two(min(sizes[axis.id], max_tile) if max_tile else sizes[axis.id])
-        for axis in axes
-    )
-    return pl.DataFrame(
-        dict(zip(names, row, strict=True)) for row in itertools.product(*values)
-    )
-
-
 def sweep_general_fold(
     spec: FoldSpec,
     *,
     sizes: Mapping[str | Axis | AxisId, int],
     hardware: Mapping,
-    max_tile: int | None = None,
-    max_partition_count: int | None = None,
     max_storage_ratio: float = 4.0,
     sweep: Sweep = Sweep.default,
 ) -> ForwardSweepResult:
@@ -137,7 +115,6 @@ def sweep_general_fold(
         map_axes,
         tuple(f"cfg:{symbols.full_tile(axis)}" for axis in map_axes),
         sizes,
-        max_tile,
         symbols=bound_symbols,
     ).with_columns(pl.lit(1, dtype=pl.Int64).alias(count_name))
     full = sweep.apply(
@@ -156,7 +133,6 @@ def sweep_general_fold(
         map_axes,
         tuple(f"cfg:{symbols.partial_tile(axis)}" for axis in map_axes),
         sizes,
-        max_tile,
         symbols=bound_symbols,
     )
     partial_configs = partition_configs_for_tiles(
@@ -167,7 +143,6 @@ def sweep_general_fold(
         fold_extent=sizes[spec.fold.id],
         max_storage_ratio=max_storage_ratio,
         symbols=bound_symbols,
-        explicit_cap=max_partition_count,
     )
     partial_frontier = replace(
         sweep.add_filters(
@@ -190,7 +165,6 @@ def sweep_general_fold(
         tuple(spec.batch),
         tuple(f"cfg:{symbols.scan_tile(axis)}" for axis in spec.batch),
         sizes,
-        max_tile,
         symbols=bound_symbols,
     )
     if not partial_configs.is_empty():
@@ -278,7 +252,6 @@ def sweep_general_backward(
     sizes,
     forward_plan,
     hardware,
-    max_tile=None,
     sweep=Sweep.default,
 ) -> BackwardSweepResult:
     sizes = _normalize_sizes(spec, sizes)
@@ -294,7 +267,6 @@ def sweep_general_backward(
         axes,
         tuple(f"cfg:{symbols.backward_tile(axis)}" for axis in axes),
         sizes,
-        max_tile,
         symbols=dict(hardware) | size_values,
     )
     full_frame = sweep.apply(
@@ -325,7 +297,6 @@ def sweep_general_backward(
             tuple(spec.batch),
             tuple(f"cfg:{symbols.backward_tile(axis)}" for axis in spec.batch),
             sizes,
-            max_tile,
             symbols=prefix_values,
         ).with_columns(
             pl.lit(int(fold_tile), dtype=pl.Int64).alias(

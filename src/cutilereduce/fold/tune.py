@@ -111,8 +111,6 @@ def tune_fold_plan(
     *,
     hardware,
     backward=True,
-    max_tile=None,
-    max_partition_count=None,
     max_storage_ratio=4.0,
     quiet=False,
 ):
@@ -143,8 +141,6 @@ def tune_fold_plan(
             timeout,
             functions=functions,
             hardware=hardware,
-            max_tile=max_tile,
-            max_partition_count=max_partition_count,
             max_storage_ratio=max_storage_ratio,
             quiet_tuning=quiet,
             backward=backward,

@@ -31,10 +31,11 @@ class ForwardOnlyTests(unittest.TestCase):
             make = stack.enter_context(patch(f'{module}.FoldPlan.make', return_value=forward))
             stack.enter_context(contextlib.redirect_stdout(io.StringIO()))
             spec = xentropy_spec()
-            tune_commutative_fold_plan(spec, {}, 1, 0, functions=None,
+            tune_commutative_fold_plan(spec, {}, 37, 0, functions=None,
                                        hardware={}, backward=False)
         backward.assert_not_called()
         self.assertEqual(sweep.call_args.kwargs['max_storage_ratio'], 4.0)
+        self.assertEqual(sweep.call_args.kwargs['sweep'].top_k, 37)
         tune.assert_called_once()
         self.assertEqual(make.call_args.args[2], ())
 

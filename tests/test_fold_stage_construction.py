@@ -634,8 +634,6 @@ class FoldStageConstructionTests(unittest.TestCase):
             spec,
             sizes={"b": 16, "v": 17, "d": 64},
             hardware=SPECMAP["l4"],
-            max_tile=16,
-            max_partition_count=2,
         )
         self.assertFalse(fold_sweep.is_empty())
         self.assertIn("single", set(fold_sweep["path"]))

@@ -242,7 +242,6 @@ def bounded_tile_configs(
     axes,
     names,
     sizes,
-    max_tile: int | None,
     *,
     symbols: Mapping[Any, Any] | None = None,
 ) -> pl.DataFrame:
@@ -276,9 +275,9 @@ def bounded_tile_configs(
         _powers_of_two(
             min(
                 sizes[axis.id],
-                *(cap for cap in (max_tile, polynomial_caps.get(name)) if cap),
+                *(cap for cap in (polynomial_caps.get(name),) if cap),
             )
-            if max_tile or polynomial_caps.get(name)
+            if polynomial_caps.get(name)
             else sizes[axis.id]
         )
         for axis, name in zip(axes, tile_names, strict=True)
@@ -329,7 +328,6 @@ def partition_configs_for_tiles(
     max_storage_ratio: float,
     symbols: Mapping[Any, Any] | None = None,
     min_count: int = 2,
-    explicit_cap: int | None = None,
 ) -> pl.DataFrame:
     """Infer valid partition counts independently for each tile row."""
     substitutions = DEFAULT_SYMBOLS | dict(symbols or {})
@@ -375,7 +373,7 @@ def partition_configs_for_tiles(
     for row in tile_configs.to_dicts():
         fold_tile = int(row[fold_tile_name])
         semantic_max = (fold_extent + fold_tile - 1) // fold_tile
-        upper = semantic_max if explicit_cap is None else min(semantic_max, explicit_cap)
+        upper = semantic_max
         if storage_bound is not None:
             upper = min(upper, storage_bound)
         if upper < min_count:

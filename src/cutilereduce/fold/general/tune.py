@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
+from cutilereduce.core.sweep import Sweep
 from cutilereduce.fold.plan import FoldPlan
 from cutilereduce.fold.embed import tune_embed_stage
 from cutilereduce.fold.tune import format_stage_timing, stage_key, tune_fold_stages
@@ -20,20 +23,18 @@ def tune_general_fold_plan(
         *,
         functions,
         hardware,
-        max_tile=None,
-        max_partition_count=None,
         max_storage_ratio=4.0,
         quiet_tuning=False,
         backward=False,
         ):
     print("analytical general-fold sweep", flush=True)
+    tuning_sweep = replace(Sweep.default, top_k=candidate_count)
     swept = sweep_general_fold(
         spec,
         sizes=sizes,
         hardware=hardware,
-        max_tile=max_tile,
-        max_partition_count=max_partition_count,
         max_storage_ratio=max_storage_ratio,
+        sweep=tuning_sweep,
     )
     if swept.is_empty():
         raise RuntimeError("general fold sweep produced no candidates")
@@ -90,7 +91,7 @@ def tune_general_fold_plan(
         sizes=sizes,
         forward_plan=plan,
         hardware=hardware,
-        max_tile=max_tile,
+        sweep=tuning_sweep,
     )
     candidates = []
     counts = {}
