@@ -30,7 +30,7 @@ def test_grouped_configs_keep_one_representative_per_product():
     assert result.row(0) == (1, 8)
 
 
-def test_grouped_configs_preserve_exact_derived_measure_differences():
+def test_grouped_configs_ignore_unrequested_derived_measure_differences():
     frame = pl.DataFrame(
         {
             "cfg:l_tile": [2, 4],
@@ -42,6 +42,26 @@ def test_grouped_configs_preserve_exact_derived_measure_differences():
         None,
         frame,
         [mono(1, l_tile=1, g_tile=1)],
+        axis_order=("l_tile", "g_tile"),
+    )
+
+    assert result.height == 1
+
+
+def test_grouped_configs_preserve_individual_axis_metric_differences():
+    frame = pl.DataFrame(
+        {
+            "cfg:l_tile": [2, 4],
+            "cfg:g_tile": [4, 2],
+        }
+    )
+    result = canonicalize_grouped_configs(
+        None,
+        frame,
+        [
+            expr.Symbol("l_tile") * expr.Symbol("g_tile"),
+            expr.Symbol("l_tile"),
+        ],
         axis_order=("l_tile", "g_tile"),
     )
 
@@ -138,6 +158,24 @@ def test_partition_bound_is_inferred_from_storage_ratio():
         symbols={},
     )
     assert result["cfg:partition_count"].to_list() == [2, 3, 4]
+
+
+def test_partition_bound_handles_checkpoint_storage_ratio():
+    partition_count = expr.Symbol("partition_count")
+    stage = _bound_stage(
+        expr.sympify(mono(1)),
+        (partition_count - 1) / 2,
+    )
+    result = partition_configs_for_tiles(
+        stage,
+        pl.DataFrame({"cfg:fold_tile": [1]}),
+        count_name="cfg:partition_count",
+        fold_tile_name="cfg:fold_tile",
+        fold_extent=8,
+        max_storage_ratio=2,
+        symbols={},
+    )
+    assert result["cfg:partition_count"].to_list() == [2, 3, 4, 5]
 
 
 def test_polynomial_upper_bound_handles_coupled_monomials():

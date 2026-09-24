@@ -18,6 +18,7 @@ from cutilereduce.core.stage_domain import (
     StageDomain,
 )
 from cutilereduce.core.measure import Measure
+from cutilereduce.core import symbolic as expr
 from cutilereduce.stages.base import BufferUse, BuiltStage, StageSchedule, bind_buffer_uses
 from cutilereduce.stages.codegen import StageFunctions, identity, make_buffer_helper, make_buffer_split, stage_grid_info
 
@@ -199,7 +200,19 @@ class MapFoldPartial:
             ),
         ))
         return BuiltStage(
-            stage=KernelStage("map_fold_partial", domain, buffers, self.spec.map_fold_work),
+            stage=KernelStage(
+                "map_fold_partial",
+                domain,
+                buffers,
+                self.spec.map_fold_work,
+                storage_base_bytes=self.spec.base_storage_bytes.subs(
+                    {
+                        expr.Symbol(axis.name): self.schedule.extent(axis)
+                        for axis in self.spec.axes
+                    }
+                ),
+                materialized_partition_count=self.partition_count,
+            ),
             partials=self.partials,
             partition_axis=self.partition_axis,
             compiler=lambda stage, functions: compile_map_fold_partial_stage(

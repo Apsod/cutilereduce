@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -15,6 +15,12 @@ from cutilereduce.core.sweep import (
     Sweep,
     bounded_tile_configs,
     partition_configs_for_tiles,
+)
+from cutilereduce.core.sweep_results import (
+    BackwardSweepResult,
+    ForwardSweepResult,
+    SweepFrame,
+    SweepSchema,
 )
 from cutilereduce.fold.plan import FoldSpec, StageSchedule
 from cutilereduce.stages import normalize_axis_mapping
@@ -310,9 +316,15 @@ def _evaluate_partial_path(
     size_values = {
         symbol: sizes[axis_id] for axis_id, symbol in sizes_for(spec).items()
     }
-    frontier_sweep = sweep.add_filters(
-        pl.col("partial_storage_ratio") <= max_storage_ratio,
-    ).with_frontier_keys(f"cfg:{symbols.partition_count}")
+    frontier_sweep = replace(
+        sweep.add_filters(
+            pl.col("partial_storage_ratio") <= max_storage_ratio,
+        ),
+        # Partition count competes with the other partial-plan parameters;
+        # do not reserve a separate top-k quota for each count.
+        frontier_keys=(),
+        top_k=max(configs.height, 1),
+    )
     partial_stage, combine_stage = CommutativePartialForwardPlan(spec).stages
     fold = frontier_sweep.apply(
         partial_stage.stage, configs, symbols=dict(hardware) | size_values
@@ -337,21 +349,31 @@ def _evaluate_partial_path(
             else ()
         ),
     )
-    combine = frontier_sweep.apply(
+    combine_sweep = replace(
+        sweep,
+        frontier_keys=(),
+        top_k=max(combine_configs.height, 1),
+    )
+    combine = combine_sweep.apply(
         combine_stage.stage, combine_configs, symbols=dict(hardware) | size_values
     )
     if combine.is_empty():
         return combine
 
     joined = fold.join(combine, on=f"cfg:{symbols.partition_count}", suffix="_combine")
-    return joined.with_columns(
+    joined = joined.with_columns(
         (pl.col("estimated_time") + pl.col("estimated_time_combine")).alias(
             "forward_estimated_time"
         ),
         pl.col("estimated_time").alias("fold_estimated_time"),
         pl.col("estimated_time_combine").alias("combine_estimated_time"),
         pl.lit("partial").alias("path"),
-    ).sort("forward_estimated_time")
+    )
+    return replace(
+        sweep,
+        key="forward_estimated_time",
+        frontier_keys=(),
+    ).sort_combine(joined)
 
 
 def sweep_commutative_fold(
@@ -365,7 +387,7 @@ def sweep_commutative_fold(
     max_storage_ratio: float = 4.0,
     sweep: Sweep = Sweep.default,
     configs: pl.DataFrame | None = None,
-) -> pl.DataFrame:
+) -> ForwardSweepResult:
     max_partition_count = max_partition_count or max_fold_programs
     normalized_sizes = _normalize_sizes(spec, sizes)
     symbols = _make_symbols(spec)
@@ -412,8 +434,17 @@ def sweep_commutative_fold(
     )
     frames = tuple(frame for frame in (single, partial) if not frame.is_empty())
     if not frames:
-        return pl.DataFrame()
-    return pl.concat(frames, how="diagonal").sort("forward_estimated_time")
+        return ForwardSweepResult.empty()
+    return ForwardSweepResult(
+        full=SweepFrame(
+            single.sort("forward_estimated_time"),
+            SweepSchema("forward.full"),
+        ) if not single.is_empty() else SweepFrame.empty(SweepSchema("forward.full")),
+        partial=SweepFrame(
+            partial.sort("forward_estimated_time"),
+            SweepSchema("forward.partial"),
+        ) if not partial.is_empty() else SweepFrame.empty(SweepSchema("forward.partial")),
+    )
 
 
 def sweep_commutative_backward(
@@ -424,7 +455,7 @@ def sweep_commutative_backward(
     max_tile: int | None = None,
     max_group_count: int = 4,
     sweep: Sweep = Sweep.default,
-) -> pl.DataFrame:
+) -> BackwardSweepResult:
     normalized_sizes = _normalize_sizes(spec, sizes)
     from cutilereduce.fold.paths import backward_plans, sizes_for, symbol
 
@@ -459,7 +490,14 @@ def sweep_commutative_backward(
             )
             // pl.col(f"cfg:{symbols.backward_tile(loop_axis)}")
         )
-        evaluated = sweep.with_frontier_keys(f"cfg:{symbols.partition_count}").apply(
+        loop_sweep = replace(
+            sweep,
+            # Group count is a tuning dimension within this loop-axis family;
+            # retain one global frontier for the loop axis.
+            frontier_keys=(),
+            top_k=sweep.top_k,
+        )
+        evaluated = loop_sweep.apply(
             stage.stage,
             loop_configs,
             symbols=dict(hardware)
@@ -473,8 +511,14 @@ def sweep_commutative_backward(
                 evaluated.with_columns(pl.lit(loop_axis.name).alias("loop_axis"))
             )
     if not frames:
-        return pl.DataFrame()
-    return pl.concat(frames).sort("estimated_time")
+        return BackwardSweepResult.empty()
+    return BackwardSweepResult({
+        str(frame["loop_axis"][0]): SweepFrame(
+            frame.sort("estimated_time"),
+            SweepSchema(f"backward.{frame['loop_axis'][0]}", ("loop_axis",)),
+        )
+        for frame in frames
+    })
 
 
 def _config_value(config: Mapping[str, object], symbol: Any) -> int:

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import itertools
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from types import MappingProxyType
 from typing import Any
 
@@ -15,6 +15,12 @@ from cutilereduce.core.sweep import (
     Sweep,
     bounded_tile_configs,
     partition_configs_for_tiles,
+)
+from cutilereduce.core.sweep_results import (
+    BackwardSweepResult,
+    ForwardSweepResult,
+    SweepFrame,
+    SweepSchema,
 )
 from cutilereduce.fold.plan import FoldSpec, StageSchedule
 from cutilereduce.stages import normalize_axis_mapping
@@ -108,7 +114,7 @@ def sweep_general_fold(
     max_partition_count: int | None = None,
     max_storage_ratio: float = 4.0,
     sweep: Sweep = Sweep.default,
-) -> pl.DataFrame:
+) -> ForwardSweepResult:
     sizes = _normalize_sizes(spec, sizes)
     symbols = _symbols(spec)
     map_axes = _map_axes(spec)
@@ -163,9 +169,16 @@ def sweep_general_fold(
         symbols=bound_symbols,
         explicit_cap=max_partition_count,
     )
-    partial_frontier = sweep.add_filters(
-        pl.col("partial_storage_ratio") <= max_storage_ratio,
-    ).with_frontier_keys(count_name)
+    partial_frontier = replace(
+        sweep.add_filters(
+            pl.col("partial_storage_ratio") <= max_storage_ratio,
+        ),
+        # Partition count is a tuning dimension of the partial plan, not a
+        # separate frontier.  Preserve all filtered candidates until map and
+        # scan are composed, then rank complete partial plans globally.
+        frontier_keys=(),
+        top_k=max(partial_configs.height, 1),
+    )
     mapped = partial_frontier.apply(
         partial_stage.stage,
         partial_configs,
@@ -185,7 +198,12 @@ def sweep_general_fold(
         scan_configs = scan_configs.join(scan_counts, how="cross")
     # Scan reuses the materialized partial allocation; it does not make the
     # partition-count storage decision, so do not prune it by that ratio again.
-    scanned = sweep.with_frontier_keys(count_name).apply(
+    scanned_sweep = replace(
+        sweep,
+        frontier_keys=(),
+        top_k=max(scan_configs.height, 1),
+    )
+    scanned = scanned_sweep.apply(
         scan_stage.stage,
         scan_configs,
         symbols=bound_symbols,
@@ -202,11 +220,25 @@ def sweep_general_fold(
             pl.col("estimated_time_scan").alias("scan_estimated_time"),
             pl.lit("partial").alias("path"),
         )
+        partial_frame = replace(
+            sweep,
+            key="forward_estimated_time",
+            frontier_keys=(),
+        ).sort_combine(partial_frame)
 
     frames = tuple(frame for frame in (full, partial_frame) if not frame.is_empty())
     if not frames:
-        return pl.DataFrame()
-    return pl.concat(frames, how="diagonal").sort("forward_estimated_time")
+        return ForwardSweepResult.empty()
+    return ForwardSweepResult(
+        full=SweepFrame(
+            full.sort("forward_estimated_time"),
+            SweepSchema("forward.full"),
+        ) if not full.is_empty() else SweepFrame.empty(SweepSchema("forward.full")),
+        partial=SweepFrame(
+            partial_frame.sort("forward_estimated_time"),
+            SweepSchema("forward.partial"),
+        ) if not partial_frame.is_empty() else SweepFrame.empty(SweepSchema("forward.partial")),
+    )
 
 
 def _config_value(config, symbol):
@@ -248,7 +280,7 @@ def sweep_general_backward(
     hardware,
     max_tile=None,
     sweep=Sweep.default,
-):
+) -> BackwardSweepResult:
     sizes = _normalize_sizes(spec, sizes)
     from cutilereduce.fold.paths import backward_plans, sizes_for, symbol
 
@@ -306,8 +338,16 @@ def sweep_general_backward(
                 prefix_frame.with_columns(pl.lit("checkpointed").alias("backward_path"))
             )
     if not frames:
-        return pl.DataFrame()
-    return pl.concat(frames, how="diagonal").sort("estimated_time")
+        return BackwardSweepResult.empty()
+    result = {}
+    for frame in frames:
+        key_column = "loop_axis" if "loop_axis" in frame.columns else "backward_path"
+        key = str(frame[key_column][0])
+        result[key] = SweepFrame(
+            frame.sort("estimated_time"),
+            SweepSchema(f"backward.{key}", (key_column,)),
+        )
+    return BackwardSweepResult(result)
 
 
 def general_backward_stage_from_config(spec, *, sizes, forward_plan, config):

@@ -15,6 +15,7 @@ from cutilereduce.core.buffer import (
 )
 from cutilereduce.core.work import WorkModel
 from cutilereduce.stages import BuiltStage, StageSchedule, resolve_axis_id
+from cutilereduce.core import symbolic as expr
 
 
 class AlgebraKind(Enum):
@@ -46,6 +47,17 @@ class FoldSpec:
     @property
     def grad_storage(self) -> BufferBundle:
         return self.input.as_grad()
+
+    @property
+    def base_storage_bytes(self):
+        """Logical input plus semantic output storage baseline."""
+        result = expr.sympify(0)
+        for buffer in (*self.input, *self.semantic):
+            value = expr.sympify(buffer.bytes_per_elem)
+            for axis in buffer.axes:
+                value = value * expr.Symbol(axis.name)
+            result = result + value
+        return result
 
     @property
     def axes(self) -> Axes:

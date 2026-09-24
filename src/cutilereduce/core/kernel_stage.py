@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from collections.abc import Callable
 from fractions import Fraction
+from typing import Any
 
 from . import symbolic as expr
 from .symbolic import Max, Min, Piecewise, SaturateSub, floor
@@ -31,6 +32,8 @@ class KernelStage:
     buffers: KernelBuffers
     work: WorkModel = WorkModel()
     write_model: Callable = normal_write
+    storage_base_bytes: Any | None = None
+    materialized_partition_count: Any | None = None
 
     @property
     def read_buffers(self) -> KernelBuffers:
@@ -117,7 +120,12 @@ class KernelStageCost:
 
     @property
     def partial_storage_ratio(self):
-        return self.materialized_storage_bytes / Max(1, self.ordinary_storage_bytes)
+        base = self.stage.storage_base_bytes
+        count = self.stage.materialized_partition_count
+        if base is None or count is None:
+            return self.materialized_storage_bytes / Max(1, self.ordinary_storage_bytes)
+        carrier = self.materialized_storage_bytes / Max(1, count)
+        return Max(0, count - 1) * carrier / Max(1, base)
 
     @property
     def residency_bytes(self):

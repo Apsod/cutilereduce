@@ -214,6 +214,19 @@ def _numeric(value):
     return value
 
 
+def _coerce_numeric_array(value):
+    array = np.asarray(value)
+    if array.dtype != object:
+        return array
+    try:
+        numeric = array.astype(np.float64)
+    except (TypeError, ValueError):
+        return array
+    if np.all(np.isfinite(numeric)) and np.all(numeric == np.floor(numeric)):
+        return numeric.astype(np.int64)
+    return numeric
+
+
 def _evaluate_scalar_metric(stage, name, row, symbols):
     frame = pl.DataFrame((row,))
     result = StageInstantiation.make(
@@ -336,8 +349,26 @@ def partition_configs_for_tiles(
         base = storage_value(0)
         slope = storage_value(1) - base
         second = storage_value(2)
+        third = storage_value(3)
         if slope > 0 and math.isclose(second, base + 2 * slope, rel_tol=1e-10, abs_tol=1e-12):
             storage_bound = math.floor((max_storage_ratio - base) / slope)
+        else:
+            # The checkpoint-style metric is clamped at zero for one
+            # partition: values are 0, 0, s, 2s, ... for p=0,1,2,3.
+            # Recognize that shifted affine form so partition discovery keeps
+            # the direct bound instead of falling back to per-row searches.
+            shifted_slope = second - storage_value(1)
+            if (
+                shifted_slope > 0
+                and math.isclose(storage_value(1), 0, abs_tol=1e-12)
+                and math.isclose(
+                    third - second,
+                    shifted_slope,
+                    rel_tol=1e-10,
+                    abs_tol=1e-12,
+                )
+            ):
+                storage_bound = math.floor(max_storage_ratio / shifted_slope) + 1
     except (KeyError, TypeError, ValueError, ZeroDivisionError):
         storage_bound = None
     rows = []
@@ -421,7 +452,7 @@ def _add_derived_measures(stage: KernelStage, frame: pl.DataFrame, substitutions
                 except KeyError:
                     return None
         if isinstance(value, np.ndarray):
-            return value
+            return _coerce_numeric_array(value)
         if isinstance(value, np.generic):
             return np.full(current.height, value.item())
         if isinstance(value, Number):
@@ -464,10 +495,10 @@ def _add_derived_measures(stage: KernelStage, frame: pl.DataFrame, substitutions
         frame,
     )
     if residency is not None and smem is not None and max_programs is not None:
-        occupancy = np.minimum(
+        occupancy = _coerce_numeric_array(np.minimum(
             np.asarray(max_programs),
             np.asarray(smem) // np.maximum(1, np.asarray(residency)),
-        )
+        ))
         columns[str(cost.resident_programs_per_sm_symbol)] = occupancy
         frame = frame.with_columns(
             pl.Series(str(cost.resident_programs_per_sm_symbol), occupancy)
@@ -499,14 +530,16 @@ def canonicalize_grouped_configs(
 ) -> pl.DataFrame:
     """Collapse tile configurations equivalent under multiplicative groups.
 
-    Group analysis is performed on the symbolic cost expressions.  Rows are
-    collapsed only when the exact derived-measure columns also agree; this
-    keeps ceil based effects (for example, a changed number of tiles) intact.
-    The representative maximizes the rightmost axis in each group, matching
-    the stage axis order.
+    Group analysis and row equivalence are both based on the symbolic
+    expressions consumed by the sweep.  Unrequested derived diagnostics do
+    not prevent reduction when a cost expression depends only on a product
+    such as ``l_tile * g_tile``.  The representative maximizes the rightmost
+    axis in each group, matching the stage axis order.
     """
     if frame.is_empty():
         return frame
+
+    expressions = tuple(expressions)
 
     groups = set()
     for expression in expressions:
@@ -565,11 +598,35 @@ def canonicalize_grouped_configs(
     axis_columns = {
         name: f"cfg:{name}" for name in available
     }
-    # Exact derived measures are the non-config columns present at this point.
-    # They include num_tiles, tiles_per_program, span_tiles, and span.
-    signature_columns = tuple(
-        column for column in frame.columns if not column.startswith("cfg:")
-    )
+    # Compare the values of the expressions that the sweep actually uses.
+    # Do not use every derived column here: per-axis diagnostics such as
+    # ``l_num_tiles`` and ``g_num_tiles`` may differ while the selected cost
+    # expression depends only on ``l_tile * g_tile``.  Including all derived
+    # columns would identify the product group and then immediately defeat
+    # the reduction.
+    context = {
+        column.removeprefix("cfg:"): frame[column].to_numpy()
+        for column in frame.columns
+    }
+    expression_values = []
+    try:
+        for expression in expressions:
+            value = expr.evaluate_batch(expression, context)
+            values = np.asarray(value)
+            if values.ndim == 0:
+                values = np.full(frame.height, values.item())
+            if values.shape[0] != frame.height:
+                raise ValueError("expression did not produce one value per row")
+            expression_values.append(values)
+    except (KeyError, TypeError, ValueError, ZeroDivisionError):
+        # If an expression cannot be evaluated at this stage, retain the
+        # previous conservative behavior rather than collapsing rows whose
+        # actual metric values may differ.
+        expression_values = [
+            frame[column].to_numpy()
+            for column in frame.columns
+            if not column.startswith("cfg:")
+        ]
     grouped_columns = {
         axis_columns[name]
         for group in selected
@@ -591,7 +648,10 @@ def canonicalize_grouped_configs(
             product = 1
             for value in values:
                 product *= int(value)
-            exact = tuple(row[column] for column in signature_columns)
+            exact = tuple(
+                value[index].item() if isinstance(value[index], np.generic) else value[index]
+                for value in expression_values
+            )
             bucket.append((product, exact))
             # The rightmost axis is preferred, then the next rightmost, etc.
             score.extend(values[::-1])
@@ -740,10 +800,35 @@ class Sweep:
             )
         eval_kwargs = dict(eval_kwargs)
         eval_kwargs["symbols"] = symbols
+
+        # Apply cheap feasibility filters before evaluating metrics that may
+        # divide by a feasibility-dependent quantity.  In particular, an
+        # infeasible tile can have zero resident programs, which makes
+        # sm_utilization zero and would otherwise raise while evaluating
+        # compute_time/traffic_time before the residency filter gets a chance
+        # to reject the row.
+        filter_roots = _filter_root_names(self.filters)
+        prefilter_names = tuple(
+            name for name in filter_roots
+            if hasattr(stage.cost, name)
+        )
+        if prefilter_names:
+            prefiltered = StageInstantiation.make(
+                stage,
+                attributes=prefilter_names,
+                symbols=symbols,
+            ).evaluate(frame)
+            frame = self.filter(prefiltered)
+            if frame.is_empty():
+                return frame
+
         frontier = None
+        metric_attributes = tuple(
+            name for name in self.attributes if name not in prefilter_names
+        )
         for chunk in chunked_evaluate_stage(
             stage,
-            attributes=self.attributes,
+            attributes=metric_attributes,
             configs=frame,
             **eval_kwargs,
         ):

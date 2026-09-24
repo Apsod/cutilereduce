@@ -55,6 +55,7 @@ from .sweep import (
     evaluate_stage,
     partition_configs_for_tiles,
 )
+from .sweep_results import BackwardSweepResult, ForwardSweepResult, SweepFrame, SweepSchema
 from .typestuff import DType, to_torch_dtype
 from .variables import ATOMIC_ADD, PIPELINE_EFFICIENCY, atomic_add_write, normal_write
 from .work import MatMulWork, WorkModel, matmul, workmodel
@@ -125,6 +126,10 @@ __all__ = [
     "chunked_evaluate_stage",
     "evaluate_stage",
     "partition_configs_for_tiles",
+    "SweepFrame",
+    "SweepSchema",
+    "ForwardSweepResult",
+    "BackwardSweepResult",
     "matmul",
     "normal_write",
     "to_torch_dtype",

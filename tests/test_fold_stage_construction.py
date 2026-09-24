@@ -518,10 +518,14 @@ class FoldStageConstructionTests(unittest.TestCase):
 
         self.assertEqual(fold_stage.cost.write_traffic, fold_stage.write_buffers.accessed_bytes)
         self.assertEqual(fold_stage.cost.effective_traffic, fold_stage.cost.traffic)
-        self.assertEqual(
+        ratio = expr.evaluate(
             fold_stage.cost.partial_storage_ratio,
-            fold_stage.cost.materialized_storage_bytes
-            / fold_stage.cost.ordinary_storage_bytes,
+            {"b": 8, "v": 17, "d": 16},
+        )
+        base = expr.evaluate(spec.base_storage_bytes, {"b": 8, "v": 17, "d": 16})
+        self.assertAlmostEqual(
+            float(ratio),
+            float(fold_stage.cost.materialized_storage_bytes / 2 / base),
         )
         self.assertEqual(fold_stage.cost.work_efficiency, fold_stage.cost.mma_efficiency)
 
@@ -593,6 +597,12 @@ class FoldStageConstructionTests(unittest.TestCase):
             pl.col("cfg:partition_count") == 2
         )["partial_storage_ratio"][0]
         self.assertEqual(vector, float(scalar))
+        self.assertEqual(
+            evaluated.filter(pl.col("cfg:partition_count") == 1)[
+                "partial_storage_ratio"
+            ][0],
+            0.0,
+        )
         self.assertGreater(evaluated["model_flops_utilization"][0], 0)
 
         pipeline_eval = evaluate_stage(
