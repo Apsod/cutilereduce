@@ -10,9 +10,11 @@ The experiment separates three concerns:
 
 - `FoldSpec` describes input tensors, identifies the axes that the algebra must
   fold, and records batch axes as user intent for validation and later planning.
-- `Monoid` owns one structured value, its identity and combine operations, and
-  an optional axis-polymorphic fold lowering. `FoldAlgebra` relates three such
-  monoids: semantic `S`, execution `E`, and adjoint `A`.
+- `Monoid` owns one structured value and its identity and combine operations.
+  It may also provide optimized axis-polymorphic fold or scan lowerings.
+  `FoldAlgebra` relates semantic
+  and execution monoids `S` and `E` to a gradient-accumulator partial
+  semigroup `A`.
 - `TensorBuilder` records the user's map and the algebra lowering as an
   axis-aware tensor IR.
 
@@ -41,7 +43,7 @@ and reductions therefore batch over untouched axes automatically. Declared
 `batch_axes` record which surviving axes belong to the outer fold problem.
 Other axes are inner axes used by input interactions or fields of the algebra.
 The distinction is useful for validation and later scheduling, but batch axes
-are not passed to `Monoid.lower_fold`. The current IR preserves input axis order but
+are not passed to a monoid fold lowering. The current IR preserves input axis order but
 deliberately makes no promises about physical storage, tiling, or CUDA layouts.
 
 ## Writing the map
@@ -80,16 +82,19 @@ Elementwise operations use lazy named-axis broadcasting.
 
 ## Specifying a fold algebra
 
-A fold algebra contains three monoids:
+A fold algebra contains two monoids and a gradient-accumulator semigroup:
 
 - `semantic` (`S`): factors produced by the map and semantic fold results;
 - `execution` (`E`): the numerically or operationally useful reduction
   carrier;
-- `adjoint` (`A`): the accumulator used by the eventual backward lowering.
+- `accumulator` (`A`): the partial semigroup used to combine embedded prefix
+  cotangents in scan backward.
 
-Each monoid owns its structure, identity, combine, and fold lowering. Each
+Each monoid owns its structure, identity, and combine. `A`
+requires only an associative combine on its valid domain; an identity is not
+part of the `FoldAlgebra` contract. Each
 `TensorField` declares only its inner axes. Values retain all of their actual
-named-axis dependencies, while `lower_fold` is told only which axes it must
+named-axis dependencies, while `fold` is told only which axes it must
 eliminate:
 
 ```python
@@ -106,10 +111,10 @@ class ExampleExecutionMonoid(Monoid):
         vector = TensorField(("d",), "float32")
         self.structure = TensorStructure({"total": vector})
 
-    def lower_identity(self, ctx):
+    def identity(self, ctx):
         ...
 
-    def lower_combine(self, ctx, left, right):
+    def combine(self, ctx, left, right):
         ...
 
     def lower_fold(self, ctx, values, *, fold_axes):
@@ -117,9 +122,29 @@ class ExampleExecutionMonoid(Monoid):
         ...
 ```
 
+`lower_fold` and `lower_scan` are optional optimizations. Compiler-owned
+`lower_fold(monoid, ...)` and `lower_scan(monoid, ...)` emit structured
+associative IR operations using `identity` and `combine` when no specialization
+is provided. A scan returns both exclusive per-element prefixes and its final
+carrier, without prescribing whether either is materialized by a backend.
+The built-in Add monoid expands its scan to `scan_sum`, and products derive
+component scans. Coupled monoids such as LWS and affine-LWS currently retain
+the generic associative scan with its explicit combine region. They should
+only override `lower_scan` when they can emit an actual equivalent tensor
+program; naming an opaque monoid-specific operation is not considered a
+lowering.
+
 `FoldAlgebra` then owns only `Phi: S -> E`, `Psi: E -> S`,
-`embed: E x S* -> A`, and `finalize`, while its `semantic`, `execution`, and
-`adjoint` attributes are independently typed `Monoid` instances.
+`embed: E x S* -> A`, and `finalize`. Its `semantic` and `execution`
+attributes are `Monoid`s, while `accumulator` is a `PartialSemigroup`. For an
+ordinary fold, `embed` is called once and `A.combine` is unnecessary. For a
+scan, embedded prefix cotangents are suffix-scanned with `A.combine` before
+each call to `finalize`:
+
+```text
+A_i = combine_A(j > i, embed(prefix_j, grad_prefix_j))
+grad_factor_i = finalize(prefix_i, factor_i, A_i)
+```
 
 `StructuredValue` remains a flat record of tensor fields belonging to one
 algebra element. Recursive algebra constructions use the separate,
@@ -151,8 +176,9 @@ def xentropy_map(ctx, inputs):
     )
 ```
 
-`Product` is the concise public constructor for `ProductAlgebra`. Its three
-`ProductMonoid`s derive identities, combines, and folds componentwise, while
+`Product` is the concise public constructor for `ProductAlgebra`. Its semantic
+and execution `ProductMonoid`s derive identities, combines, and folds
+componentwise; its `ProductSemigroup` combines accumulators componentwise; while
 the algebra delegates `Phi`, `Psi`, `embed`, and `finalize`. The two components still inhabit one
 IR graph: the logits contraction is shared, their reductions can later be
 scheduled together, and semantic leaves materialize under stable paths such as
@@ -169,7 +195,7 @@ componentwise `Phi` and `Psi`. With the right-oriented convention:
     = (a_s o b_s, action(b_s, a_v) o b_v)
 ```
 
-The generic algebra construction cannot infer an efficient fold or a resolved adjoint
+The generic algebra construction cannot infer an efficient fold or a resolved accumulator
 factorization from an arbitrary action alone. Concrete instances provide those
 operations. Once the IR has a generic structured ordered-fold region, `Phi`,
 the action-aware `E.combine`, and the identity will also be sufficient for a
@@ -197,6 +223,39 @@ Its optimized region fold uses a reverse exclusive sum scan of log scales and
 a weighted sum of payloads. This makes ordering explicit in the tensor IR
 without fixing whether the region is a hardware tile or the complete fold.
 
+`AffineLWS` is the bounded, normalized variant in which the additive payload
+is itself a log-weighted sum:
+
+```python
+from cutilereduce.experimental import AffineLWS
+
+algebra = AffineLWS(("d",))
+factor = algebra.value(
+    acting=StructuredValue({"value": log_scale}),
+    payload=StructuredValue(
+        {"log_weight": log_weight, "value": payload}
+    ),
+)
+```
+
+Its ordered operation is:
+
+```text
+(a.alpha, a.beta) o (b.alpha, b.beta)
+    = (a.alpha + b.alpha,
+       reweight(b.alpha, a.beta) LWS-combine b.beta)
+
+reweight(s, beta).log_weight = beta.log_weight + s
+reweight(s, beta).value      = beta.value
+```
+
+The execution carrier stores the payload in the stable
+`{maximum, normalizer, numerator}` LWS representation. Consequently the
+action changes only a log-domain field, and projecting the observed payload
+produces a convex combination rather than an unbounded affine translation.
+Its gradient accumulator is `Add x LWS({weight, value})`, matching the stable
+carrier-resolved factorization for prefix-dependent scan backward.
+
 The monoid structure declarations are checked at tracing time. Field names,
 required inner axes, and dtypes must agree with mapped, lifted, folded, and
 projected values.
@@ -206,34 +265,53 @@ relationships:
 
 ```text
 Monoid[T]:
-    lower_identity: 1 -> T
-    lower_combine:  T x T -> T
-    lower_fold:     T[...,F] -> T[...]
+    identity: 1 -> T
+    combine:  T x T -> T
+    lower_fold: optional optimized T[...,F] -> T[...]
+    lower_scan: optional optimized (T[...,F], T[...]) -> (T[...,F], T[...])
 
 FoldAlgebra[S,E,A]:
-    lower_phi:      S -> E
-    lower_psi:      E -> S
-    lower_embed:    E x S* -> A
-    lower_finalize: S x A -> S*                 # commutative
-    lower_finalize: E_prefix x S x A -> S*      # general
+    to_execution: S -> E                         # Phi
+    to_semantic:  E -> S                         # Psi
+    embed:        E x S* -> A
+    finalize:     S x A -> S*                    # commutative
+    finalize:     E_prefix x S x A -> S*         # general
 ```
+
+Every `Monoid` explicitly declares `commutative`. The planner uses the
+execution monoid's declaration to decide whether partial carriers may be
+permuted; associativity still permits order-preserving regrouping for a
+non-commutative monoid. `FoldAlgebra.finalize_context` independently declares
+whether `finalize` requires no ordered context or an execution prefix:
+
+```text
+FinalizeContext.NONE
+FinalizeContext.PREFIX
+```
+
+The prefix requirement is not inferred from the Python method signature and
+does not define monoid commutativity. Products propagate commutativity only
+when every component monoid is commutative, and require prefix context when
+any component algebra requires it. Semidirect-product monoids conservatively
+declare themselves non-commutative.
 
 These operations construct tensor IR and therefore operate pointwise over
 every axis they do not explicitly eliminate. A specialized monoid fold must be
-equivalent to repeated `lower_combine`. Unsupported operations fail explicitly
+equivalent to repeated `combine`. Unsupported operations fail explicitly
 rather than silently selecting a placeholder implementation.
 
-Identities are single algebra elements: their fields contain only the inner
-axes declared by `E` or `A`. They do not receive batch or other outer axes.
+Monoid identities are single algebra elements: their fields contain only the
+inner axes declared by `S` or `E`. They do not receive batch or other outer axes.
 `Phi`, `Psi`, combine, embed, and finalize are likewise elementwise and simply
 preserve the dependencies of their operands. The fold lowering is different:
 it receives `fold_axes` because its job is specifically to eliminate those
 axes. Any lifting of an identity across outer axes belongs to the surrounding
 tensor program, not to the algebra definition.
 
-The current forward compiler needs `Phi`, `E.lower_fold`, and `Psi`. LWS uses
+The current forward compiler needs `to_execution`, `E.fold`, and
+`to_semantic`. LWS uses
 an LWS semantic monoid, a stable execution-carrier monoid, and another LWS
-monoid over `{scalar, value}` as its adjoint. Its `embed` and `finalize` realize
+monoid over `{scalar, value}` as its accumulator. Its `embed` and `finalize` realize
 the stable LWS gradient factorization.
 
 ### Correctness contract for execution folding
@@ -243,13 +321,13 @@ Let `lift: S -> E` be the factorwise semantic-to-execution map (denoted
 every factor first and then folding in the execution monoid:
 
 ```text
-E.lower_fold(Phi^F(S[...,F])) == fold_E_F(map(Phi, S[...,F]))
+E.fold(to_execution^F(S[...,F])) == fold_E_F(map(Phi, S[...,F]))
 ```
 
 In mathematical shorthand:
 
 ```text
-forward region = E.lower_fold o Phi^F
+forward region = E.fold o to_execution^F
 ```
 
 It is explicitly **not**:
@@ -269,12 +347,12 @@ must preserve `fold_E o Phi^F` semantics.
 The final semantic fold result is obtained only afterward:
 
 ```text
-partial carriers = E.lower_fold(Phi(factor region 1)), ...
+partial carriers = E.fold(to_execution(factor region 1)), ...
 combined carrier = fold(E.combine, partial carriers)
 semantic result  = Psi(combined carrier)
 ```
 
-Crucially, an invocation of `E.lower_fold` need not cover the complete logical
+Crucially, an invocation of `E.fold` need not cover the complete logical
 fold domain. It lowers an arbitrary factor region to a valid (possibly
 partial) `E` value. The same lowering can therefore be used for one tile, many
 tiles handled by a loop, a persistent work assignment, or the entire fold.
@@ -283,7 +361,7 @@ preserve logical factor order.
 
 The algebra does not choose among those possibilities. Tiling, loops,
 persistence, reduction trees, partial-state materialization, and kernel
-boundaries belong to an execution planner. `E.lower_fold` is deliberately
+boundaries belong to an execution planner. `E.fold` is deliberately
 agnostic about all of them. Applying `Psi` before all required partial carriers
 have been combined is only valid when the selected region was the complete
 fold domain.
@@ -295,7 +373,7 @@ operations such as `map_fold_E` or `map_finalize_map*` are not methods of
 `FoldAlgebra`. Their canonical forward composition is:
 
 ```text
-inputs -> map -> S[...,F] -> Phi -> E[...,F] -> E.lower_fold -> partial E
+inputs -> map -> S[...,F] -> to_execution -> E[...,F] -> E.fold -> partial E
 ```
 
 and the canonical local backward composition is:
@@ -313,7 +391,7 @@ crosses the boundary between the user map and the algebra. The algebra owns
 only operations over its `S`, `E`, and `A` structures; it neither receives nor
 owns a `map_region`.
 
-Like `E.lower_fold` itself, these fused rewrites are region-polymorphic and do
+Like `E.fold` itself, these fused rewrites are region-polymorphic and do
 not prescribe staging. A planner may instantiate them over any chosen region
 and decide whether their partial carriers or cotangents remain local, are
 combined in a loop, or are persisted for later work.
@@ -333,11 +411,11 @@ local_backward = compile_map_finalize_vjp_region(
 print(local_backward.format())
 ```
 
-This program has `adjoint.*` inputs and performs:
+This program has `accumulator.*` inputs and performs:
 
 ```text
 region inputs -> xentropy_map -> local S
-local S, adjoint A -> finalize -> local S*
+local S, accumulator A -> finalize -> local S*
 local S* -> VJP(xentropy_map) -> partial input cotangents
 ```
 
@@ -356,16 +434,20 @@ local_backward = compile_map_finalize_vjp_region(
     spec,
     Affine(("d",)),
     affine_map,
-    with_prefix=True,
 )
 ```
 
-For affine composition this introduces `prefix.acting.value` and
-`prefix.payload.value` inputs. Given global adjoint state containing the total
-scale and output cotangents, `finalize` reconstructs the suffix scale from the
-total, prefix, and local scales and produces the local scale and payload
-cotangents. Prefix-dependent finalize is needed for this general
-non-commutative case, not for commutative folds.
+The affine algebra's `FinalizeContext.PREFIX` declaration automatically
+introduces an exclusive tile-boundary `prefix.*` input. The region scans its
+mapped execution carriers to obtain factorwise prefixes for `finalize` and
+returns `updated_prefix.*`, the inclusive carrier at the outgoing tile
+boundary. Its
+accumulator stores the sum of scale cotangents and represents prefix-scale
+weighted payload cotangents with an LWS payload. Thus its combine never first
+forms `exp(prefix_scale) * payload_cotangent`. `finalize` uses the LWS
+log-weight relative to the local prefix, then transports the normalized
+payload through the local factor. Prefix-dependent finalize is needed for
+this non-commutative case, not for commutative folds.
 
 Both forms expose the composition needed for a future fusion rewrite, but the
 rewrite itself remains a compiler optimization rather than a `FoldAlgebra`
@@ -477,7 +559,7 @@ fundamental algebra operation:
 ```text
 updated_E = E.combine(
     state_E,
-    E.lower_fold(Phi(map(region))),
+    E.fold(to_execution(map(region))),
 )
 ```
 
@@ -539,14 +621,14 @@ print(program.format())
 
 1. Create symbolic input nodes with their actual axis dependencies.
 2. Trace `map` to obtain semantic factors retaining their actual dependencies.
-3. Apply `Phi` pointwise to obtain execution carriers retaining the fold axes.
-4. Invoke `execution.lower_fold` with only the fold axes to obtain a partial
+3. Apply `to_execution` pointwise to obtain carriers retaining the fold axes.
+4. Invoke `execution.fold` with only the fold axes to obtain a partial
    execution carrier in which those axes have been eliminated.
-5. Invoke `Psi` to recover semantic outputs and materialize their fields.
+5. Invoke `to_semantic` to recover semantic outputs and materialize their fields.
 
 The current prototype instantiates this trace over a single region spanning
 the complete declared fold axes. That is a limitation of the current compiler,
-not part of the `execution.lower_fold` contract. A subsequent planner-oriented
+not part of the `execution.fold` contract. A subsequent planner-oriented
 representation should be able to instantiate the same lowering over arbitrary
 regions, combine their partial `E` values, and apply `Psi` only to the combined
 carrier.
@@ -624,7 +706,7 @@ cotangent accumulation, and contractions. Contraction VJPs are emitted as new
 contractions, so the cross-entropy map produces GEMM-shaped gradients for both
 input matrices.
 
-`Add` and `LogSumExp` implement the adjoint operations needed by the
+`Add` and `LogSumExp` implement the accumulator operations needed by the
 cross-entropy product. The shared logits expression receives and adds the
 cotangents returned by both component finalizers:
 
@@ -635,7 +717,7 @@ g_logits = exp(logits - logsumexp) * g_normalizer
 
 This local cotangent remains symbolic and feeds the two contraction VJPs; it is
 not an output materialization. LWS uses the same construction with an LWS
-adjoint monoid. General planner construction of prefix context and concrete
+accumulator monoid. General planner construction of prefix context and concrete
 backward scheduling remain future work.
 
 ## Current scope
@@ -648,8 +730,10 @@ Implemented:
 - contraction-axis partitioning and implementation hints;
 - flat structured values for individual algebras and recursive composite
   values for algebra constructions;
-- independently structured semantic, execution, and adjoint monoids;
-- monoid-owned identity, combine, and optimized region-fold lowering;
+- independently structured semantic and execution monoids and an accumulator
+  partial semigroup;
+- monoid-owned identity and combine, optional optimized fold lowerings, and
+  generic structured associative fold/scan fallbacks;
 - componentwise `ProductAlgebra`, plus `Add` and `LogSumExp` instances;
 - a right-oriented `SemidirectProductMonoid` construction and concrete
   prefix-differentiable `LogScaleAffine` instance;
@@ -665,12 +749,10 @@ Implemented:
 
 Not implemented yet:
 
-- scalar algebra definitions and a generic combine-based fallback;
-- generic structured ordered-fold regions and a combine-derived fallback;
 - execution-carrier combination across partitions;
 - VJP rules beyond the current bounded tensor-IR subset;
-- planner construction of prefix context for arbitrary non-commutative folds;
-- adjoint suffix scans for differentiable scans;
+- physical planning of prefix scans and boundary-carrier persistence;
+- accumulator suffix scans for differentiable scans;
 - additional global/algebra-aware optimization passes;
 - accumulating-fold recognition and online carrier-update lowering;
 - explicit carrier ordering/merge capabilities, including compensated sums;

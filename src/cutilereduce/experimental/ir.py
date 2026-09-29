@@ -74,16 +74,31 @@ class TensorProgram:
 
     def format(self) -> str:
         lines = []
+        regions: list[TensorProgram] = []
         output_names = {node_id: name for name, node_id in self.outputs}
         for node in self.nodes:
             inputs = ", ".join(f"%{value}" for value in node.inputs)
-            attrs = ", ".join(f"{key}={value!r}" for key, value in node.attributes)
+            formatted_attrs = []
+            for key, value in node.attributes:
+                if isinstance(value, TensorProgram):
+                    if value not in regions:
+                        regions.append(value)
+                    formatted_attrs.append(
+                        f"{key}=@region{regions.index(value)}"
+                    )
+                else:
+                    formatted_attrs.append(f"{key}={value!r}")
+            attrs = ", ".join(formatted_attrs)
             details = ", ".join(value for value in (inputs, attrs) if value)
             suffix = f" -> {output_names[node.id]}" if node.id in output_names else ""
             lines.append(
                 f"%{node.id} = {node.op}({details}) : "
                 f"tensor[{', '.join(node.axes)}; {node.dtype}]{suffix}"
             )
+        for index, region in enumerate(regions):
+            lines.append(f"region @region{index} {{")
+            lines.extend(f"  {line}" for line in region.format().splitlines())
+            lines.append("}")
         return "\n".join(lines)
 
 
@@ -247,6 +262,28 @@ class TensorBuilder:
             over=over,
             exclusive=exclusive,
             reverse=reverse,
+        )
+
+    def associative_result(
+        self,
+        op: str,
+        inputs: tuple[TensorValue, ...],
+        *,
+        axes: tuple[str, ...],
+        dtype: str,
+        region: TensorProgram,
+        result_path: tuple[str, ...],
+        over: tuple[str, ...],
+    ) -> TensorValue:
+        """Add one result of a structured associative fold or scan region."""
+        return self._add(
+            op,
+            inputs,
+            axes,
+            dtype,
+            over=over,
+            result_path=result_path,
+            combine_region=region,
         )
 
     def contract(

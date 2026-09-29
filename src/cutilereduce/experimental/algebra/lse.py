@@ -2,22 +2,30 @@
 
 from __future__ import annotations
 
-from .base import FoldAlgebra, Monoid, StructuredValue, TensorField, TensorStructure
+from .base import (
+    FinalizeContext,
+    FoldAlgebra,
+    Monoid,
+    StructuredValue,
+    TensorField,
+    TensorStructure,
+)
 from .lws import LogWeightedMonoid
 from ..ir import TensorBuilder
 
 
 class LogAddExpMonoid(Monoid[StructuredValue]):
+    commutative = True
     def __init__(self, dtype: str = "float32"):
         self.dtype = dtype
         self.structure = TensorStructure({"value": TensorField(dtype=dtype)})
 
-    def lower_identity(self, ctx: TensorBuilder) -> StructuredValue:
+    def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
             {"value": ctx.constant(float("-inf"), self.dtype)}
         )
 
-    def lower_combine(
+    def combine(
         self,
         ctx: TensorBuilder,
         left: StructuredValue,
@@ -54,8 +62,8 @@ class LogAddExpMonoid(Monoid[StructuredValue]):
         )
         return StructuredValue({"value": maximum + ctx.log(normalizer)})
 
-
 class LSEExecutionMonoid(Monoid[StructuredValue]):
+    commutative = True
     def __init__(self, dtype: str = "float32"):
         self.dtype = dtype
         scalar = TensorField(dtype=dtype)
@@ -63,7 +71,7 @@ class LSEExecutionMonoid(Monoid[StructuredValue]):
             {"maximum": scalar, "normalizer": scalar}
         )
 
-    def lower_identity(self, ctx: TensorBuilder) -> StructuredValue:
+    def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
             {
                 "maximum": ctx.constant(float("-inf"), self.dtype),
@@ -71,7 +79,7 @@ class LSEExecutionMonoid(Monoid[StructuredValue]):
             }
         )
 
-    def lower_combine(
+    def combine(
         self,
         ctx: TensorBuilder,
         left: StructuredValue,
@@ -112,17 +120,17 @@ class LSEExecutionMonoid(Monoid[StructuredValue]):
             {"maximum": maximum, "normalizer": normalizer}
         )
 
-
 class LogSumExp(
     FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]
 ):
+    finalize_context = FinalizeContext.NONE
     def __init__(self, dtype: str = "float32"):
         scalar = TensorField(dtype=dtype)
         self.semantic = LogAddExpMonoid(dtype)
         self.execution = LSEExecutionMonoid(dtype)
-        self.adjoint = LogWeightedMonoid({"value": scalar}, dtype)
+        self.accumulator = LogWeightedMonoid({"value": scalar}, dtype)
 
-    def lower_phi(
+    def to_execution(
         self, ctx: TensorBuilder, semantic: StructuredValue
     ) -> StructuredValue:
         self.semantic.validate(semantic, label="LSE semantic factor")
@@ -134,7 +142,7 @@ class LogSumExp(
             }
         )
 
-    def lower_psi(
+    def to_semantic(
         self, ctx: TensorBuilder, execution: StructuredValue
     ) -> StructuredValue:
         self.execution.validate(execution, label="LSE execution carrier")
@@ -145,13 +153,13 @@ class LogSumExp(
             }
         )
 
-    def lower_embed(
+    def embed(
         self,
         ctx: TensorBuilder,
         execution: StructuredValue,
         semantic_cotangent: StructuredValue,
     ) -> StructuredValue:
-        semantic = self.lower_psi(ctx, execution)
+        semantic = self.to_semantic(ctx, execution)
         self.semantic.validate(
             semantic_cotangent, label="LSE semantic cotangent"
         )
@@ -162,23 +170,23 @@ class LogSumExp(
             }
         )
 
-    def lower_finalize(
+    def finalize(
         self,
         ctx: TensorBuilder,
         factor: StructuredValue,
-        adjoint: StructuredValue,
+        accumulator: StructuredValue,
         *,
         prefix: StructuredValue | None = None,
     ) -> StructuredValue:
         del prefix
         self.semantic.validate(factor, label="LSE semantic factor")
-        self.adjoint.validate(adjoint, label="LSE adjoint")
+        self.accumulator.validate(accumulator, label="LSE accumulator")
         return StructuredValue(
             {
                 "value": ctx.exp(
-                    factor["value"] + adjoint["log_weight"]
+                    factor["value"] + accumulator["log_weight"]
                 )
-                * adjoint["value"]
+                * accumulator["value"]
             }
         )
 

@@ -4,12 +4,21 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from .base import FoldAlgebra, Monoid, StructuredValue, TensorField, TensorStructure
+from .base import (
+    FinalizeContext,
+    FoldAlgebra,
+    Monoid,
+    StructuredValue,
+    TensorField,
+    TensorStructure,
+)
 from ..ir import TensorBuilder, TensorValue
 
 
 class LogWeightedMonoid(Monoid[StructuredValue]):
     """LWS over an arbitrary flat record of payload tensor fields."""
+
+    commutative = True
 
     def __init__(
         self,
@@ -24,7 +33,7 @@ class LogWeightedMonoid(Monoid[StructuredValue]):
             {"log_weight": TensorField(dtype=dtype), **self.payload_fields}
         )
 
-    def lower_identity(self, ctx: TensorBuilder) -> StructuredValue:
+    def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
             {
                 "log_weight": ctx.constant(float("-inf"), self.dtype),
@@ -35,7 +44,7 @@ class LogWeightedMonoid(Monoid[StructuredValue]):
             }
         )
 
-    def lower_combine(
+    def combine(
         self,
         ctx: TensorBuilder,
         left: StructuredValue,
@@ -81,9 +90,10 @@ class LogWeightedMonoid(Monoid[StructuredValue]):
             )
         return StructuredValue(fields)
 
-
 class LWSExecutionMonoid(Monoid[StructuredValue]):
     """Stable execution carrier for an LWS with one tensor payload."""
+
+    commutative = True
 
     def __init__(self, value_axes: tuple[str, ...], dtype: str = "float32"):
         scalar = TensorField(dtype=dtype)
@@ -96,7 +106,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             }
         )
 
-    def lower_identity(self, ctx: TensorBuilder) -> StructuredValue:
+    def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
             {
                 "maximum": ctx.constant(float("-inf")),
@@ -107,7 +117,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             }
         )
 
-    def lower_combine(
+    def combine(
         self,
         ctx: TensorBuilder,
         left: StructuredValue,
@@ -153,23 +163,24 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             }
         )
 
-
 class LogWeightedSum(
     FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]
 ):
     """Stable log-weighted summation over one tensor payload."""
+
+    finalize_context = FinalizeContext.NONE
 
     def __init__(self, value_axes: tuple[str, ...], dtype: str = "float32"):
         scalar = TensorField(dtype=dtype)
         value = TensorField(value_axes, dtype)
         self.semantic = LogWeightedMonoid({"value": value}, dtype)
         self.execution = LWSExecutionMonoid(value_axes, dtype)
-        self.adjoint = LogWeightedMonoid(
+        self.accumulator = LogWeightedMonoid(
             {"scalar": scalar, "value": value}, dtype
         )
         self.value_axes = value_axes
 
-    def lower_phi(
+    def to_execution(
         self, ctx: TensorBuilder, semantic: StructuredValue
     ) -> StructuredValue:
         self.semantic.validate(semantic, label="LWS semantic factor")
@@ -182,7 +193,7 @@ class LogWeightedSum(
             }
         )
 
-    def lower_psi(
+    def to_semantic(
         self, ctx: TensorBuilder, execution: StructuredValue
     ) -> StructuredValue:
         self.execution.validate(execution, label="LWS execution carrier")
@@ -194,13 +205,13 @@ class LogWeightedSum(
             }
         )
 
-    def lower_embed(
+    def embed(
         self,
         ctx: TensorBuilder,
         execution: StructuredValue,
         semantic_cotangent: StructuredValue,
     ) -> StructuredValue:
-        result = self.lower_psi(ctx, execution)
+        result = self.to_semantic(ctx, execution)
         self.semantic.validate(
             semantic_cotangent, label="LWS semantic cotangent"
         )
@@ -217,30 +228,30 @@ class LogWeightedSum(
             }
         )
 
-    def lower_finalize(
+    def finalize(
         self,
         ctx: TensorBuilder,
         factor: StructuredValue,
-        adjoint: StructuredValue,
+        accumulator: StructuredValue,
         *,
         prefix: StructuredValue | None = None,
     ) -> StructuredValue:
         del prefix
         self.semantic.validate(factor, label="LWS local factor")
-        self.adjoint.validate(adjoint, label="LWS adjoint")
-        scale = ctx.exp(factor["log_weight"] + adjoint["log_weight"])
+        self.accumulator.validate(accumulator, label="LWS accumulator")
+        scale = ctx.exp(factor["log_weight"] + accumulator["log_weight"])
         return StructuredValue(
             {
                 "log_weight": scale
                 * (
-                    adjoint["scalar"]
+                    accumulator["scalar"]
                     + ctx.contract(
-                        adjoint["value"],
+                        accumulator["value"],
                         factor["value"],
                         over=self.value_axes,
                     )
                 ),
-                "value": scale * adjoint["value"],
+                "value": scale * accumulator["value"],
             }
         )
 

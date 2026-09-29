@@ -2,21 +2,30 @@
 
 from __future__ import annotations
 
-from .base import FoldAlgebra, Monoid, StructuredValue, TensorField, TensorStructure
+from .base import (
+    FinalizeContext,
+    FoldAlgebra,
+    Monoid,
+    ScanResult,
+    StructuredValue,
+    TensorField,
+    TensorStructure,
+)
 from ..ir import TensorBuilder
 
 
 class AddMonoid(Monoid[StructuredValue]):
+    commutative = True
     def __init__(self, inner_axes: tuple[str, ...] = (), dtype: str = "float32"):
         self.field = TensorField(inner_axes, dtype)
         self.structure = TensorStructure({"value": self.field})
 
-    def lower_identity(self, ctx: TensorBuilder) -> StructuredValue:
+    def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
             {"value": ctx.full(self.field.inner_axes, 0.0, self.field.dtype)}
         )
 
-    def lower_combine(
+    def combine(
         self,
         ctx: TensorBuilder,
         left: StructuredValue,
@@ -39,29 +48,51 @@ class AddMonoid(Monoid[StructuredValue]):
             {"value": ctx.reduce("sum", values["value"], fold_axes)}
         )
 
+    def lower_scan(
+        self,
+        ctx: TensorBuilder,
+        values: StructuredValue,
+        *,
+        scan_axis: str,
+        initial: StructuredValue,
+    ) -> ScanResult[StructuredValue]:
+        self.validate(values, label="additive scan values")
+        self.validate(initial, label="additive scan initial")
+        prefixes = initial["value"] + ctx.scan(
+            "sum", values["value"], over=scan_axis, exclusive=True
+        )
+        final = initial["value"] + ctx.reduce(
+            "sum", values["value"], (scan_axis,)
+        )
+        return ScanResult(
+            prefixes=StructuredValue({"value": prefixes}),
+            final=StructuredValue({"value": final}),
+        )
+
 
 class Add(FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]):
+    finalize_context = FinalizeContext.NONE
     def __init__(self, inner_axes: tuple[str, ...] = (), dtype: str = "float32"):
         monoid = AddMonoid(inner_axes, dtype)
         self.semantic = monoid
         self.execution = monoid
-        self.adjoint = monoid
+        self.accumulator = monoid
 
-    def lower_phi(
+    def to_execution(
         self, ctx: TensorBuilder, semantic: StructuredValue
     ) -> StructuredValue:
         del ctx
         self.semantic.validate(semantic, label="add semantic factor")
         return semantic
 
-    def lower_psi(
+    def to_semantic(
         self, ctx: TensorBuilder, execution: StructuredValue
     ) -> StructuredValue:
         del ctx
         self.execution.validate(execution, label="add execution carrier")
         return execution
 
-    def lower_embed(
+    def embed(
         self,
         ctx: TensorBuilder,
         execution: StructuredValue,
@@ -73,17 +104,17 @@ class Add(FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]):
         )
         return semantic_cotangent
 
-    def lower_finalize(
+    def finalize(
         self,
         ctx: TensorBuilder,
         factor: StructuredValue,
-        adjoint: StructuredValue,
+        accumulator: StructuredValue,
         *,
         prefix: StructuredValue | None = None,
     ) -> StructuredValue:
         del ctx, factor, prefix
-        self.adjoint.validate(adjoint, label="add adjoint")
-        return adjoint
+        self.accumulator.validate(accumulator, label="add accumulator")
+        return accumulator
 
 
 __all__ = ["Add", "AddMonoid"]

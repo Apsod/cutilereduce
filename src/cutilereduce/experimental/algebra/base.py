@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from enum import Enum
 from typing import Never
 
 from ..ir import TensorBuilder, TensorValue
@@ -89,6 +90,11 @@ class CompositeStructure:
 type AlgebraStructure = TensorStructure | CompositeStructure
 
 
+class FinalizeContext(Enum):
+    NONE = "none"
+    PREFIX = "prefix"
+
+
 def value_leaves(
     value: AlgebraValue, prefix: tuple[str, ...] = ()
 ) -> Iterator[tuple[tuple[str, ...], TensorValue]]:
@@ -101,10 +107,11 @@ def value_leaves(
         yield from value_leaves(component, (*prefix, name))
 
 
-class Monoid[ValueT: AlgebraValue]:
-    """One structured monoid and its tensor-IR lowering operations."""
+class PartialSemigroup[ValueT: AlgebraValue]:
+    """A possibly partial associative combine operation."""
 
     structure: AlgebraStructure
+    commutative: bool
 
     def _unsupported(self, operation: str) -> Never:
         raise NotImplementedError(
@@ -114,12 +121,7 @@ class Monoid[ValueT: AlgebraValue]:
     def validate(self, value: AlgebraValue, *, label: str) -> None:
         self.structure.validate(value, label=label)
 
-    def lower_identity(self, ctx: TensorBuilder) -> ValueT:
-        """Construct one identity, carrying only the monoid's inner axes."""
-        del ctx
-        self._unsupported("identity")
-
-    def lower_combine(
+    def combine(
         self,
         ctx: TensorBuilder,
         left: ValueT,
@@ -129,68 +131,96 @@ class Monoid[ValueT: AlgebraValue]:
         del ctx, left, right
         self._unsupported("combine")
 
+
+class Monoid[ValueT: AlgebraValue](PartialSemigroup[ValueT]):
+    """A partial semigroup with an identity and optional optimized lowerings."""
+
+    def identity(self, ctx: TensorBuilder) -> ValueT:
+        """Construct one identity, carrying only the monoid's inner axes."""
+        del ctx
+        self._unsupported("identity")
+
     def lower_fold(
         self,
         ctx: TensorBuilder,
         values: ValueT,
         *,
         fold_axes: tuple[str, ...],
-    ) -> ValueT:
-        """Fold an arbitrary region without prescribing its staging."""
+    ) -> ValueT | None:
+        """Optionally emit an optimized fold; ``None`` selects the fallback."""
         del ctx, values, fold_axes
-        self._unsupported("fold")
+        return None
+
+    def lower_scan(
+        self,
+        ctx: TensorBuilder,
+        values: ValueT,
+        *,
+        scan_axis: str,
+        initial: ValueT,
+    ) -> ScanResult[ValueT] | None:
+        """Optionally emit an optimized exclusive scan and final carrier."""
+        del ctx, values, scan_axis, initial
+        return None
+
+
+@dataclass(frozen=True)
+class ScanResult[ValueT: AlgebraValue]:
+    prefixes: ValueT
+    final: ValueT
 
 
 class FoldAlgebra[
     SemanticT: AlgebraValue,
     ExecutionT: AlgebraValue,
-    AdjointT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
 ]:
-    """Relationships among semantic, execution, and adjoint monoids."""
+    """Semantic/execution monoids and their gradient accumulator relation."""
 
     semantic: Monoid[SemanticT]
     execution: Monoid[ExecutionT]
-    adjoint: Monoid[AdjointT]
+    accumulator: PartialSemigroup[AccumulatorT]
+    finalize_context: FinalizeContext
 
     def _unsupported(self, operation: str) -> Never:
         raise NotImplementedError(
             f"{type(self).__name__} does not implement {operation} lowering"
         )
 
-    def lower_phi(
+    def to_execution(
         self, ctx: TensorBuilder, semantic: SemanticT
     ) -> ExecutionT:
         """Lift semantic factors into execution carriers, Phi: S -> E."""
         del ctx, semantic
         self._unsupported("Phi")
 
-    def lower_psi(
+    def to_semantic(
         self, ctx: TensorBuilder, execution: ExecutionT
     ) -> SemanticT:
         """Project an execution carrier to its semantic value, Psi: E -> S."""
         del ctx, execution
         self._unsupported("Psi")
 
-    def lower_embed(
+    def embed(
         self,
         ctx: TensorBuilder,
         execution: ExecutionT,
         semantic_cotangent: SemanticT,
-    ) -> AdjointT:
+    ) -> AccumulatorT:
         """Embed a global execution state and semantic cotangent into A."""
         del ctx, execution, semantic_cotangent
         self._unsupported("embed")
 
-    def lower_finalize(
+    def finalize(
         self,
         ctx: TensorBuilder,
         factor: SemanticT,
-        adjoint: AdjointT,
+        accumulator: AccumulatorT,
         *,
         prefix: ExecutionT | None = None,
     ) -> SemanticT:
         """Produce a local semantic cotangent, optionally using an E prefix."""
-        del ctx, factor, adjoint, prefix
+        del ctx, factor, accumulator, prefix
         self._unsupported("finalize")
 
 
@@ -198,7 +228,10 @@ __all__ = [
     "AlgebraStructure",
     "AlgebraValue",
     "FoldAlgebra",
+    "FinalizeContext",
     "Monoid",
+    "PartialSemigroup",
+    "ScanResult",
     "CompositeStructure",
     "CompositeValue",
     "StructuredValue",
