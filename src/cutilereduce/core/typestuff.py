@@ -19,3 +19,4 @@ def to_torch_dtype(dtype: DType) -> torch.dtype:
         case ct.uint32: return torch.uint32       # noqa: E701
         case ct.uint16: return torch.uint16       # noqa: E701
         case ct.uint8: return torch.uint8         # noqa: E701
+    raise TypeError(f"unsupported CUDA Tile dtype: {dtype!r}")

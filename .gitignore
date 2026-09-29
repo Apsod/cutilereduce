@@ -5,6 +5,10 @@ build/
 dist/
 wheels/
 *.egg-info
+.ipynb_checkpoints/
+notebook/Untitled.ipynb
+*.zip
+theory.pdf
 
 # Virtual environments
 .venv

@@ -306,7 +306,11 @@ class StageGridInfo:
         if loop_axis is None:
             raise ValueError(f"map/fold compile requires one loop axis: {domain}")
         loop_program_axis = domain.program_axis_for(loop_axis)
-        loop_programs = 1 if loop_program_axis is None else int(loop_program_axis.programs)
+        loop_programs = (
+            1 if loop_program_axis is None else loop_program_axis.programs
+        )
+        if type(loop_programs) is not int:
+            raise ValueError(f"unresolved loop program count: {loop_programs}")
         loop_tiles = int(loop_axis.num_tiles)
         loop_program_index = (
             -1

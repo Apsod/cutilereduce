@@ -1,7 +1,7 @@
 [project]
 name = "cutilereduce"
 version = "0.1.0"
-description = "Add your description here"
+description = "An experimental CUDA Tile generator for monoidal fold kernels"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [
@@ -23,4 +23,5 @@ dev = [
     "pytest"
 ]
 
-[pytest]
+[tool.pytest.ini_options]
+testpaths = ["tests"]

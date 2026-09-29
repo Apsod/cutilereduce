@@ -1,7 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
-from typing import Self, Any
+from typing import Any, Self
 from copy import replace
 from fractions import Fraction
 
@@ -33,7 +33,7 @@ class Internal:
     def __init__(self, *tags: str):
         object.__setattr__(self, "tags", tuple(tags))
 
-    def tag(self, tag: str) -> Self:
+    def tag(self, tag: str) -> Internal:
         return Internal(*self.tags, tag)
 
 

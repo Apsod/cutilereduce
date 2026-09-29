@@ -1,10 +1,12 @@
 # CutileReduce
 
 CutileReduce is an experimental CUDA Tile reduction generator for kernels that
-can be expressed as monoidal folds. The project is based on the theory in
-[`theory.pdf`](theory.pdf): many memory-efficient deep learning kernels can be
-seen as tiled folds over associative operations, and useful backward passes can
-often be derived from local gradient rules for those monoids.
+can be expressed as monoidal folds. The project is based on the observation
+that many memory-efficient deep learning kernels can be seen as tiled folds
+over associative operations, and useful backward passes can often be derived
+from local gradient rules for those monoids. The accompanying theory manuscript
+is not currently distributed with this repository; it will be linked here when
+it has a stable external home.
 
 The current implementation focuses on a practical subset of that model:
 forward and backward kernels for fold-style reductions. A user supplies:
@@ -51,6 +53,24 @@ Not yet landed:
   ordered partial folds;
 - broader API polish and packaging around the prototype examples.
 - support for multi-device distributed folds.
+
+## Experimental tensor IR
+
+`cutilereduce.experimental` contains a target-independent prototype of the
+algebra-driven interface. Given an experimental `FoldSpec`, a `FoldAlgebra`,
+and a logical map function, `compile_fold` produces an abstract tensor program
+with named axes, reductions, contractions, implementation hints, and explicit
+materialization boundaries. It does not emit CUDA Tile or PyTorch operations.
+See the [experimental interface README](src/cutilereduce/experimental/README.md)
+for the user model and current design boundaries.
+
+The initial `LogWeightedSum` lowering acts only on the specified fold axes;
+named tensor operations automatically preserve every other dependency. Its
+attention test demonstrates that a weighted value field is lowered directly to
+a batched-GEMM-shaped contraction rather than materialized as a broadcast
+tensor over outer, fold, and value axes. This package is intentionally separate
+from the existing executable fold implementation while the IR and algebra
+interfaces evolve.
 
 ## Function Interface
 
@@ -248,6 +268,11 @@ uv run -m examples.attention --heads 4 --l 4096 --r 4096 --validate
 uv run -m examples.xentropy --batch 1024 --v 4096 --d 128
 uv run -m examples.affine_attention --help
 ```
+
+The CPU-only analytical sweep in
+[`notebook/xentropy_sweep.ipynb`](notebook/xentropy_sweep.ipynb) is a smaller
+way to inspect candidate generation, typed sweep results, and result
+serialization without compiling kernels or requiring a GPU.
 
 The shared `ExampleParser` generates dimension arguments from `spec.axes`.
 Examples supply size defaults and optional descriptive aliases (`--heads` for

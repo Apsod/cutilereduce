@@ -1,7 +1,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
 import gc
 import torch
 import torch.utils.benchmark as torch_benchmark
@@ -96,7 +97,7 @@ def print_mean_absolute_errors(
 
 def validate_implementations(
         inputs,
-        implementations: Mapping[str, object],
+        implementations: Mapping[str, Callable[..., Any]],
         *,
         reference,
         input_names,
@@ -121,7 +122,7 @@ def validate_implementations(
 def benchmark_implementations(
         name,
         inputs,
-        implementations: Mapping[str, object],
+        implementations: Mapping[str, Callable[..., Any]],
         *,
         min_run_time=0.5,
         backward=True,

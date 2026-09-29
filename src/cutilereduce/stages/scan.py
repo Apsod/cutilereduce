@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 import cuda.tile as ct
 
@@ -19,10 +20,13 @@ from cutilereduce.stages.codegen import (
 )
 from cutilereduce.stages.map_fold import batch_program_axes, fold_compute_axes
 
+if TYPE_CHECKING:
+    from cutilereduce.fold.plan import FoldSpec
+
 
 @dataclass(frozen=True)
 class Scan:
-    spec: object
+    spec: FoldSpec
     schedule: StageSchedule
     scan_axis: Axis
     inputs: BufferBundle
@@ -215,6 +219,8 @@ def compile_scan_stage(
     if functions is not None:
         combine = combine or functions.combine
         to_semantic = to_semantic or functions.to_semantic
+    if stage.carriers is None:
+        raise ValueError("scan stage has no carrier buffers")
     scan_program = make_scan_program(
         stage,
         combine,

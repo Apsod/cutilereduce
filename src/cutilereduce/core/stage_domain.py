@@ -222,7 +222,9 @@ class StageDomain:
     def index(self, axis: Axis | AxisId) -> int:
         return self.compute_axes.index(axis)
 
-    def storage_index(self, axis: Axis | AxisId) -> int:
+    def storage_index(
+        self, axis: Axis | AxisId | ComputeAxis | ProgramAxis
+    ) -> int:
         return self.storage_axes.index(axis)
 
     def resolve(self, axes: Iterable[Axis | AxisId]) -> ComputeAxes:
@@ -310,12 +312,14 @@ class StageDomain:
     @staticmethod
     def measure_symbol(
         stage_name: str,
-        axis: Axis | AxisId,
+        axis: Axis | AxisId | ComputeAxis,
         measure: Measure,
         *,
         extent=None,
         tile=None,
     ):
+        if isinstance(axis, ComputeAxis):
+            axis = axis.id
         if measure is Measure.num_tiles and type(extent) is int and type(tile) is int:
             return ceil_div(extent, tile)
         return expr.Symbol(f"{stage_name}_{axis_id(axis).name}_{measure.value}")
@@ -325,8 +329,10 @@ class StageDomain:
             value = value.subs(substitutions)
         return value if type(value) is int else None
 
-    def measure(self, axis: Axis | AxisId, measure: Measure):
+    def measure(self, axis: Axis | AxisId | ComputeAxis, measure: Measure):
         """Return the symbolic or concrete expression for a stage measure."""
+        if isinstance(axis, ComputeAxis):
+            axis = axis.id
         if measure is Measure.extent:
             return self.get(axis).extent
         if measure is Measure.tile:
