@@ -4,7 +4,7 @@ This package explores a user interface in which a fold is described by its
 logical tensor interactions and its algebra, rather than by handwritten fused
 tile callbacks. Its output is a target-independent tensor program: it makes
 contractions, reductions, surviving axes, dtypes, and materialization
-boundaries explicit, but does not emit CUDA Tile or PyTorch code.
+boundaries explicit before target-specific CPU or cuTile emission.
 
 The experiment separates three concerns:
 
@@ -79,6 +79,312 @@ lifted over `(h, l, g, r)` does not broadcast or materialize an
 products, matrix-vector products, matrix products, and their batched variants
 are instances of the same operation and are classified from their named axes.
 Elementwise operations use lazy named-axis broadcasting.
+
+Logical coordinates are available without exposing physical tile IDs:
+
+```python
+is_target = ctx.compare("equal", ctx.axis_index("v"), inputs["target"])
+```
+
+This permits compact targets, causal masks, and relative-position expressions.
+The backend lowers an axis index to the current tile origin plus a local range.
+
+When a predicate removes a complete interaction from the fold, return a
+`FoldFactor`:
+
+```python
+return FoldFactor(
+    value=StructuredValue({"log_weight": scores, "value": inputs["value"]}),
+    where=ctx.compare(
+        "less_equal", ctx.axis_index("r"), ctx.axis_index("l")
+    ),
+)
+```
+
+The false branch is the semantic monoid identity and therefore has zero input
+cotangent. This is distinct from an unmasked value that merely happens to equal
+the identity. Scheduling combines this semantic predicate with physical tile
+validity, masks partial tiles lane-wise, and skips tiles proven empty from
+simple axis-index comparisons. Optimized monoid folds must return their exact
+identity, without NaNs, when every factor is masked.
+
+## Constructing an operator
+
+`FoldOperator` is the complete unscheduled, observable fold definition. It
+bundles the logical tensor specification, fold algebra, factor map, and output
+map:
+
+```python
+from cutilereduce.experimental import FoldMaps, FoldOperator
+
+operator = FoldOperator(
+    spec=spec,
+    algebra=LogWeightedSum(("dv",)),
+    maps=FoldMaps(
+        to_factor=attention_map,
+        to_output=lambda ctx, semantic: StructuredValue(
+            {"value": semantic["value"]}
+        ),
+    ),
+)
+```
+
+Only `to_factor: inputs -> S` and `to_output: S -> O` are user-authored.
+Their VJPs are generated from tensor IR. Calling `operator.lower()` performs
+purely symbolic lowering and produces a schedule-independent
+`FoldProgram` containing:
+
+```text
+map_fold                         map -> Phi -> local E-fold
+project_output                   Psi -> to_output
+embed_output_vjp                 to_output* -> embed
+map_finalize_map_vjp             finalize -> map*                 # commutative
+map_finalize_map_vjp_accumulate  threaded E prefix, finalize, map* # general
+execution_identity              scalar E identity
+execution_combine               pointwise E combine
+semantic_commutative            guarantees prefix-free finalization
+execution_commutative           whether partial E values may be reordered
+```
+
+Exactly one map-finalize region is present. Commutative folds use the stateless
+form. General folds use the accumulating form, which consumes an exclusive
+partition-boundary execution checkpoint, threads it through its local fold
+range, and returns the updated carrier. A partial forward plan persists local
+`map_fold` carriers and exclusive-scans them with `E.combine` to produce those
+checkpoints and the global execution result; `project_output` observes only
+the latter. These `TensorRegion`s have formal symbolic arguments and SSA
+results; their boundaries do not imply loads, stores, or materialization.
+Together with the fold specification, execution structure, and commutativity
+law, these regions define the logical contract. `build_schedule_space(program)`
+constructs hardware-independent forward and backward schedule templates.
+Templates are alternatives, not executable programs; their symbolic iteration
+parameters have shape-bounded domains. `ScheduleSpace.analyze_shape` exposes
+those domains without choosing a target, while `select_forward` and
+`select_backward` may use target support and an optional target cost hook.
+
+Semantic and execution commutativity are recorded separately. Commutativity
+of `S` guarantees that backward finalization is prefix-free; the operator
+rejects `S.commutative` together with `FinalizeContext.PREFIX`.
+Commutativity of `E` independently determines whether a planner may reorder
+partial execution carriers. The converse implication is not required: a
+noncommutative semantic monoid may still admit prefix-free finalization.
+
+The standalone `compile_fold_*` functions remain lower-level compatibility
+entry points for lowering standalone programs.
+
+## Schedule selection and target specialization
+
+The `FoldProgram` and its schedule space are independent of problem extents and
+target. A target may analyze shape-bounded choices, reject unsupported
+templates, or provide a cost hook. The initial implementation uses
+deterministic policies and explicit overrides; it does not run a general
+constraint solver.
+
+CuTile currently implements the online forward template. Specialization binds
+shape and tile overrides, creates a self-contained `SpecializedSchedule`, and
+emission consumes that object rather than separately supplied program, stage,
+and sizes:
+
+```python
+from cutilereduce.experimental import (
+    TargetModel,
+    build_schedule_space,
+    emit_cutile_source,
+    specialize_cutile_schedule,
+)
+
+program = operator.lower()
+space = build_schedule_space(program)
+cutile = TargetModel(
+    "cutile",
+    frozenset({"tensor_regions", "tiled_loops", "multi_stage"}),
+    supported_schedules=frozenset({"online", "independent", "prefix"}),
+)
+forward = space.select_forward(sizes, cutile)
+specialized = specialize_cutile_schedule(
+    program, forward, sizes, tiles={"l": 32, "r": 64}, target=cutile
+)
+source = emit_cutile_source(specialized)
+```
+
+The specialization owns its source `FoldProgram`, selected schedule template,
+shape, bound parameters, target description, and concrete stage DAG. The same
+wrapper is used for the CuTile backward emitter. CPU compilation likewise
+retains a `SpecializedSchedule`; its target-specific implementation is the
+CPU-scheduled plan. `execute_tiled_fold_cpu` remains a correctness interpreter
+for tile coverage, remainder handling, carrier threading, and region
+composition, not the optimized CPU backend.
+
+```text
+parallel output owners:
+    state_E = execution_identity()
+    for fold_tile in serial fold tiles:
+        state_E = map_fold_combine(input_tile, state_E)
+    store project_output(state_E)
+```
+
+`map_fold_combine` is a single symbolic region for updating a running carrier
+from one input tile. Its generic lowering is `combine(state_E,
+fold_E(Phi(map(input_tile))))`; a monoid may provide a fused accumulate
+lowering when it can avoid materializing that tile's partial carrier. For
+example, the LWS execution carrier lowers its numerator contraction directly
+into the rescaled running numerator. `map_fold` remains available to schedules
+that need independently materialized partial carriers, followed by a later
+tree or staged combine.
+
+`lower_backward_stage` lowers the existing scheduled-backward description to
+the same SSA stage form: persistent gradients become loop carries, streamed
+gradients commit inside the loop, and persistent gradients commit after it.
+
+An `AxisPartition(axis, extent, tile, programs)` describes both levels of
+ownership for one logical axis. Programs own balanced, disjoint spans of tile
+indices; the stage-local serial loop visits the tiles in the current program's
+span. Thus an axis may be parallel between programs and serial within each
+program without being represented as two different logical axes. Setting
+`programs=1` is the ordinary single-program serial fold. The same structure is
+used by the CPU correctness interpreters and cuTile source emission.
+
+Each loop stage classifies input bindings by dependence on its loop axis.
+Bindings without that axis are resident: the backend loads their tile once
+before the local loop. Bindings carrying the loop axis are streamed and loaded
+for the current tile inside the loop. For example, attention over `r` keeps
+`query` resident while streaming `key` and `value`; cross-entropy over `v`
+keeps `context` and the compact target index resident while streaming class
+embeddings. Backward applies the same rule to the embedded accumulator.
+
+Backward is initially a two-stage `TiledPlan`. An `embed_output_vjp` map stage
+materializes one accumulator tile per output tile. A `finalize_map_vjp` stage
+then reads that accumulator while traversing its owned factor tiles. Gradients
+independent of the local loop are loop-carried and committed at program end;
+factor-local gradients can commit each iteration. Shared destinations use
+explicit relaxed atomic adds, while destinations with unique ownership use
+stores. The dependency and its accumulator buffer are explicit plan objects.
+
+Nothing in this topology denotes blocks, warps, cores, or SIMD lanes. A CPU
+backend may map owners to worker tasks, while a cuTile backend may map them to
+grid blocks. Forward partial-carrier materialization is a separate schedule
+topology rather than implicit behavior of this one. Backward may already split
+its loop axis between programs; the resulting shared gradient commits remain
+explicit.
+
+`build_schedule_space(program)` constructs hardware-independent recursive
+schedule templates. The initial forward candidates are an online carrier fold, a fused tree, a
+materialized partial fold, and—when prefix-dependent backward requires
+it—a partial fold followed by an exclusive checkpoint scan. Partitions may
+contain their own online fold over smaller chunks; this nesting is part of the
+plan rather than a CPU or GPU concept.
+
+Forward and backward schedule templates are separate. Prefix-free backward composes with
+any forward plan that supplies the global execution carrier. Prefix-dependent
+backward additionally declares its boundary-prefix requirement, and therefore
+only composes with a forward persistence plan that supplies compatible
+checkpoints.
+
+`schedule_cpu` binds a plan to concrete extents, chunk sizes, partition counts,
+parallel/serial loops, and private or materialized storage. These CPU choices
+do not appear in `FoldPlan`. Nested thread-pool parallelism is suppressed by
+the initial scheduler.
+
+The first executable path is:
+
+```python
+compiled = compile_cpu(
+    operator,
+    sizes={"h": 2, "l": 128, "g": 1, "r": 128, "dqk": 64, "dv": 64},
+    backward=True,
+    # Optional and independent of the forward chunk schedule:
+    backward_schedule=CpuScheduleConfig(chunk_sizes=(("r", 32),)),
+)
+output = compiled(query, key, value)
+```
+
+An explicit scheduled backward can be supplied while schedule selection is
+still experimental:
+
+```python
+problem = operator.lower()
+backward_program = schedule_backward_program(
+    problem,
+    sizes,
+    loop_axis="l",
+    tiles={"l": 32, "r": 64},
+)
+compiled = compile_cpu(
+    operator,
+    sizes,
+    backward=True,
+    backward_program=backward_program,
+)
+```
+
+It generates and caches a size-specialized PyTorch C++ extension for
+contiguous CPU tensors. Prefix-free algebraic backward is exposed through a
+custom `torch.autograd.Function`. Its partitioning and chunking are scheduled
+independently of forward. Prefix-dependent backward shares only the persisted
+forward partition boundaries while retaining an independent local chunk size.
+The generic region emitter covers the
+current tensor IR; attention-shaped LWS map-folds use a fused generated C++
+loop with `at::parallel_for`, resident maximum/normalizer/numerator state, and
+direct score recomputation. It does not allocate a logits grid or a replicated
+value-factor grid.
+
+The executable backend accepts online, fused-tree, and materialized-partial
+forward plans. Chunk and partition extents compile to cached specialized
+`map_fold` functions and partial carriers are merged with the generated
+`E.combine` region using the selected online or tree topology. Prefix plans
+persist exclusive partition-boundary carriers; generated accumulating backward
+loads each boundary, performs the local structured execution scan, threads the
+updated prefix through local chunks, and merges the resulting input gradients.
+For a supplied prefix-free `ScheduledBackwardProgram`, the extension instead
+generates one scheduled backward entry point: CPU programs run through
+`at::parallel_for`, persistent gradient tiles remain local across the serial
+tile loop, and completed tiles use direct stores or C++20 relaxed atomic
+additions. Prefix-dependent schedules continue to use the existing executor.
+
+`estimate_cpu_plan` counts region operations, materialized carrier/output
+bytes, exposed parallel tasks, and serial steps. `select_cpu_plan` evaluates a
+small deterministic set of chunk and partition configurations against the
+detected worker/vector width and supplies the default plan used by
+`compile_cpu`. This is an analytical first model; benchmark calibration and
+cache-aware traffic tiers remain future refinements.
+
+### Scheduled programs and shared gradient writes
+
+Tensor IR specifies contractions, reductions, and value dependencies, but it
+does not prescribe concurrent writers or memory scope. After an abstract plan
+has been tiled, the scheduled-program IR represents those physical decisions
+explicitly:
+
+- `Parallel` partitions logical axes into independently executing programs;
+- `SerialLoop` is a program-local tiled loop;
+- `LocalZero` and `Accumulate` describe loop-carried resident tiles;
+- `Store` commits a uniquely owned output tile;
+- `AtomicAdd` commits a contended tile with relaxed ordering.
+
+Backward output lifetime and write contention are separate properties. A
+gradient whose axes contain the local loop axis is streamed and committed at
+each loop iteration. A gradient without the loop axis is accumulated locally
+and committed once at program end. Independently, any nontrivial parallel
+program axis absent from the gradient axes creates multiple writers and turns
+the commit into a relaxed atomic add.
+
+For attention with programs partitioned over `r` and a local loop over `l`,
+this gives the characteristic schedule:
+
+```text
+parallel r-program:
+    local dK, dV = zero
+    loop l-tile:
+        dQ-tile, dK-delta, dV-delta = map_finalize_map_vjp(...)
+        accumulate dK, dV
+        atomic_add relaxed dQ
+    store dK, dV
+```
+
+Only tile-sized gradient state is private. The logical per-program `dQ`
+contributions are never materialized as a program-by-output tensor. A target
+backend maps the same scheduled operations to CPU threads and atomics, GPU
+programs and device atomics, or another explicit execution hierarchy.
 
 ## Specifying a fold algebra
 
@@ -256,7 +562,7 @@ produces a convex combination rather than an unbounded affine translation.
 Its gradient accumulator is `Add x LWS({weight, value})`, matching the stable
 carrier-resolved factorization for prefix-dependent scan backward.
 
-The monoid structure declarations are checked at tracing time. Field names,
+The monoid structure declarations are checked during symbolic lowering. Field names,
 required inner axes, and dtypes must agree with mapped, lifted, folded, and
 projected values.
 
@@ -396,7 +702,7 @@ not prescribe staging. A planner may instantiate them over any chosen region
 and decide whether their partial carriers or cotangents remain local, are
 combined in a loop, or are persisted for later work.
 
-The prototype can already trace the unfused local backward composition as an
+The prototype can already lower the unfused local backward composition as an
 independent program:
 
 ```python
@@ -626,7 +932,7 @@ print(program.format())
    execution carrier in which those axes have been eliminated.
 5. Invoke `to_semantic` to recover semantic outputs and materialize their fields.
 
-The current prototype instantiates this trace over a single region spanning
+The current prototype instantiates this symbolic region over a range spanning
 the complete declared fold axes. That is a limitation of the current compiler,
 not part of the `execution.fold` contract. A subsequent planner-oriented
 representation should be able to instantiate the same lowering over arbitrary
@@ -717,8 +1023,9 @@ g_logits = exp(logits - logsumexp) * g_normalizer
 
 This local cotangent remains symbolic and feeds the two contraction VJPs; it is
 not an output materialization. LWS uses the same construction with an LWS
-accumulator monoid. General planner construction of prefix context and concrete
-backward scheduling remain future work.
+accumulator monoid. Prefix-dependent folds persist partition-boundary execution
+carriers and generated backward threads them through independently chunked
+local regions.
 
 ## Current scope
 
@@ -737,7 +1044,7 @@ Implemented:
 - componentwise `ProductAlgebra`, plus `Add` and `LogSumExp` instances;
 - a right-oriented `SemidirectProductMonoid` construction and concrete
   prefix-differentiable `LogScaleAffine` instance;
-- forward fold tracing and explicit final materialization;
+- forward fold lowering and explicit final materialization;
 - separate commutative forward and backward compilers with an explicit saved
   execution-state contract;
 - algebraic `embed` and `finalize` for `Add`, `LogSumExp`, LWS, and affine;
@@ -745,18 +1052,28 @@ Implemented:
 - constant simplification, dead-code elimination, contraction discovery and
   canonicalization, and conservative output materialization passes;
 - a stable `LogWeightedSum` lowering polymorphic over fold-axis names, ranks,
-  and all untouched dependencies.
+  and all untouched dependencies;
+- recursive hardware-independent online/tree/partial/scan fold plans;
+- concrete CPU scheduling and analytical plan selection;
+- generated size-specialized PyTorch C++ extensions for forward and
+  prefix-free backward;
+- an explicit scheduled-backward SSA form with loop-carried local gradients,
+  streamed commits, relaxed atomic adds, and liveness intervals;
+- analytical scheduled-memory accounting and separate forward/backward/full
+  CPU timing helpers;
+- an algebra-component graph which retains SSA producer sharing, Product
+  independence, and semidirect actor-to-payload dependencies; splitting a
+  shared producer requires an explicit recompute-or-materialize decision;
+- fused CPU LWS attention map-folds without logits or value-factor grids.
 
 Not implemented yet:
 
-- execution-carrier combination across partitions;
 - VJP rules beyond the current bounded tensor-IR subset;
-- physical planning of prefix scans and boundary-carrier persistence;
 - accumulator suffix scans for differentiable scans;
 - additional global/algebra-aware optimization passes;
 - accumulating-fold recognition and online carrier-update lowering;
 - explicit carrier ordering/merge capabilities, including compensated sums;
-- concrete layouts, tile sizes, code generation, or execution.
+- explicit SIMD lowering beyond compiler auto-vectorization.
 
 The package is intentionally independent of the existing executable fold
 implementation while these interfaces are still being tested.

@@ -143,7 +143,7 @@ class LogScaleAffine(SemidirectProductAlgebra):
             ctx.exp(accumulated_payload["log_weight"] - prefix_scale)
             * accumulated_payload["value"]
         )
-        local_payload_cotangent = ctx.exp(local_scale * -1.0) * relative_payload
+        local_payload_cotangent = ctx.exp(-local_scale) * relative_payload
         scale_from_payload = prefix_payload * relative_payload
         if self.payload_axes:
             scale_from_payload = ctx.reduce(

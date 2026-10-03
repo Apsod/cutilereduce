@@ -6,6 +6,9 @@ from cutilereduce.experimental import (
     AffineLWS,
     ContractionAxes,
     FinalizeContext,
+    FoldMaps,
+    FoldFactor,
+    FoldOperator,
     FoldSpec,
     LogSumExp,
     LogWeightedSum,
@@ -50,9 +53,7 @@ class GenericAddMonoid(Monoid[StructuredValue]):
     commutative = True
 
     def __init__(self):
-        self.structure = TensorStructure(
-            {"value": TensorField(dtype="float32")}
-        )
+        self.structure = TensorStructure({"value": TensorField(dtype="float32")})
 
     def identity(self, ctx):
         return StructuredValue({"value": ctx.constant(0.0)})
@@ -65,17 +66,11 @@ class GenericAddMonoid(Monoid[StructuredValue]):
 def test_generic_fold_and_scan_are_derived_from_combine():
     monoid = GenericAddMonoid()
     ctx = TensorBuilder(("b", "f"))
-    values = StructuredValue(
-        {"value": ctx.input("values", ("b", "f"), "float32")}
-    )
-    initial = StructuredValue(
-        {"value": ctx.input("initial", ("b",), "float32")}
-    )
+    values = StructuredValue({"value": ctx.input("values", ("b", "f"), "float32")})
+    initial = StructuredValue({"value": ctx.input("initial", ("b",), "float32")})
 
     folded = lower_fold(ctx, monoid, values, fold_axes=("f",))
-    scanned = lower_scan(
-        ctx, monoid, values, scan_axis="f", initial=initial
-    )
+    scanned = lower_scan(ctx, monoid, values, scan_axis="f", initial=initial)
 
     assert folded["value"].node.op == "associative_fold"
     assert scanned.prefixes["value"].node.op == "associative_scan_prefix"
@@ -84,6 +79,33 @@ def test_generic_fold_and_scan_are_derived_from_combine():
     assert scanned.final["value"].axes == ("b",)
     region = scanned.final["value"].node.attribute("combine_region")
     assert any(node.op == "add" for node in region.nodes)
+
+
+def test_axis_index_and_factor_mask_validation():
+    ctx = TensorBuilder(("b", "f", "d"))
+    assert ctx.axis_index("f").axes == ("f",)
+    assert ctx.axis_index("f", "int32").dtype == "int32"
+    with pytest.raises(ValueError, match="unknown axis"):
+        ctx.axis_index("missing")
+    with pytest.raises(ValueError, match="int32 or int64"):
+        ctx.axis_index("f", "float32")
+
+    spec = FoldSpec(
+        inputs={"x": TensorSpec(("b", "f", "d"))},
+        batch_axes=("b",),
+        fold_axes=("f",),
+    )
+
+    def invalid_map(builder, inputs):
+        return FoldFactor(
+            StructuredValue({"value": inputs["x"]}),
+            where=builder.compare("greater", builder.axis_index("d"), 0),
+        )
+
+    with pytest.raises(ValueError, match="batch and fold axes"):
+        compile_fold(spec, Add(("d",)), invalid_map)
+
+
 def test_attention_fold_lowers_weighted_values_to_one_batched_gemm():
     program = compile_fold(
         attention_spec(),
@@ -110,6 +132,100 @@ def test_attention_fold_lowers_weighted_values_to_one_batched_gemm():
     assert weighted_value.dtype == "float32"
 
 
+def test_fold_operator_builds_the_logical_planning_contract():
+    algebra = LogWeightedSum(("dv",))
+
+    def output_function(ctx, semantic):
+        del ctx
+        return StructuredValue({"value": semantic["value"]})
+
+    operator = FoldOperator(
+        spec=attention_spec(),
+        algebra=algebra,
+        maps=FoldMaps(
+            to_factor=attention_map,
+            to_output=output_function,
+        ),
+    )
+    lowered = operator.lower()
+
+    assert lowered.semantic_commutative
+    assert lowered.execution_commutative
+    assert not lowered.requires_prefix
+    assert lowered.embed_output_vjp is not None
+    assert lowered.map_finalize_map_vjp is not None
+    assert lowered.map_finalize_map_vjp_accumulate is None
+    assert "execution.maximum" in dict(lowered.map_fold.outputs)
+    assert "execution.normalizer" in dict(lowered.map_fold.outputs)
+    assert "execution.numerator" in dict(lowered.map_fold.outputs)
+    assert "value" in dict(lowered.project_output.outputs)
+    assert {
+        "accumulator.log_weight",
+        "accumulator.scalar",
+        "accumulator.value",
+    } <= set(dict(lowered.embed_output_vjp.outputs))
+    assert not lowered.map_fold.materializations
+    formatted = lowered.map_finalize_map_vjp.format()
+    assert "%0 query: tensor[h, l, g, dqk; bfloat16]" in formatted
+    assert "%0 = argument" not in formatted
+    assert "yield partial_grad_input.query=" in formatted
+    assert {name for name, _ in lowered.execution_combine.arguments} == {
+        "left.maximum",
+        "left.normalizer",
+        "left.numerator",
+        "right.maximum",
+        "right.normalizer",
+        "right.numerator",
+    }
+
+
+def test_affine_operator_exposes_prefix_planning_capability():
+    algebra = Affine(("d",))
+    spec = FoldSpec(
+        inputs={
+            "scale": TensorSpec(("b", "f")),
+            "payload": TensorSpec(("b", "f", "d")),
+        },
+        batch_axes=("b",),
+        fold_axes=("f",),
+    )
+
+    def map_function(ctx, inputs):
+        del ctx
+        return algebra.value(
+            acting=StructuredValue({"value": inputs["scale"]}),
+            payload=StructuredValue({"value": inputs["payload"]}),
+        )
+
+    operator = FoldOperator(
+        spec=spec,
+        algebra=algebra,
+        maps=FoldMaps(to_factor=map_function),
+    )
+    lowered = operator.lower()
+
+    assert not lowered.semantic_commutative
+    assert lowered.requires_prefix
+    assert not lowered.execution_commutative
+    assert lowered.map_finalize_map_vjp is None
+    assert lowered.map_finalize_map_vjp_accumulate is not None
+    assert "updated_prefix.acting.value" in dict(
+        lowered.map_finalize_map_vjp_accumulate.outputs
+    )
+
+
+def test_commutative_semantic_algebra_rejects_prefix_finalize():
+    class InvalidLogWeightedSum(LogWeightedSum):
+        finalize_context = FinalizeContext.PREFIX
+
+    with pytest.raises(ValueError, match="commutative semantic monoid"):
+        FoldOperator(
+            spec=attention_spec(),
+            algebra=InvalidLogWeightedSum(("dv",)),
+            maps=FoldMaps(to_factor=attention_map),
+        )
+
+
 def test_attention_program_never_materializes_broadcast_value_factors():
     program = compile_fold(
         attention_spec(),
@@ -117,10 +233,7 @@ def test_attention_program_never_materializes_broadcast_value_factors():
         attention_map,
     )
 
-    assert all(
-        set(node.axes) != {"h", "l", "g", "r", "dv"}
-        for node in program.nodes
-    )
+    assert all(set(node.axes) != {"h", "l", "g", "r", "dv"} for node in program.nodes)
     assert {
         node.attribute("name")
         for node in program.materializations
@@ -140,7 +253,11 @@ def test_reductions_and_materialization_boundaries_are_explicit():
         ("reduce_max", ("r",)),
         ("reduce_sum", ("r",)),
     ]
-    assert all(program.node(node.inputs[0]).op != "materialize" for node in program.nodes if node.inputs)
+    assert all(
+        program.node(node.inputs[0]).op != "materialize"
+        for node in program.nodes
+        if node.inputs
+    )
 
 
 def test_contraction_rejects_an_axis_absent_from_an_operand():
@@ -189,9 +306,7 @@ def test_lws_exposes_phi_and_execution_combine_lowerings():
 
 def test_lws_backward_uses_an_lws_accumulator():
     algebra = LogWeightedSum(("dv",))
-    program = compile_map_finalize_vjp_region(
-        attention_spec(), algebra, attention_map
-    )
+    program = compile_map_finalize_vjp_region(attention_spec(), algebra, attention_map)
 
     input_names = {
         node.attribute("name") for node in program.nodes if node.op == "input"
@@ -218,13 +333,10 @@ def test_lws_backward_uses_an_lws_accumulator():
         "dv",
     )
     assert not any(
-        set(node.axes) == {"h", "l", "g", "r", "dv"}
-        for node in program.nodes
+        set(node.axes) == {"h", "l", "g", "r", "dv"} for node in program.nodes
     )
     value_gradient = next(
-        node
-        for node in program.contractions
-        if node.axes == ("h", "r", "dv")
+        node for node in program.contractions if node.axes == ("h", "r", "dv")
     )
     assert value_gradient.attribute("contraction_axes") == ContractionAxes(
         batch=("h",),
@@ -293,9 +405,7 @@ def test_cross_entropy_product_lowers_lse_and_add_from_one_map_graph():
     assert algebra.finalize_context is FinalizeContext.NONE
 
     def map_function(ctx, inputs):
-        logits = ctx.contract(
-            inputs["context"], inputs["targets"], over=("d",)
-        )
+        logits = ctx.contract(inputs["context"], inputs["targets"], over=("d",))
         target_logits = ctx.where(
             inputs["is_target"],
             logits,
@@ -333,9 +443,7 @@ def test_cross_entropy_backward_composes_finalize_with_map_vjp():
     algebra = Product(normalizer=LogSumExp(), target=Add())
 
     def map_function(ctx, inputs):
-        logits = ctx.contract(
-            inputs["context"], inputs["targets"], over=("d",)
-        )
+        logits = ctx.contract(inputs["context"], inputs["targets"], over=("d",))
         target_logits = ctx.where(
             inputs["is_target"],
             logits,
@@ -393,9 +501,7 @@ def test_cross_entropy_map_finalize_vjp_is_an_independent_region():
     algebra = Product(normalizer=LogSumExp(), target=Add())
 
     def map_function(ctx, inputs):
-        logits = ctx.contract(
-            inputs["context"], inputs["targets"], over=("d",)
-        )
+        logits = ctx.contract(inputs["context"], inputs["targets"], over=("d",))
         return algebra.value(
             normalizer=StructuredValue({"value": logits}),
             target=StructuredValue(
@@ -473,18 +579,10 @@ def test_affine_accumulator_combines_distinct_prefix_contributions():
     def affine_value(prefix: str):
         return algebra.value(
             acting=StructuredValue(
-                {
-                    "value": ctx.input(
-                        f"{prefix}.scale", ("b",), "float32"
-                    )
-                }
+                {"value": ctx.input(f"{prefix}.scale", ("b",), "float32")}
             ),
             payload=StructuredValue(
-                {
-                    "value": ctx.input(
-                        f"{prefix}.payload", ("b", "d"), "float32"
-                    )
-                }
+                {"value": ctx.input(f"{prefix}.payload", ("b", "d"), "float32")}
             ),
         )
 
@@ -496,9 +594,6 @@ def test_affine_accumulator_combines_distinct_prefix_contributions():
     payload = combined["payload"]
     assert isinstance(acting, StructuredValue)
     assert isinstance(payload, StructuredValue)
-    assert acting["value"].node.op == "add"
-    assert payload["log_weight"].node.op == "add"
-    assert payload["value"].node.op == "divide"
     assert payload["log_weight"].axes == ("b",)
     assert acting["value"].axes == ("b",)
     assert payload["value"].axes == ("b", "d")
@@ -547,8 +642,7 @@ def test_affine_map_finalize_vjp_uses_explicit_prefix():
         "d",
     )
     scan_prefixes = tuple(
-        node for node in program.nodes
-        if node.op == "associative_scan_prefix"
+        node for node in program.nodes if node.op == "associative_scan_prefix"
     )
     assert {node.axes for node in scan_prefixes} == {
         ("b", "f"),
@@ -587,13 +681,9 @@ def test_affine_lws_fold_reweights_then_normalizes_payload():
 
     def output_function(ctx, semantic):
         del ctx
-        return StructuredValue(
-            {"value": semantic["payload"]["value"]}
-        )
+        return StructuredValue({"value": semantic["payload"]["value"]})
 
-    program = compile_fold(
-        spec, algebra, map_function, output_function=output_function
-    )
+    program = compile_fold(spec, algebra, map_function, output_function=output_function)
 
     assert len(program.scans) == 1
     assert any(node.op == "reduce_max" for node in program.nodes)
@@ -628,9 +718,7 @@ def test_affine_lws_projected_backward_uses_lws_accumulator():
 
     def output_function(ctx, semantic):
         del ctx
-        return StructuredValue(
-            {"value": semantic["payload"]["value"]}
-        )
+        return StructuredValue({"value": semantic["payload"]["value"]})
 
     program = compile_map_finalize_vjp_region(
         spec, algebra, map_function, output_function=output_function

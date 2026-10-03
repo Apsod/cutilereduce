@@ -52,21 +52,37 @@ class LogWeightedMonoid(Monoid[StructuredValue]):
     ) -> StructuredValue:
         self.validate(left, label="left LWS value")
         self.validate(right, label="right LWS value")
-        left_is_high = ctx.compare(
-            "greater", left["log_weight"], right["log_weight"]
+        left_is_high = ctx.compare("greater", left["log_weight"], right["log_weight"])
+        maximum = ctx.where(left_is_high, left["log_weight"], right["log_weight"])
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        left_weight = ctx.where(
+            nonempty,
+            ctx.exp(left["log_weight"] - safe_maximum),
+            ctx.constant(0.0, self.dtype),
         )
-        maximum = ctx.where(
-            left_is_high, left["log_weight"], right["log_weight"]
+        right_weight = ctx.where(
+            nonempty,
+            ctx.exp(right["log_weight"] - safe_maximum),
+            ctx.constant(0.0, self.dtype),
         )
-        left_weight = ctx.exp(left["log_weight"] - maximum)
-        right_weight = ctx.exp(right["log_weight"] - maximum)
         normalizer = left_weight + right_weight
-        log_weight = maximum + ctx.log(normalizer)
+        safe_normalizer = ctx.where(nonempty, normalizer, ctx.constant(1.0, self.dtype))
+        log_weight = ctx.where(
+            nonempty,
+            maximum + ctx.log(safe_normalizer),
+            ctx.constant(float("-inf"), self.dtype),
+        )
         fields: dict[str, TensorValue] = {"log_weight": log_weight}
         for name in self.payload_fields:
-            fields[name] = (
+            payload = (
                 left_weight * left[name] + right_weight * right[name]
-            ) / normalizer
+            ) / safe_normalizer
+            fields[name] = ctx.where(
+                nonempty,
+                payload,
+                ctx.full(payload.axes, 0.0, payload.dtype),
+            )
         return StructuredValue(fields)
 
     def lower_fold(
@@ -78,17 +94,33 @@ class LogWeightedMonoid(Monoid[StructuredValue]):
     ) -> StructuredValue:
         self.validate(values, label="LWS values")
         maximum = ctx.reduce("max", values["log_weight"], fold_axes)
-        weights = ctx.exp(values["log_weight"] - maximum)
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        weights = ctx.where(
+            nonempty,
+            ctx.exp(values["log_weight"] - safe_maximum),
+            ctx.full(values["log_weight"].axes, 0.0, self.dtype),
+        )
         normalizer = ctx.reduce("sum", weights, fold_axes)
+        safe_normalizer = ctx.where(nonempty, normalizer, ctx.constant(1.0, self.dtype))
         fields: dict[str, TensorValue] = {
-            "log_weight": maximum + ctx.log(normalizer)
+            "log_weight": ctx.where(
+                nonempty,
+                maximum + ctx.log(safe_normalizer),
+                ctx.constant(float("-inf"), self.dtype),
+            )
         }
         for name in self.payload_fields:
-            fields[name] = (
-                ctx.contract(weights, values[name], over=fold_axes)
-                / normalizer
+            payload = (
+                ctx.contract(weights, values[name], over=fold_axes) / safe_normalizer
+            )
+            fields[name] = ctx.where(
+                nonempty,
+                payload,
+                ctx.full(payload.axes, 0.0, payload.dtype),
             )
         return StructuredValue(fields)
+
 
 class LWSExecutionMonoid(Monoid[StructuredValue]):
     """Stable execution carrier for an LWS with one tensor payload."""
@@ -96,6 +128,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
     commutative = True
 
     def __init__(self, value_axes: tuple[str, ...], dtype: str = "float32"):
+        self.dtype = dtype
         scalar = TensorField(dtype=dtype)
         self.value_field = TensorField(value_axes, dtype)
         self.structure = TensorStructure(
@@ -127,8 +160,18 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         self.validate(right, label="right LWS execution carrier")
         left_is_high = ctx.compare("greater", left["maximum"], right["maximum"])
         maximum = ctx.where(left_is_high, left["maximum"], right["maximum"])
-        left_scale = ctx.exp(left["maximum"] - maximum)
-        right_scale = ctx.exp(right["maximum"] - maximum)
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        left_scale = ctx.where(
+            nonempty,
+            ctx.exp(left["maximum"] - safe_maximum),
+            ctx.constant(0.0, self.dtype),
+        )
+        right_scale = ctx.where(
+            nonempty,
+            ctx.exp(right["maximum"] - safe_maximum),
+            ctx.constant(0.0, self.dtype),
+        )
         return StructuredValue(
             {
                 "maximum": maximum,
@@ -148,13 +191,15 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
     ) -> StructuredValue:
         self.validate(values, label="LWS execution carriers")
         maximum = ctx.reduce("max", values["maximum"], fold_axes)
-        scales = ctx.exp(values["maximum"] - maximum)
-        normalizer = ctx.reduce(
-            "sum", scales * values["normalizer"], fold_axes
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        scales = ctx.where(
+            nonempty,
+            ctx.exp(values["maximum"] - safe_maximum),
+            ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
-        numerator = ctx.contract(
-            scales, values["numerator"], over=fold_axes
-        )
+        normalizer = ctx.reduce("sum", scales * values["normalizer"], fold_axes)
+        numerator = ctx.contract(scales, values["numerator"], over=fold_axes)
         return StructuredValue(
             {
                 "maximum": maximum,
@@ -163,9 +208,50 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             }
         )
 
-class LogWeightedSum(
-    FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]
-):
+    def lower_fold_accumulate(
+        self,
+        ctx: TensorBuilder,
+        initial: StructuredValue,
+        values: StructuredValue,
+        *,
+        fold_axes: tuple[str, ...],
+    ) -> StructuredValue:
+        """Update the stable carrier, accumulating the numerator in its contraction."""
+        self.validate(initial, label="initial LWS execution carrier")
+        self.validate(values, label="LWS execution tile")
+        tile_maximum = ctx.reduce("max", values["maximum"], fold_axes)
+        maximum = ctx.where(
+            ctx.compare("greater", initial["maximum"], tile_maximum),
+            initial["maximum"],
+            tile_maximum,
+        )
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        initial_scale = ctx.where(
+            nonempty,
+            ctx.exp(initial["maximum"] - safe_maximum),
+            ctx.constant(0.0, self.dtype),
+        )
+        tile_scales = ctx.where(
+            nonempty,
+            ctx.exp(values["maximum"] - safe_maximum),
+            ctx.full(values["maximum"].axes, 0.0, self.dtype),
+        )
+        normalizer = initial_scale * initial["normalizer"] + ctx.reduce(
+            "sum", tile_scales * values["normalizer"], fold_axes
+        )
+        numerator = ctx.contract_accumulate(
+            initial_scale * initial["numerator"],
+            tile_scales,
+            values["numerator"],
+            over=fold_axes,
+        )
+        return StructuredValue(
+            {"maximum": maximum, "normalizer": normalizer, "numerator": numerator}
+        )
+
+
+class LogWeightedSum(FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]):
     """Stable log-weighted summation over one tensor payload."""
 
     finalize_context = FinalizeContext.NONE
@@ -175,9 +261,7 @@ class LogWeightedSum(
         value = TensorField(value_axes, dtype)
         self.semantic = LogWeightedMonoid({"value": value}, dtype)
         self.execution = LWSExecutionMonoid(value_axes, dtype)
-        self.accumulator = LogWeightedMonoid(
-            {"scalar": scalar, "value": value}, dtype
-        )
+        self.accumulator = LogWeightedMonoid({"scalar": scalar, "value": value}, dtype)
         self.value_axes = value_axes
 
     def to_execution(
@@ -200,8 +284,25 @@ class LogWeightedSum(
         return StructuredValue(
             {
                 "log_weight": execution["maximum"]
-                + ctx.log(execution["normalizer"]),
-                "value": execution["numerator"] / execution["normalizer"],
+                + ctx.log(
+                    ctx.where(
+                        ctx.compare("greater", execution["normalizer"], 0.0),
+                        execution["normalizer"],
+                        ctx.constant(1.0, execution["normalizer"].dtype),
+                    )
+                ),
+                "value": ctx.where(
+                    ctx.compare("greater", execution["normalizer"], 0.0),
+                    execution["numerator"]
+                    / ctx.where(
+                        ctx.compare("greater", execution["normalizer"], 0.0),
+                        execution["normalizer"],
+                        ctx.constant(1.0, execution["normalizer"].dtype),
+                    ),
+                    ctx.full(
+                        execution["numerator"].axes, 0.0, execution["numerator"].dtype
+                    ),
+                ),
             }
         )
 
@@ -212,12 +313,10 @@ class LogWeightedSum(
         semantic_cotangent: StructuredValue,
     ) -> StructuredValue:
         result = self.to_semantic(ctx, execution)
-        self.semantic.validate(
-            semantic_cotangent, label="LWS semantic cotangent"
-        )
+        self.semantic.validate(semantic_cotangent, label="LWS semantic cotangent")
         return StructuredValue(
             {
-                "log_weight": result["log_weight"] * -1.0,
+                "log_weight": -result["log_weight"],
                 "scalar": semantic_cotangent["log_weight"]
                 - ctx.contract(
                     semantic_cotangent["value"],

@@ -221,9 +221,25 @@ class AffineLWS(SemidirectProductAlgebra):
             raise ValueError("affine-LWS finalize requires an E prefix")
         self.semantic.validate(factor, label="affine-LWS local factor")
         self.accumulator.validate(accumulator, label="affine-LWS accumulator")
-        prefix_semantic = self.to_semantic(ctx, prefix)
-        prefix_scale = cast(StructuredValue, prefix_semantic["acting"])["value"]
-        prefix_payload = cast(StructuredValue, prefix_semantic["payload"])
+        prefix_scale = cast(StructuredValue, prefix["acting"])["value"]
+        prefix_execution_payload = cast(StructuredValue, prefix["payload"])
+        prefix_normalizer = prefix_execution_payload["normalizer"]
+        has_prefix_payload = ctx.compare(
+            "greater", prefix_normalizer, 0.0
+        )
+        safe_prefix_normalizer = ctx.where(
+            has_prefix_payload,
+            prefix_normalizer,
+            ctx.full(prefix_normalizer.axes, 1.0, prefix_normalizer.dtype),
+        )
+        prefix_payload = StructuredValue(
+            {
+                "log_weight": prefix_execution_payload["maximum"]
+                + ctx.log(safe_prefix_normalizer),
+                "value": prefix_execution_payload["numerator"]
+                / safe_prefix_normalizer,
+            }
+        )
         local_scale = cast(StructuredValue, factor["acting"])["value"]
         local_payload = cast(StructuredValue, factor["payload"])
         accumulated_scale = cast(StructuredValue, accumulator["acting"])[

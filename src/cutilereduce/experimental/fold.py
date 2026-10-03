@@ -1,4 +1,4 @@
-"""Trace a logical fold specification into the experimental tensor IR."""
+"""Symbolically lower logical fold specifications to tensor IR."""
 
 from __future__ import annotations
 
@@ -7,11 +7,14 @@ from dataclasses import dataclass
 from typing import cast
 
 from .algebra import (
+    AlgebraStructure,
     AlgebraValue,
+    CompositeStructure,
     CompositeValue,
     FinalizeContext,
     FoldAlgebra,
     StructuredValue,
+    TensorStructure,
     value_leaves,
 )
 from .autodiff import vjp
@@ -33,9 +36,17 @@ class TensorSpec:
         return self.dtype not in {"bool", "int8", "int16", "int32", "int64"}
 
 
+@dataclass(frozen=True)
+class FoldFactor[ValueT: AlgebraValue]:
+    """One semantic factor and an optional whole-interaction validity mask."""
+
+    value: ValueT
+    where: TensorValue | None = None
+
+
 type MapFunction[ValueT: AlgebraValue] = Callable[
     [TensorBuilder, Mapping[str, TensorValue]],
-    ValueT,
+    ValueT | FoldFactor[ValueT],
 ]
 
 type OutputFunction[SemanticT: AlgebraValue, OutputT: AlgebraValue] = Callable[
@@ -69,7 +80,8 @@ class FoldSpec:
         if overlap:
             raise ValueError(f"axes cannot be both batch and fold: {sorted(overlap)}")
         duplicates = {
-            axis for axis in self.axes
+            axis
+            for axis in self.axes
             if sum(axis in spec.axes for spec in self.inputs.values()) == 0
         }
         if duplicates:
@@ -79,13 +91,69 @@ class FoldSpec:
                 raise ValueError(f"input {name!r} has duplicate axes: {spec.axes}")
 
 
-def _inputs(
-    ctx: TensorBuilder, spec: FoldSpec
-) -> dict[str, TensorValue]:
+def _inputs(ctx: TensorBuilder, spec: FoldSpec) -> dict[str, TensorValue]:
     return {
         name: ctx.input(name, input_spec.axes, input_spec.dtype)
         for name, input_spec in spec.inputs.items()
     }
+
+
+def _mapped_factor[
+    ValueT: AlgebraValue,
+    ExecutionT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
+](
+    ctx: TensorBuilder,
+    spec: FoldSpec,
+    algebra: FoldAlgebra[ValueT, ExecutionT, AccumulatorT],
+    mapped: ValueT | FoldFactor[ValueT],
+    *,
+    physical_valid: TensorValue | None = None,
+) -> ValueT:
+    factor = mapped.value if isinstance(mapped, FoldFactor) else mapped
+    semantic_valid = mapped.where if isinstance(mapped, FoldFactor) else None
+    algebra.semantic.validate(factor, label="map result")
+    allowed_axes = set(spec.batch_axes) | set(spec.fold_axes)
+    if semantic_valid is not None:
+        if semantic_valid.dtype != "bool":
+            raise ValueError("factor mask must have bool dtype")
+        if set(semantic_valid.axes) - allowed_axes:
+            raise ValueError("factor mask may only use batch and fold axes")
+    valid = semantic_valid
+    if physical_valid is not None:
+        valid = (
+            physical_valid
+            if valid is None
+            else ctx.where(valid, physical_valid, ctx.constant(0, "bool"))
+        )
+    if valid is None:
+        return factor
+    condition = valid
+    identity = algebra.semantic.identity(ctx)
+    group = len(ctx.nodes)
+
+    def mask(value: AlgebraValue, neutral: AlgebraValue) -> AlgebraValue:
+        if isinstance(value, StructuredValue):
+            if not isinstance(neutral, StructuredValue):
+                raise TypeError("semantic value and identity structures disagree")
+            return StructuredValue(
+                {
+                    name: ctx.mask_identity(
+                        condition, field, neutral[name], mask_group=group
+                    )
+                    for name, field in value.fields.items()
+                }
+            )
+        if not isinstance(neutral, CompositeValue):
+            raise TypeError("semantic value and identity structures disagree")
+        return CompositeValue(
+            {
+                name: mask(component, neutral[name])
+                for name, component in value.components.items()
+            }
+        )
+
+    return cast(ValueT, mask(factor, identity))
 
 
 def _value_inputs(
@@ -97,25 +165,19 @@ def _value_inputs(
     if isinstance(template, StructuredValue):
         return StructuredValue(
             {
-                name: ctx.input(
-                    f"{prefix}.{name}", value.axes, value.dtype
-                )
+                name: ctx.input(f"{prefix}.{name}", value.axes, value.dtype)
                 for name, value in template.fields.items()
             }
         )
     return CompositeValue(
         {
-            name: _value_inputs(
-                ctx, component, prefix=f"{prefix}.{name}"
-            )
+            name: _value_inputs(ctx, component, prefix=f"{prefix}.{name}")
             for name, component in template.components.items()
         }
     )
 
 
-def _apply_output[
-    SemanticT: AlgebraValue, OutputT: AlgebraValue
-](
+def _apply_output[SemanticT: AlgebraValue, OutputT: AlgebraValue](
     ctx: TensorBuilder,
     semantic: SemanticT,
     output_function: OutputFunction[SemanticT, OutputT] | None,
@@ -167,19 +229,14 @@ def _output_vjp[
     semantic_leaves = dict(value_leaves(semantic))
     gradients = vjp(
         ctx,
-        (
-            (primal_outputs[path], cotangent_outputs[path])
-            for path in primal_outputs
-        ),
+        ((primal_outputs[path], cotangent_outputs[path]) for path in primal_outputs),
         wrt={".".join(path): value for path, value in semantic_leaves.items()},
     )
-    by_path = {
-        tuple(name.split(".")): value for name, value in gradients.items()
-    }
+    by_path = {tuple(name.split(".")): value for name, value in gradients.items()}
     return cast(SemanticT, _cotangent_value(ctx, semantic, by_path))
 
 
-def _trace_forward[
+def _lower_forward_values[
     SemanticT: AlgebraValue,
     ExecutionT: AlgebraValue,
     AccumulatorT: AlgebraValue,
@@ -190,12 +247,9 @@ def _trace_forward[
     map_function: MapFunction[SemanticT],
     inputs: Mapping[str, TensorValue],
 ) -> tuple[ExecutionT, SemanticT]:
-    factors = map_function(ctx, inputs)
-    algebra.semantic.validate(factors, label="map result")
+    factors = _mapped_factor(ctx, spec, algebra, map_function(ctx, inputs))
     lifted = algebra.to_execution(ctx, factors)
-    execution = lower_fold(
-        ctx, algebra.execution, lifted, fold_axes=spec.fold_axes
-    )
+    execution = lower_fold(ctx, algebra.execution, lifted, fold_axes=spec.fold_axes)
     for path, value in value_leaves(execution):
         remaining = set(value.axes) & set(spec.fold_axes)
         if remaining:
@@ -222,7 +276,7 @@ def compile_fold_forward[
     """Lower the forward fold and its explicit saved-state boundary."""
     spec.check()
     ctx = TensorBuilder(spec.axes)
-    execution, semantic = _trace_forward(
+    execution, semantic = _lower_forward_values(
         ctx, spec, algebra, map_function, _inputs(ctx, spec)
     )
     output = _apply_output(ctx, semantic, output_function)
@@ -256,6 +310,167 @@ def compile_fold[
     )
 
 
+def compile_map_fold_region[
+    SemanticT: AlgebraValue,
+    ExecutionT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
+](
+    spec: FoldSpec,
+    algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
+    map_function: MapFunction[SemanticT],
+) -> TensorProgram:
+    """Lower ``E.fold o Phi^F o map`` for an arbitrary fold region."""
+    spec.check()
+    ctx = TensorBuilder(spec.axes)
+    factors = _mapped_factor(ctx, spec, algebra, map_function(ctx, _inputs(ctx, spec)))
+    execution = lower_fold(
+        ctx,
+        algebra.execution,
+        algebra.to_execution(ctx, factors),
+        fold_axes=spec.fold_axes,
+    )
+    for path, value in value_leaves(execution):
+        ctx.materialize(f"execution.{'.'.join(path)}", value)
+    return optimize_program(ctx.finish())
+
+
+def compile_masked_map_fold_region[
+    SemanticT: AlgebraValue,
+    ExecutionT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
+](
+    spec: FoldSpec,
+    algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
+    map_function: MapFunction[SemanticT],
+) -> TensorProgram:
+    """Lower map-fold with an explicit validity mask for padded fold tiles."""
+    spec.check()
+    ctx = TensorBuilder(spec.axes)
+    valid = ctx.input("physical_valid", (*spec.batch_axes, *spec.fold_axes), "bool")
+    masked = _mapped_factor(
+        ctx,
+        spec,
+        algebra,
+        map_function(ctx, _inputs(ctx, spec)),
+        physical_valid=valid,
+    )
+    execution = lower_fold(
+        ctx,
+        algebra.execution,
+        algebra.to_execution(ctx, masked),
+        fold_axes=spec.fold_axes,
+    )
+    for path, value in value_leaves(execution):
+        ctx.materialize(f"execution.{'.'.join(path)}", value)
+    return optimize_program(ctx.finish())
+
+
+def compile_map_fold_combine_region[
+    SemanticT: AlgebraValue,
+    ExecutionT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
+](
+    spec: FoldSpec,
+    algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
+    map_function: MapFunction[SemanticT],
+    *,
+    masked: bool = False,
+) -> TensorProgram:
+    """Lower ``combine(state, fold(Phi(map(tile))))`` as one region."""
+    spec.check()
+    ctx = TensorBuilder(spec.axes)
+    inputs = _inputs(ctx, spec)
+
+    def state_inputs(
+        structure: AlgebraStructure, prefix: tuple[str, ...] = ()
+    ) -> AlgebraValue:
+        name = ".".join(prefix)
+        if isinstance(structure, TensorStructure):
+            return StructuredValue(
+                {
+                    field: ctx.input(
+                        f"accumulator.{name + '.' if name else ''}{field}",
+                        (*spec.batch_axes, *schema.inner_axes),
+                        schema.dtype,
+                    )
+                    for field, schema in structure.fields.items()
+                }
+            )
+        if isinstance(structure, CompositeStructure):
+            return CompositeValue(
+                {
+                    component: state_inputs(value, (*prefix, component))
+                    for component, value in structure.components.items()
+                }
+            )
+        raise TypeError("unknown algebra structure")
+
+    initial = cast(ExecutionT, state_inputs(algebra.execution.structure))
+    valid = (
+        ctx.input("physical_valid", (*spec.batch_axes, *spec.fold_axes), "bool")
+        if masked
+        else None
+    )
+    factors = _mapped_factor(
+        ctx,
+        spec,
+        algebra,
+        map_function(ctx, inputs),
+        physical_valid=valid,
+    )
+    lifted = algebra.to_execution(ctx, factors)
+    result = algebra.execution.lower_fold_accumulate(
+        ctx, initial, lifted, fold_axes=spec.fold_axes
+    )
+    if result is None:
+        partial = lower_fold(
+            ctx, algebra.execution, lifted, fold_axes=spec.fold_axes
+        )
+        result = algebra.execution.combine(ctx, initial, partial)
+    algebra.execution.validate(result, label="map-fold-combine result")
+    for path, value in value_leaves(result):
+        if set(value.axes) & set(spec.fold_axes):
+            raise ValueError(
+                f"map-fold-combine result {'.'.join(path)!r} retains fold axes"
+            )
+        ctx.materialize(f"execution.{'.'.join(path)}", value)
+    return optimize_program(ctx.finish())
+
+
+def compile_project_output_region[
+    SemanticT: AlgebraValue,
+    ExecutionT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
+    OutputT: AlgebraValue,
+](
+    spec: FoldSpec,
+    algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
+    map_function: MapFunction[SemanticT],
+    *,
+    output_function: OutputFunction[SemanticT, OutputT] | None = None,
+) -> TensorProgram:
+    """Lower ``to_output o Psi`` from a completed execution carrier."""
+    spec.check()
+    shape_ctx = TensorBuilder(spec.axes)
+    execution_template, _ = _lower_forward_values(
+        shape_ctx,
+        spec,
+        algebra,
+        map_function,
+        _inputs(shape_ctx, spec),
+    )
+    ctx = TensorBuilder(spec.axes)
+    execution = cast(
+        ExecutionT,
+        _value_inputs(ctx, execution_template, prefix="execution"),
+    )
+    semantic = algebra.to_semantic(ctx, execution)
+    output = _apply_output(ctx, semantic, output_function)
+    for path, value in value_leaves(output):
+        ctx.materialize(".".join(path), value)
+    return optimize_program(ctx.finish())
+
+
 def compile_fold_backward[
     SemanticT: AlgebraValue,
     ExecutionT: AlgebraValue,
@@ -280,16 +495,14 @@ def compile_fold_backward[
             "standalone fold backward cannot supply required prefix context"
         )
     shape_ctx = TensorBuilder(spec.axes)
-    execution_template, semantic_template = _trace_forward(
+    execution_template, semantic_template = _lower_forward_values(
         shape_ctx,
         spec,
         algebra,
         map_function,
         _inputs(shape_ctx, spec),
     )
-    output_template = _apply_output(
-        shape_ctx, semantic_template, output_function
-    )
+    output_template = _apply_output(shape_ctx, semantic_template, output_function)
 
     ctx = TensorBuilder(spec.axes)
     inputs = _inputs(ctx, spec)
@@ -303,15 +516,11 @@ def compile_fold_backward[
     )
     semantic = algebra.to_semantic(ctx, execution)
     output = _apply_output(ctx, semantic, output_function)
-    semantic_cotangent = _output_vjp(
-        ctx, semantic, output, output_cotangent
-    )
+    semantic_cotangent = _output_vjp(ctx, semantic, output, output_cotangent)
     accumulator = algebra.embed(ctx, execution, semantic_cotangent)
 
-    recomputed_factors = map_function(ctx, inputs)
-    local_cotangent = algebra.finalize(
-        ctx, recomputed_factors, accumulator
-    )
+    recomputed_factors = _mapped_factor(ctx, spec, algebra, map_function(ctx, inputs))
+    local_cotangent = algebra.finalize(ctx, recomputed_factors, accumulator)
     primal_by_path = dict(value_leaves(recomputed_factors))
     cotangent_by_path = dict(value_leaves(local_cotangent))
     if primal_by_path.keys() != cotangent_by_path.keys():
@@ -324,15 +533,54 @@ def compile_fold_backward[
     }
     input_cotangents = vjp(
         ctx,
-        (
-            (primal_by_path[path], cotangent_by_path[path])
-            for path in primal_by_path
-        ),
+        ((primal_by_path[path], cotangent_by_path[path]) for path in primal_by_path),
         wrt=differentiable_inputs,
     )
 
     for name, value in input_cotangents.items():
         ctx.materialize(f"grad_input.{name}", value)
+    return optimize_program(ctx.finish())
+
+
+def compile_embed_region[
+    SemanticT: AlgebraValue,
+    ExecutionT: AlgebraValue,
+    AccumulatorT: AlgebraValue,
+    OutputT: AlgebraValue,
+](
+    spec: FoldSpec,
+    algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
+    map_function: MapFunction[SemanticT],
+    *,
+    output_function: OutputFunction[SemanticT, OutputT] | None = None,
+) -> TensorProgram:
+    """Lower ``embed o output_function*`` as an independent region."""
+    spec.check()
+    shape_ctx = TensorBuilder(spec.axes)
+    execution_template, semantic_template = _lower_forward_values(
+        shape_ctx,
+        spec,
+        algebra,
+        map_function,
+        _inputs(shape_ctx, spec),
+    )
+    output_template = _apply_output(shape_ctx, semantic_template, output_function)
+
+    ctx = TensorBuilder(spec.axes)
+    execution = cast(
+        ExecutionT,
+        _value_inputs(ctx, execution_template, prefix="saved_execution"),
+    )
+    output_cotangent = cast(
+        OutputT,
+        _value_inputs(ctx, output_template, prefix="grad_output"),
+    )
+    semantic = algebra.to_semantic(ctx, execution)
+    output = _apply_output(ctx, semantic, output_function)
+    semantic_cotangent = _output_vjp(ctx, semantic, output, output_cotangent)
+    accumulator = algebra.embed(ctx, execution, semantic_cotangent)
+    for path, value in value_leaves(accumulator):
+        ctx.materialize(f"accumulator.{'.'.join(path)}", value)
     return optimize_program(ctx.finish())
 
 
@@ -347,6 +595,7 @@ def compile_map_finalize_vjp_region[
     map_function: MapFunction[SemanticT],
     *,
     output_function: OutputFunction[SemanticT, OutputT] | None = None,
+    mask_fold: bool = False,
 ) -> TensorProgram:
     """Lower ``map -> finalize -> map*`` over an arbitrary input region.
 
@@ -365,21 +614,17 @@ def compile_map_finalize_vjp_region[
     # composition.  The resulting tensor values are used only as input
     # signatures for this independent region program.
     shape_ctx = TensorBuilder(spec.axes)
-    execution_template, semantic_template = _trace_forward(
+    execution_template, semantic_template = _lower_forward_values(
         shape_ctx,
         spec,
         algebra,
         map_function,
         _inputs(shape_ctx, spec),
     )
-    output_template = _apply_output(
-        shape_ctx, semantic_template, output_function
-    )
+    output_template = _apply_output(shape_ctx, semantic_template, output_function)
     output_cotangent_template = cast(
         OutputT,
-        _value_inputs(
-            shape_ctx, output_template, prefix="unused_grad_output"
-        ),
+        _value_inputs(shape_ctx, output_template, prefix="unused_grad_output"),
     )
     semantic_cotangent_template = _output_vjp(
         shape_ctx,
@@ -405,8 +650,12 @@ def compile_map_finalize_vjp_region[
         if algebra.finalize_context is FinalizeContext.PREFIX
         else None
     )
-    factors = map_function(ctx, inputs)
-    algebra.semantic.validate(factors, label="map result")
+    mapped = map_function(ctx, inputs)
+    if mask_fold:
+        valid = ctx.input("physical_valid", (*spec.batch_axes, *spec.fold_axes), "bool")
+        factors = _mapped_factor(ctx, spec, algebra, mapped, physical_valid=valid)
+    else:
+        factors = _mapped_factor(ctx, spec, algebra, mapped)
     prefix = boundary_prefix
     updated_prefix = None
     if boundary_prefix is not None:
@@ -424,9 +673,7 @@ def compile_map_finalize_vjp_region[
         )
         prefix = scan.prefixes
         updated_prefix = scan.final
-    local_cotangent = algebra.finalize(
-        ctx, factors, accumulator, prefix=prefix
-    )
+    local_cotangent = algebra.finalize(ctx, factors, accumulator, prefix=prefix)
 
     primal_by_path = dict(value_leaves(factors))
     cotangent_by_path = dict(value_leaves(local_cotangent))
@@ -440,10 +687,7 @@ def compile_map_finalize_vjp_region[
     }
     input_cotangents = vjp(
         ctx,
-        (
-            (primal_by_path[path], cotangent_by_path[path])
-            for path in primal_by_path
-        ),
+        ((primal_by_path[path], cotangent_by_path[path]) for path in primal_by_path),
         wrt=differentiable_inputs,
     )
     for name, value in input_cotangents.items():
@@ -455,6 +699,7 @@ def compile_map_finalize_vjp_region[
 
 
 __all__ = [
+    "FoldFactor",
     "FoldSpec",
     "MapFunction",
     "OutputFunction",
@@ -462,5 +707,9 @@ __all__ = [
     "compile_fold",
     "compile_fold_backward",
     "compile_fold_forward",
+    "compile_embed_region",
+    "compile_map_fold_region",
+    "compile_map_fold_combine_region",
     "compile_map_finalize_vjp_region",
+    "compile_project_output_region",
 ]

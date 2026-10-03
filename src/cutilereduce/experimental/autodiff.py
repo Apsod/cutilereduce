@@ -81,9 +81,7 @@ def vjp(
 
         def add_input(index: int, value: TensorValue) -> None:
             operand = inputs[index]
-            _accumulate(
-                gradients, operand.id, _sum_to(ctx, value, operand.axes)
-            )
+            _accumulate(gradients, operand.id, _sum_to(ctx, value, operand.axes))
 
         match node.op:
             case "add":
@@ -91,7 +89,7 @@ def vjp(
                 add_input(1, cotangent)
             case "subtract":
                 add_input(0, cotangent)
-                add_input(1, cotangent * -1.0)
+                add_input(1, -cotangent)
             case "multiply":
                 add_input(0, cotangent * inputs[1])
                 add_input(1, cotangent * inputs[0])
@@ -99,20 +97,22 @@ def vjp(
                 add_input(0, cotangent / inputs[1])
                 add_input(
                     1,
-                    cotangent * inputs[0] * -1.0
-                    / (inputs[1] * inputs[1]),
+                    -(cotangent * inputs[0]) / (inputs[1] * inputs[1]),
                 )
+            case "neg":
+                add_input(0, -cotangent)
             case "exp":
                 add_input(0, cotangent * TensorValue(ctx, node_id))
             case "log":
                 add_input(0, cotangent / inputs[0])
             case "cast":
                 add_input(0, ctx.cast(cotangent, inputs[0].dtype))
-            case "where":
+            case "where" | "mask_identity":
                 zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
                 add_input(1, ctx.where(inputs[0], cotangent, zero))
-                add_input(2, ctx.where(inputs[0], zero, cotangent))
-            case "contract":
+                if node.op == "where":
+                    add_input(2, ctx.where(inputs[0], zero, cotangent))
+            case "contract" | "contract_accumulate":
                 partition = node.attribute("contraction_axes")
                 if not isinstance(partition, ContractionAxes):
                     raise TypeError("contract node has invalid axis metadata")
@@ -126,6 +126,8 @@ def vjp(
                         target_axes=inputs[0].axes,
                     ),
                 )
+                if node.op == "contract_accumulate":
+                    add_input(2, cotangent)
                 add_input(
                     1,
                     _contract_vjp(
@@ -139,10 +141,9 @@ def vjp(
             case "reduce_sum":
                 add_input(
                     0,
-                    cotangent
-                    * ctx.full(inputs[0].axes, 1.0, cotangent.dtype),
+                    cotangent * ctx.full(inputs[0].axes, 1.0, cotangent.dtype),
                 )
-            case "input" | "constant" | "full" | "zero":
+            case "input" | "axis_index" | "constant" | "full" | "zero":
                 pass
             case _:
                 raise NotImplementedError(f"no VJP rule for tensor op {node.op!r}")

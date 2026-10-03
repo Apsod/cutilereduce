@@ -16,14 +16,13 @@ from ..ir import TensorBuilder
 
 class LogAddExpMonoid(Monoid[StructuredValue]):
     commutative = True
+
     def __init__(self, dtype: str = "float32"):
         self.dtype = dtype
         self.structure = TensorStructure({"value": TensorField(dtype=dtype)})
 
     def identity(self, ctx: TensorBuilder) -> StructuredValue:
-        return StructuredValue(
-            {"value": ctx.constant(float("-inf"), self.dtype)}
-        )
+        return StructuredValue({"value": ctx.constant(float("-inf"), self.dtype)})
 
     def combine(
         self,
@@ -38,12 +37,20 @@ class LogAddExpMonoid(Monoid[StructuredValue]):
             left["value"],
             right["value"],
         )
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        normalizer = ctx.where(
+            nonempty,
+            ctx.exp(left["value"] - safe_maximum)
+            + ctx.exp(right["value"] - safe_maximum),
+            ctx.constant(1.0, self.dtype),
+        )
         return StructuredValue(
             {
-                "value": maximum
-                + ctx.log(
-                    ctx.exp(left["value"] - maximum)
-                    + ctx.exp(right["value"] - maximum)
+                "value": ctx.where(
+                    nonempty,
+                    maximum + ctx.log(normalizer),
+                    ctx.constant(float("-inf"), self.dtype),
                 )
             }
         )
@@ -57,19 +64,35 @@ class LogAddExpMonoid(Monoid[StructuredValue]):
     ) -> StructuredValue:
         self.validate(values, label="logaddexp values")
         maximum = ctx.reduce("max", values["value"], fold_axes)
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         normalizer = ctx.reduce(
-            "sum", ctx.exp(values["value"] - maximum), fold_axes
+            "sum",
+            ctx.where(
+                nonempty,
+                ctx.exp(values["value"] - safe_maximum),
+                ctx.full(values["value"].axes, 0.0, self.dtype),
+            ),
+            fold_axes,
         )
-        return StructuredValue({"value": maximum + ctx.log(normalizer)})
+        return StructuredValue(
+            {
+                "value": ctx.where(
+                    nonempty,
+                    maximum + ctx.log(normalizer),
+                    ctx.constant(float("-inf"), self.dtype),
+                )
+            }
+        )
+
 
 class LSEExecutionMonoid(Monoid[StructuredValue]):
     commutative = True
+
     def __init__(self, dtype: str = "float32"):
         self.dtype = dtype
         scalar = TensorField(dtype=dtype)
-        self.structure = TensorStructure(
-            {"maximum": scalar, "normalizer": scalar}
-        )
+        self.structure = TensorStructure({"maximum": scalar, "normalizer": scalar})
 
     def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
@@ -92,12 +115,22 @@ class LSEExecutionMonoid(Monoid[StructuredValue]):
             left["maximum"],
             right["maximum"],
         )
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         return StructuredValue(
             {
                 "maximum": maximum,
-                "normalizer": ctx.exp(left["maximum"] - maximum)
+                "normalizer": ctx.where(
+                    nonempty,
+                    ctx.exp(left["maximum"] - safe_maximum),
+                    ctx.constant(0.0, self.dtype),
+                )
                 * left["normalizer"]
-                + ctx.exp(right["maximum"] - maximum)
+                + ctx.where(
+                    nonempty,
+                    ctx.exp(right["maximum"] - safe_maximum),
+                    ctx.constant(0.0, self.dtype),
+                )
                 * right["normalizer"],
             }
         )
@@ -111,19 +144,24 @@ class LSEExecutionMonoid(Monoid[StructuredValue]):
     ) -> StructuredValue:
         self.validate(values, label="LSE execution carriers")
         maximum = ctx.reduce("max", values["maximum"], fold_axes)
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         normalizer = ctx.reduce(
             "sum",
-            ctx.exp(values["maximum"] - maximum) * values["normalizer"],
+            ctx.where(
+                nonempty,
+                ctx.exp(values["maximum"] - safe_maximum),
+                ctx.full(values["maximum"].axes, 0.0, self.dtype),
+            )
+            * values["normalizer"],
             fold_axes,
         )
-        return StructuredValue(
-            {"maximum": maximum, "normalizer": normalizer}
-        )
+        return StructuredValue({"maximum": maximum, "normalizer": normalizer})
 
-class LogSumExp(
-    FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]
-):
+
+class LogSumExp(FoldAlgebra[StructuredValue, StructuredValue, StructuredValue]):
     finalize_context = FinalizeContext.NONE
+
     def __init__(self, dtype: str = "float32"):
         scalar = TensorField(dtype=dtype)
         self.semantic = LogAddExpMonoid(dtype)
@@ -147,10 +185,7 @@ class LogSumExp(
     ) -> StructuredValue:
         self.execution.validate(execution, label="LSE execution carrier")
         return StructuredValue(
-            {
-                "value": execution["maximum"]
-                + ctx.log(execution["normalizer"])
-            }
+            {"value": execution["maximum"] + ctx.log(execution["normalizer"])}
         )
 
     def embed(
@@ -160,12 +195,10 @@ class LogSumExp(
         semantic_cotangent: StructuredValue,
     ) -> StructuredValue:
         semantic = self.to_semantic(ctx, execution)
-        self.semantic.validate(
-            semantic_cotangent, label="LSE semantic cotangent"
-        )
+        self.semantic.validate(semantic_cotangent, label="LSE semantic cotangent")
         return StructuredValue(
             {
-                "log_weight": semantic["value"] * -1.0,
+                "log_weight": -semantic["value"],
                 "value": semantic_cotangent["value"],
             }
         )
@@ -183,9 +216,7 @@ class LogSumExp(
         self.accumulator.validate(accumulator, label="LSE accumulator")
         return StructuredValue(
             {
-                "value": ctx.exp(
-                    factor["value"] + accumulator["log_weight"]
-                )
+                "value": ctx.exp(factor["value"] + accumulator["log_weight"])
                 * accumulator["value"]
             }
         )

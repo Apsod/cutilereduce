@@ -151,6 +151,18 @@ class Monoid[ValueT: AlgebraValue](PartialSemigroup[ValueT]):
         del ctx, values, fold_axes
         return None
 
+    def lower_fold_accumulate(
+        self,
+        ctx: TensorBuilder,
+        initial: ValueT,
+        values: ValueT,
+        *,
+        fold_axes: tuple[str, ...],
+    ) -> ValueT | None:
+        """Optionally fold a tile directly into an existing carrier."""
+        del ctx, initial, values, fold_axes
+        return None
+
     def lower_scan(
         self,
         ctx: TensorBuilder,
