@@ -71,13 +71,37 @@ def _generic_inputs(
     )
 
 
+def _mask_domain_identity[ValueT: AlgebraValue](
+    ctx: TensorBuilder,
+    monoid: Monoid[ValueT],
+    values: ValueT,
+    domain_valid: TensorValue,
+) -> ValueT:
+    identity = monoid.identity(ctx)
+    identity_leaves = dict(value_leaves(identity))
+    group = len(ctx.nodes)
+    masked = {
+        path: ctx.mask_identity(domain_valid, value, identity_leaves[path], mask_group=group)
+        for path, value in value_leaves(values)
+    }
+    return cast(ValueT, _replace_leaves(values, masked))
+
+
 def lower_fold[ValueT: AlgebraValue](
     ctx: TensorBuilder,
     monoid: Monoid[ValueT],
     values: ValueT,
     *,
     fold_axes: tuple[str, ...],
+    domain_valid: TensorValue | None = None,
 ) -> ValueT:
+    if domain_valid is not None:
+        domain_lowering = monoid.lower_fold_domain(
+            ctx, values, fold_axes=fold_axes, domain_valid=domain_valid
+        )
+        if domain_lowering is not None:
+            return domain_lowering
+        values = _mask_domain_identity(ctx, monoid, values, domain_valid)
     specialized = monoid.lower_fold(ctx, values, fold_axes=fold_axes)
     if specialized is not None:
         return specialized
@@ -98,6 +122,36 @@ def lower_fold[ValueT: AlgebraValue](
         for path, value in value_leaves(values)
     }
     return cast(ValueT, _replace_leaves(values, leaves))
+
+
+def lower_fold_accumulate[ValueT: AlgebraValue](
+    ctx: TensorBuilder,
+    monoid: Monoid[ValueT],
+    initial: ValueT,
+    values: ValueT,
+    *,
+    fold_axes: tuple[str, ...],
+    domain_valid: TensorValue | None = None,
+) -> ValueT:
+    if domain_valid is not None:
+        domain_lowering = monoid.lower_fold_accumulate_domain(
+            ctx,
+            initial,
+            values,
+            fold_axes=fold_axes,
+            domain_valid=domain_valid,
+        )
+        if domain_lowering is not None:
+            return domain_lowering
+        values = _mask_domain_identity(ctx, monoid, values, domain_valid)
+    specialized = monoid.lower_fold_accumulate(
+        ctx, initial, values, fold_axes=fold_axes
+    )
+    if specialized is not None:
+        return specialized
+    return monoid.combine(
+        ctx, initial, lower_fold(ctx, monoid, values, fold_axes=fold_axes)
+    )
 
 
 def lower_scan[ValueT: AlgebraValue](
@@ -145,4 +199,4 @@ def lower_scan[ValueT: AlgebraValue](
     )
 
 
-__all__ = ["lower_fold", "lower_scan"]
+__all__ = ["lower_fold", "lower_fold_accumulate", "lower_scan"]

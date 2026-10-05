@@ -103,10 +103,13 @@ return FoldFactor(
 
 The false branch is the semantic monoid identity and therefore has zero input
 cotangent. This is distinct from an unmasked value that merely happens to equal
-the identity. Scheduling combines this semantic predicate with physical tile
-validity, masks partial tiles lane-wise, and skips tiles proven empty from
-simple axis-index comparisons. Optimized monoid folds must return their exact
-identity, without NaNs, when every factor is masked.
+the identity. Physical padding is separate: the schedule supplies an execution
+domain to the fold region, and invalid lanes contribute the execution-carrier
+identity after `to_execution`. This avoids assuming that `Phi` maps the
+semantic identity to the execution identity. Backward regions use the same
+domain to suppress padded-factor gradients. A backend may skip tiles proven
+empty from simple axis-index comparisons. Optimized monoid folds must return
+their exact identity, without NaNs, when every factor is masked.
 
 ## Constructing an operator
 
@@ -831,12 +834,21 @@ Every compiled program currently runs these passes in order:
    `x + 0`, `x / 1`, and redundant casts.
 2. Dead-code elimination retains only nodes reachable from declared outputs.
 3. Contraction discovery rewrites a named-axis sum of products into an
-   explicit contraction when every reduced axis occurs in both operands:
+   explicit contraction when every reduced axis occurs in both operands. It
+   also recognizes a zero-masked product when the mask can be applied to one
+   operand without expanding that operand's axes:
 
    ```text
    reduce_sum(multiply(lhs, rhs), over=R)
        -> contract(lhs, rhs, over=R)
+
+   reduce_sum(where(mask, multiply(lhs, rhs), 0), over=R)
+       -> contract(where(mask, lhs, 0), rhs, over=R)
    ```
+
+   Masks spanning axes exclusive to both operands are left as generic tensor
+   expressions, since applying such a mask to either operand would introduce
+   an unnecessary expanded intermediate.
 
 4. Contraction canonicalization recomputes the named-axis partition and its
    dot/GEMV/GEMM/batched implementation classification.

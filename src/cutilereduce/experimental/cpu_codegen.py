@@ -374,6 +374,11 @@ def _emit_region(
         inputs = [values[node_id] for node_id in node.inputs]
         input_nodes = [region.nodes[node_id] for node_id in node.inputs]
         match node.op:
+            case "domain_valid":
+                expression = (
+                    f"at::ones({_axes_literal(node.axes, sizes)}, "
+                    f"at::TensorOptions().dtype(at::kBool))"
+                )
             case "axis_index":
                 axis = _attr(node, "axis")
                 expression = (

@@ -136,7 +136,10 @@ def _build_tiled_stage(
                 "call_region",
                 (*parameters, *carry_arguments),
                 next_state,
-                (("region", "masked_map_fold_combine"),),
+                (
+                    ("region", "map_fold_combine"),
+                    ("domain_axes", (*problem.spec.batch_axes, *problem.spec.fold_axes)),
+                ),
             ),
         ),
     )
@@ -426,7 +429,11 @@ def _execute_region(
         inputs = [values[value] for value in node.inputs]
         input_nodes = [region.nodes[value] for value in node.inputs]
         attrs = dict(node.attributes)
-        if node.op == "axis_index":
+        if node.op == "domain_valid":
+            value = torch.ones(
+                tuple(axis_extent(axis) for axis in node.axes), dtype=torch.bool
+            )
+        elif node.op == "axis_index":
             axis = attrs["axis"]
             extent = axis_sizes.get(axis)
             if extent is None:
@@ -528,7 +535,6 @@ def execute_tiled_fold_cpu(
         "execution_identity": problem.execution_identity,
         "map_fold": problem.map_fold,
         "map_fold_combine": problem.map_fold_combine,
-        "masked_map_fold_combine": problem.masked_map_fold_combine,
         "execution_combine": problem.execution_combine,
         "project_output": problem.project_output,
     }
@@ -614,14 +620,6 @@ def execute_tiled_fold_cpu(
                     for name, value in state.items()
                 }
             )
-            if "physical_valid" in dict(regions[tile_region].arguments):
-                combine_inputs["physical_valid"] = torch.ones(
-                    tuple(
-                        locations[axis][1]
-                        for axis in (*problem.spec.batch_axes, *problem.spec.fold_axes)
-                    ),
-                    dtype=torch.bool,
-                )
             state = _execute_region(
                 regions[tile_region],
                 combine_inputs,
@@ -677,7 +675,11 @@ def execute_tiled_backward_cpu(
     if len(plan.stages) != 2 or plan.stages[1].loop is None:
         raise ValueError("backward CPU mock expects embed and finalize stages")
     embed_region = problem.embed_output_vjp
-    finalize_region = problem.masked_map_finalize_map_vjp
+    finalize_region = (
+        problem.map_finalize_map_vjp_accumulate
+        if problem.requires_prefix
+        else problem.map_finalize_map_vjp
+    )
     if embed_region is None or finalize_region is None:
         raise ValueError("backward CPU mock requires backward regions")
 
@@ -740,13 +742,7 @@ def execute_tiled_backward_cpu(
             arguments = {}
             for name, node_id in finalize_region.arguments:
                 axes = finalize_region.nodes[node_id].axes
-                if name == "physical_valid":
-                    shape = tuple(
-                        locations[axis][1]
-                        for axis in (*problem.spec.batch_axes, *problem.spec.fold_axes)
-                    )
-                    arguments[name] = torch.ones(shape, dtype=torch.bool)
-                elif name.startswith("accumulator."):
+                if name.startswith("accumulator."):
                     arguments[name] = tile(accumulator[name], axes, locations)
                 else:
                     arguments[name] = tile(inputs[name], axes, locations)

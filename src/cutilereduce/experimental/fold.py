@@ -19,7 +19,7 @@ from .algebra import (
 )
 from .autodiff import vjp
 from .ir import TensorBuilder, TensorProgram, TensorValue
-from .lowering import lower_fold, lower_scan
+from .lowering import lower_fold, lower_fold_accumulate, lower_scan
 from .passes import optimize_program
 
 
@@ -107,8 +107,6 @@ def _mapped_factor[
     spec: FoldSpec,
     algebra: FoldAlgebra[ValueT, ExecutionT, AccumulatorT],
     mapped: ValueT | FoldFactor[ValueT],
-    *,
-    physical_valid: TensorValue | None = None,
 ) -> ValueT:
     factor = mapped.value if isinstance(mapped, FoldFactor) else mapped
     semantic_valid = mapped.where if isinstance(mapped, FoldFactor) else None
@@ -119,16 +117,9 @@ def _mapped_factor[
             raise ValueError("factor mask must have bool dtype")
         if set(semantic_valid.axes) - allowed_axes:
             raise ValueError("factor mask may only use batch and fold axes")
-    valid = semantic_valid
-    if physical_valid is not None:
-        valid = (
-            physical_valid
-            if valid is None
-            else ctx.where(valid, physical_valid, ctx.constant(0, "bool"))
-        )
-    if valid is None:
+    if semantic_valid is None:
         return factor
-    condition = valid
+    condition = semantic_valid
     identity = algebra.semantic.identity(ctx)
     group = len(ctx.nodes)
 
@@ -154,6 +145,51 @@ def _mapped_factor[
         )
 
     return cast(ValueT, mask(factor, identity))
+
+
+def _mask_algebra_value(
+    ctx: TensorBuilder,
+    value: AlgebraValue,
+    neutral: AlgebraValue,
+    condition: TensorValue,
+) -> AlgebraValue:
+    """Select an algebra value or its neutral element over a validity domain."""
+    if isinstance(value, StructuredValue):
+        if not isinstance(neutral, StructuredValue):
+            raise TypeError("algebra value and neutral structures disagree")
+        group = len(ctx.nodes)
+        return StructuredValue(
+            {
+                name: ctx.mask_identity(
+                    condition, field, neutral[name], mask_group=group
+                )
+                for name, field in value.fields.items()
+            }
+        )
+    if not isinstance(neutral, CompositeValue):
+        raise TypeError("algebra value and neutral structures disagree")
+    return CompositeValue(
+        {
+            name: _mask_algebra_value(ctx, item, neutral[name], condition)
+            for name, item in value.components.items()
+        }
+    )
+
+
+def _zero_like_value(ctx: TensorBuilder, value: AlgebraValue) -> AlgebraValue:
+    if isinstance(value, StructuredValue):
+        return StructuredValue(
+            {
+                name: ctx.full(item.axes, 0.0, item.dtype)
+                for name, item in value.fields.items()
+            }
+        )
+    return CompositeValue(
+        {
+            name: _zero_like_value(ctx, item)
+            for name, item in value.components.items()
+        }
+    )
 
 
 def _value_inputs(
@@ -343,22 +379,17 @@ def compile_masked_map_fold_region[
     algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
     map_function: MapFunction[SemanticT],
 ) -> TensorProgram:
-    """Lower map-fold with an explicit validity mask for padded fold tiles."""
+    """Lower map-fold with validity supplied by its scheduled execution domain."""
     spec.check()
     ctx = TensorBuilder(spec.axes)
-    valid = ctx.input("physical_valid", (*spec.batch_axes, *spec.fold_axes), "bool")
-    masked = _mapped_factor(
-        ctx,
-        spec,
-        algebra,
-        map_function(ctx, _inputs(ctx, spec)),
-        physical_valid=valid,
-    )
+    valid = ctx.domain_valid((*spec.batch_axes, *spec.fold_axes))
+    factors = _mapped_factor(ctx, spec, algebra, map_function(ctx, _inputs(ctx, spec)))
     execution = lower_fold(
         ctx,
         algebra.execution,
-        algebra.to_execution(ctx, masked),
+        algebra.to_execution(ctx, factors),
         fold_axes=spec.fold_axes,
+        domain_valid=valid,
     )
     for path, value in value_leaves(execution):
         ctx.materialize(f"execution.{'.'.join(path)}", value)
@@ -373,8 +404,6 @@ def compile_map_fold_combine_region[
     spec: FoldSpec,
     algebra: FoldAlgebra[SemanticT, ExecutionT, AccumulatorT],
     map_function: MapFunction[SemanticT],
-    *,
-    masked: bool = False,
 ) -> TensorProgram:
     """Lower ``combine(state, fold(Phi(map(tile))))`` as one region."""
     spec.check()
@@ -406,27 +435,17 @@ def compile_map_fold_combine_region[
         raise TypeError("unknown algebra structure")
 
     initial = cast(ExecutionT, state_inputs(algebra.execution.structure))
-    valid = (
-        ctx.input("physical_valid", (*spec.batch_axes, *spec.fold_axes), "bool")
-        if masked
-        else None
-    )
-    factors = _mapped_factor(
-        ctx,
-        spec,
-        algebra,
-        map_function(ctx, inputs),
-        physical_valid=valid,
-    )
+    valid = ctx.domain_valid((*spec.batch_axes, *spec.fold_axes))
+    factors = _mapped_factor(ctx, spec, algebra, map_function(ctx, inputs))
     lifted = algebra.to_execution(ctx, factors)
-    result = algebra.execution.lower_fold_accumulate(
-        ctx, initial, lifted, fold_axes=spec.fold_axes
+    result = lower_fold_accumulate(
+        ctx,
+        algebra.execution,
+        initial,
+        lifted,
+        fold_axes=spec.fold_axes,
+        domain_valid=valid,
     )
-    if result is None:
-        partial = lower_fold(
-            ctx, algebra.execution, lifted, fold_axes=spec.fold_axes
-        )
-        result = algebra.execution.combine(ctx, initial, partial)
     algebra.execution.validate(result, label="map-fold-combine result")
     for path, value in value_leaves(result):
         if set(value.axes) & set(spec.fold_axes):
@@ -595,7 +614,6 @@ def compile_map_finalize_vjp_region[
     map_function: MapFunction[SemanticT],
     *,
     output_function: OutputFunction[SemanticT, OutputT] | None = None,
-    mask_fold: bool = False,
 ) -> TensorProgram:
     """Lower ``map -> finalize -> map*`` over an arbitrary input region.
 
@@ -651,11 +669,8 @@ def compile_map_finalize_vjp_region[
         else None
     )
     mapped = map_function(ctx, inputs)
-    if mask_fold:
-        valid = ctx.input("physical_valid", (*spec.batch_axes, *spec.fold_axes), "bool")
-        factors = _mapped_factor(ctx, spec, algebra, mapped, physical_valid=valid)
-    else:
-        factors = _mapped_factor(ctx, spec, algebra, mapped)
+    valid = ctx.domain_valid((*spec.batch_axes, *spec.fold_axes))
+    factors = _mapped_factor(ctx, spec, algebra, mapped)
     prefix = boundary_prefix
     updated_prefix = None
     if boundary_prefix is not None:
@@ -664,6 +679,8 @@ def compile_map_finalize_vjp_region[
                 "prefix-dependent region lowering requires one ordered axis"
             )
         lifted = algebra.to_execution(ctx, factors)
+        identity = algebra.execution.identity(ctx)
+        lifted = _mask_algebra_value(ctx, lifted, identity, valid)
         scan = lower_scan(
             ctx,
             algebra.execution,
@@ -691,6 +708,20 @@ def compile_map_finalize_vjp_region[
         wrt=differentiable_inputs,
     )
     for name, value in input_cotangents.items():
+        surviving = tuple(axis for axis in valid.axes if axis in value.axes)
+        discarded = tuple(axis for axis in valid.axes if axis not in value.axes)
+        if discarded:
+            any_valid = ctx.compare(
+                "greater",
+                ctx.reduce("max", ctx.cast(valid, "int32"), discarded),
+                0,
+            )
+        else:
+            any_valid = valid
+        if surviving:
+            condition = any_valid
+            zero = ctx.full(value.axes, 0.0, value.dtype)
+            value = ctx.where(condition, value, zero)
         ctx.materialize(f"partial_grad_input.{name}", value)
     if updated_prefix is not None:
         for path, value in value_leaves(updated_prefix):

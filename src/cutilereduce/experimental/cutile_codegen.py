@@ -133,10 +133,12 @@ def _emit_region(
         node_id: argument.replace(".", "_") for argument, node_id in region.arguments
     }
     index_nodes = tuple(node for node in region.nodes if node.op == "axis_index")
+    domain_nodes = tuple(node for node in region.nodes if node.op == "domain_valid")
     parameters = ", ".join(
         (
             *argument_names.values(),
             *(f"axis_index_{node.attribute('axis')}" for node in index_nodes),
+            *(("domain_valid",) if domain_nodes else ()),
         )
     )
     lines = ["@ct.function", f"def {name}({parameters}):"]
@@ -144,6 +146,7 @@ def _emit_region(
     values.update(
         (node.id, f"axis_index_{node.attribute('axis')}") for node in index_nodes
     )
+    values.update((node.id, "domain_valid") for node in domain_nodes)
     for node in region.nodes:
         if node.id in values:
             continue
@@ -362,7 +365,7 @@ def emit_cutile_source(
         )
     regions = {
         "execution_identity": problem.execution_identity,
-        "masked_map_fold_combine": problem.masked_map_fold_combine,
+        "map_fold_combine": problem.map_fold_combine,
         "project_output": problem.project_output,
     }
     tiles = {partition.axis: partition.tile for partition in stage.effective_partitions}
@@ -429,7 +432,7 @@ def emit_cutile_source(
                 tile_coordinates,
             )
         ]
-        region = regions["masked_map_fold_combine"]
+        region = regions["map_fold_combine"]
         guard = _tile_mask_guard(problem.map_fold, partition_by_axis, tile_coordinates)
         body_indent = indent
         if guard is not None:
@@ -449,12 +452,12 @@ def emit_cutile_source(
             f"tile_{binding.name.replace('.', '_')}" for binding in stage.bindings
         ]
         arguments.append("*state")
-        arguments.append("physical_valid")
         arguments.extend(
             _axis_index_arguments(region, partition_by_axis, tile_coordinates, sizes)
         )
+        arguments.append("physical_valid")
         result.append(
-            f"{body_indent}state = masked_map_fold_combine({', '.join(arguments)})"
+            f"{body_indent}state = map_fold_combine({', '.join(arguments)})"
         )
         return result
 
@@ -605,9 +608,13 @@ def _emit_finalize_stage(
         raise NotImplementedError(
             "cuTile backward emission does not yet thread noncommutative prefixes"
         )
-    region = problem.masked_map_finalize_map_vjp
+    region = (
+        problem.map_finalize_map_vjp_accumulate
+        if problem.requires_prefix
+        else problem.map_finalize_map_vjp
+    )
     if region is None:
-        raise ValueError("backward plan requires a masked finalize region")
+        raise ValueError("backward plan requires a finalize region")
     tiles = {partition.axis: partition.tile for partition in stage.effective_partitions}
     helper = _emit_region("map_finalize_map_vjp", region, sizes, tiles)
     destinations = tuple(
@@ -700,10 +707,10 @@ def _emit_finalize_stage(
             )
             loaded[parameter.id] = name
         arguments = [loaded[value.id] for value in call.inputs]
-        arguments.append("physical_valid")
         arguments.extend(
             _axis_index_arguments(region, partition_by_axis, tile_coordinates, sizes)
         )
+        arguments.append("physical_valid")
         outputs = tuple(
             f"partial_{value.name.replace('.', '_')}" for value in call.outputs
         )

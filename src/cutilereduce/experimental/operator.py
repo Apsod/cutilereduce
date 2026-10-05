@@ -24,7 +24,6 @@ from .fold import (
     compile_fold_forward,
     compile_map_fold_region,
     compile_map_fold_combine_region,
-    compile_masked_map_fold_region,
     compile_map_finalize_vjp_region,
     compile_project_output_region,
 )
@@ -51,15 +50,11 @@ class FoldProgram:
     execution_identity: TensorRegion
     execution_combine: TensorRegion
     map_fold: TensorRegion
-    masked_map_fold: TensorRegion
     map_fold_combine: TensorRegion
-    masked_map_fold_combine: TensorRegion
     project_output: TensorRegion
     embed_output_vjp: TensorRegion | None
     map_finalize_map_vjp: TensorRegion | None
     map_finalize_map_vjp_accumulate: TensorRegion | None
-    masked_map_finalize_map_vjp: TensorRegion | None
-    masked_map_finalize_map_vjp_accumulate: TensorRegion | None
 
     def __post_init__(self) -> None:
         if self.semantic_commutative and self.requires_prefix:
@@ -199,17 +194,9 @@ class FoldOperator[
         map_fold = program_to_region(
             compile_map_fold_region(self.spec, self.algebra, self.maps.to_factor)
         )
-        masked_map_fold = program_to_region(
-            compile_masked_map_fold_region(self.spec, self.algebra, self.maps.to_factor)
-        )
         map_fold_combine = program_to_region(
             compile_map_fold_combine_region(
                 self.spec, self.algebra, self.maps.to_factor
-            )
-        )
-        masked_map_fold_combine = program_to_region(
-            compile_map_fold_combine_region(
-                self.spec, self.algebra, self.maps.to_factor, masked=True
             )
         )
         template = cast(
@@ -250,19 +237,6 @@ class FoldOperator[
             if backward
             else None
         )
-        masked_backward_region = (
-            program_to_region(
-                compile_map_finalize_vjp_region(
-                    self.spec,
-                    self.algebra,
-                    self.maps.to_factor,
-                    output_function=self.maps.to_output,
-                    mask_fold=True,
-                )
-            )
-            if backward
-            else None
-        )
         prefix = self.algebra.finalize_context is FinalizeContext.PREFIX
         return FoldProgram(
             spec=self.spec,
@@ -274,19 +248,11 @@ class FoldOperator[
                 self.spec, self.algebra, template
             ),
             map_fold=map_fold,
-            masked_map_fold=masked_map_fold,
             map_fold_combine=map_fold_combine,
-            masked_map_fold_combine=masked_map_fold_combine,
             project_output=project,
             embed_output_vjp=embed,
             map_finalize_map_vjp=backward_region if not prefix else None,
             map_finalize_map_vjp_accumulate=backward_region if prefix else None,
-            masked_map_finalize_map_vjp=(
-                masked_backward_region if not prefix else None
-            ),
-            masked_map_finalize_map_vjp_accumulate=(
-                masked_backward_region if prefix else None
-            ),
         )
 
 

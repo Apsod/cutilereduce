@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from collections import Counter
 from dataclasses import dataclass
 from typing import Any
 
@@ -234,41 +233,124 @@ def _contraction_axes(
 
 
 def discover_contractions(program: TensorProgram) -> TensorProgram:
-    """Recognize sum-of-products as named-axis contractions."""
-    nodes = list(program.nodes)
-    uses = Counter(value for node in nodes for value in node.inputs)
-    for index, node in enumerate(nodes):
-        if node.op != "reduce_sum" or len(node.inputs) != 1:
-            continue
-        product = nodes[node.inputs[0]]
-        if product.op != "multiply" or len(product.inputs) != 2:
-            continue
-        lhs = nodes[product.inputs[0]]
-        rhs = nodes[product.inputs[1]]
-        reduce = _attribute(node, "over")
-        if not isinstance(reduce, tuple):
-            continue
-        if not set(reduce) <= set(lhs.axes) & set(rhs.axes):
-            continue
-        partition = _contraction_axes(program.axes, lhs, rhs, reduce)
-        nodes[index] = TensorNode(
-            id=node.id,
-            op="contract",
-            inputs=product.inputs,
-            axes=node.axes,
-            dtype=node.dtype,
-            attributes=(
-                ("contraction_axes", partition),
-                ("implementation", partition.kind),
-            ),
+    """Recognize sum-of-products and zero-masked products as contractions."""
+    nodes: list[TensorNode] = []
+    remap: dict[int, int] = {}
+
+    def is_zero(node: TensorNode) -> bool:
+        if node.op == "zero":
+            return True
+        return node.op in {"constant", "full"} and _attribute(node, "value") == 0
+
+    for old in program.nodes:
+        mapped_inputs = tuple(remap[value] for value in old.inputs)
+        if old.op == "reduce_sum" and len(old.inputs) == 1:
+            producer = program.nodes[old.inputs[0]]
+            condition_id: int | None = None
+            if producer.op == "where" and len(producer.inputs) == 3:
+                condition, product_id, zero_id = producer.inputs
+                product = program.nodes[product_id]
+                if (
+                    is_zero(program.nodes[zero_id])
+                    and program.nodes[condition].dtype == "bool"
+                    and product.op == "multiply"
+                    and len(product.inputs) == 2
+                ):
+                    condition_id = condition
+            else:
+                product = producer
+
+            reduce = _attribute(old, "over")
+            if (
+                product.op == "multiply"
+                and len(product.inputs) == 2
+                and isinstance(reduce, tuple)
+            ):
+                lhs = nodes[remap[product.inputs[0]]]
+                rhs = nodes[remap[product.inputs[1]]]
+                reduction = set(reduce)
+                if condition_id is not None:
+                    condition = nodes[remap[condition_id]]
+                    # Move a zeroing mask onto one operand only when it does
+                    # not require expanding that operand to a larger rank.
+                    selected: int | None = None
+                    for candidate, operand in enumerate((lhs, rhs)):
+                        if (
+                            set(condition.axes) <= set(operand.axes)
+                            and operand.dtype == product.dtype
+                        ):
+                            selected = candidate
+                            break
+                    if selected is not None:
+                        operand = (lhs, rhs)[selected]
+                        zero = TensorNode(
+                            id=len(nodes),
+                            op="zero",
+                            inputs=(),
+                            axes=operand.axes,
+                            dtype=operand.dtype,
+                        )
+                        nodes.append(zero)
+                        masked = TensorNode(
+                            id=len(nodes),
+                            op="where",
+                            inputs=(condition.id, operand.id, zero.id),
+                            axes=operand.axes,
+                            dtype=operand.dtype,
+                        )
+                        nodes.append(masked)
+                        if selected == 0:
+                            lhs = masked
+                        else:
+                            rhs = masked
+                    else:
+                        lhs = rhs = None
+                if lhs is not None and rhs is not None and reduction <= (
+                    set(lhs.axes) & set(rhs.axes)
+                ):
+                    result_axes = tuple(
+                        axis
+                        for axis in program.axes
+                        if axis in (set(lhs.axes) | set(rhs.axes)) - reduction
+                    )
+                    if result_axes == old.axes:
+                        partition = _contraction_axes(
+                            program.axes, lhs, rhs, reduce
+                        )
+                        contraction = TensorNode(
+                            id=len(nodes),
+                            op="contract",
+                            inputs=(lhs.id, rhs.id),
+                            axes=old.axes,
+                            dtype=old.dtype,
+                            attributes=(
+                                ("contraction_axes", partition),
+                                ("implementation", partition.kind),
+                            ),
+                        )
+                        nodes.append(contraction)
+                        remap[old.id] = contraction.id
+                        continue
+
+        new_id = len(nodes)
+        remap[old.id] = new_id
+        nodes.append(
+            TensorNode(
+                id=new_id,
+                op=old.op,
+                inputs=mapped_inputs,
+                axes=old.axes,
+                dtype=old.dtype,
+                attributes=old.attributes,
+            )
         )
 
-    rewritten = TensorProgram(program.axes, tuple(nodes), program.outputs)
-    # A recognized multiply commonly becomes orphaned. Compacting it here is
-    # part of constructing the replacement, not a second global DCE policy.
-    if any(uses[node.id] == 1 for node in nodes if node.op == "multiply"):
-        return eliminate_dead_code(rewritten)
-    return rewritten
+    rewritten = TensorProgram(
+        program.axes,
+        tuple(nodes),
+        tuple((name, remap[node_id]) for name, node_id in program.outputs),
+    )
+    return eliminate_dead_code(rewritten)
 
 
 def canonicalize_contractions(program: TensorProgram) -> TensorProgram:

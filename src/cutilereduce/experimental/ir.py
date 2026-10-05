@@ -348,6 +348,13 @@ class TensorBuilder:
             mask_group=mask_group,
         )
 
+    def domain_valid(self, axes: tuple[str, ...]) -> TensorValue:
+        """Reference the active schedule's physical tile domain, not a tensor input."""
+        unknown = set(axes) - set(self.axes)
+        if unknown:
+            raise ValueError(f"domain axes are not in this program: {sorted(unknown)}")
+        return self._add("domain_valid", (), axes, "bool")
+
     def cast(self, value: TensorValue, dtype: str) -> TensorValue:
         if value.dtype == dtype:
             return value

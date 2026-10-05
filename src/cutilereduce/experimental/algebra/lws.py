@@ -208,6 +208,40 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             }
         )
 
+    def lower_fold_domain(
+        self,
+        ctx: TensorBuilder,
+        values: StructuredValue,
+        *,
+        fold_axes: tuple[str, ...],
+        domain_valid: TensorValue,
+    ) -> StructuredValue:
+        """Fold a padded tile without broadcasting validity over payload axes."""
+        self.validate(values, label="LWS execution carriers")
+        masked_maximum = ctx.where(
+            domain_valid,
+            values["maximum"],
+            ctx.full(values["maximum"].axes, float("-inf"), self.dtype),
+        )
+        maximum = ctx.reduce("max", masked_maximum, fold_axes)
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        valid_nonempty = ctx.where(
+            nonempty,
+            domain_valid,
+            ctx.full(domain_valid.axes, False, "bool"),
+        )
+        scales = ctx.where(
+            valid_nonempty,
+            ctx.exp(values["maximum"] - safe_maximum),
+            ctx.full(values["maximum"].axes, 0.0, self.dtype),
+        )
+        normalizer = ctx.reduce("sum", scales * values["normalizer"], fold_axes)
+        numerator = ctx.contract(scales, values["numerator"], over=fold_axes)
+        return StructuredValue(
+            {"maximum": maximum, "normalizer": normalizer, "numerator": numerator}
+        )
+
     def lower_fold_accumulate(
         self,
         ctx: TensorBuilder,
@@ -234,6 +268,59 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         )
         tile_scales = ctx.where(
             nonempty,
+            ctx.exp(values["maximum"] - safe_maximum),
+            ctx.full(values["maximum"].axes, 0.0, self.dtype),
+        )
+        normalizer = initial_scale * initial["normalizer"] + ctx.reduce(
+            "sum", tile_scales * values["normalizer"], fold_axes
+        )
+        numerator = ctx.contract_accumulate(
+            initial_scale * initial["numerator"],
+            tile_scales,
+            values["numerator"],
+            over=fold_axes,
+        )
+        return StructuredValue(
+            {"maximum": maximum, "normalizer": normalizer, "numerator": numerator}
+        )
+
+    def lower_fold_accumulate_domain(
+        self,
+        ctx: TensorBuilder,
+        initial: StructuredValue,
+        values: StructuredValue,
+        *,
+        fold_axes: tuple[str, ...],
+        domain_valid: TensorValue,
+    ) -> StructuredValue:
+        """Accumulate valid padded LWS factors directly into an existing carrier."""
+        self.validate(initial, label="initial LWS execution carrier")
+        self.validate(values, label="LWS execution tile")
+        masked_maximum = ctx.where(
+            domain_valid,
+            values["maximum"],
+            ctx.full(values["maximum"].axes, float("-inf"), self.dtype),
+        )
+        tile_maximum = ctx.reduce("max", masked_maximum, fold_axes)
+        maximum = ctx.where(
+            ctx.compare("greater", initial["maximum"], tile_maximum),
+            initial["maximum"],
+            tile_maximum,
+        )
+        nonempty = ctx.compare("not_equal", maximum, float("-inf"))
+        safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
+        initial_scale = ctx.where(
+            nonempty,
+            ctx.exp(initial["maximum"] - safe_maximum),
+            ctx.constant(0.0, self.dtype),
+        )
+        valid_nonempty = ctx.where(
+            nonempty,
+            domain_valid,
+            ctx.full(domain_valid.axes, False, "bool"),
+        )
+        tile_scales = ctx.where(
+            valid_nonempty,
             ctx.exp(values["maximum"] - safe_maximum),
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )

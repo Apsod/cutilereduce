@@ -151,6 +151,31 @@ class Monoid[ValueT: AlgebraValue](PartialSemigroup[ValueT]):
         del ctx, values, fold_axes
         return None
 
+    def lower_fold_domain(
+        self,
+        ctx: TensorBuilder,
+        values: ValueT,
+        *,
+        fold_axes: tuple[str, ...],
+        domain_valid: TensorValue,
+    ) -> ValueT | None:
+        """Optionally fold values while consuming physical tile validity directly."""
+        del ctx, values, fold_axes, domain_valid
+        return None
+
+    def lower_fold_accumulate_domain(
+        self,
+        ctx: TensorBuilder,
+        initial: ValueT,
+        values: ValueT,
+        *,
+        fold_axes: tuple[str, ...],
+        domain_valid: TensorValue,
+    ) -> ValueT | None:
+        """Optionally accumulate a valid factor tile without expanding its mask."""
+        del ctx, initial, values, fold_axes, domain_valid
+        return None
+
     def lower_fold_accumulate(
         self,
         ctx: TensorBuilder,

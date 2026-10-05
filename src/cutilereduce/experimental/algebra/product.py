@@ -14,7 +14,7 @@ from .base import (
     PartialSemigroup,
     ScanResult,
 )
-from ..ir import TensorBuilder
+from ..ir import TensorBuilder, TensorValue
 
 
 class ProductSemigroup(PartialSemigroup[CompositeValue]):
@@ -69,6 +69,54 @@ class ProductMonoid(ProductSemigroup, Monoid[CompositeValue]):
             {
                 name: lower_fold(
                     ctx, monoid, values[name], fold_axes=fold_axes
+                )
+                for name, monoid in self.monoids.items()
+            }
+        )
+
+    def lower_fold_domain(
+        self,
+        ctx: TensorBuilder,
+        values: CompositeValue,
+        *,
+        fold_axes: tuple[str, ...],
+        domain_valid: TensorValue,
+    ) -> CompositeValue:
+        from ..lowering import lower_fold
+
+        return CompositeValue(
+            {
+                name: lower_fold(
+                    ctx,
+                    monoid,
+                    values[name],
+                    fold_axes=fold_axes,
+                    domain_valid=domain_valid,
+                )
+                for name, monoid in self.monoids.items()
+            }
+        )
+
+    def lower_fold_accumulate_domain(
+        self,
+        ctx: TensorBuilder,
+        initial: CompositeValue,
+        values: CompositeValue,
+        *,
+        fold_axes: tuple[str, ...],
+        domain_valid: TensorValue,
+    ) -> CompositeValue:
+        from ..lowering import lower_fold_accumulate
+
+        return CompositeValue(
+            {
+                name: lower_fold_accumulate(
+                    ctx,
+                    monoid,
+                    initial[name],
+                    values[name],
+                    fold_axes=fold_axes,
+                    domain_valid=domain_valid,
                 )
                 for name, monoid in self.monoids.items()
             }

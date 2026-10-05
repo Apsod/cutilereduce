@@ -256,7 +256,7 @@ def lower_backward_stage(program: ScheduledBackwardProgram) -> TiledStage:
             "call_region",
             parameters,
             tuple(call_results[gradient.input_name] for gradient in program.gradients),
-            (("region", program.region),),
+            (("region", program.region), ("domain_axes", program.domain_axes)),
         )
     ]
     yielded: dict[str, ScheduledValue] = {}

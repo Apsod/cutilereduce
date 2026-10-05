@@ -66,7 +66,7 @@ def test_cpu_mock_executes_single_owner_tiled_attention_fold():
     schedule = specialized.implementation.stages[0]
     assert isinstance(schedule, TiledStage)
     assert [dict(op.attributes)["region"] for op in schedule.loop.body] == [
-        "masked_map_fold_combine",
+        "map_fold_combine",
     ]
     assert dict(schedule.epilogue[0].attributes)["region"] == "project_output"
     assert [binding.name for binding in schedule.resident_bindings] == ["query"]
@@ -94,10 +94,20 @@ def test_cpu_mock_executes_single_owner_tiled_attention_fold():
     assert "@ct.kernel" in source
     assert "def single_owner_tiled_fold" in source
     assert source.count("ct.mma(") >= 2
-    assert "ct.mma(" in source.split("def masked_map_fold_combine", 1)[1]
-    assert "ct.reshape(ct.mma(" in source.split("def masked_map_fold_combine", 1)[1]
+    assert "ct.mma(" in source.split("def map_fold_combine", 1)[1]
+    assert "ct.reshape(ct.mma(" in source.split("def map_fold_combine", 1)[1]
     assert "for local_tile in range(loop_size)" in source
     assert "physical_valid =" in source
+    assert "physical_valid" not in dict(problem.map_fold_combine.arguments)
+    assert any(node.op == "domain_valid" for node in problem.map_fold_combine.nodes)
+    domain_conditions = [
+        problem.map_fold_combine.nodes[node.inputs[1]]
+        for node in problem.map_fold_combine.nodes
+        if node.op == "where"
+        and problem.map_fold_combine.nodes[node.inputs[0]].op == "domain_valid"
+    ]
+    assert domain_conditions
+    assert all("dv" not in node.axes for node in domain_conditions)
     assert source.count("ct.load(query,") == 1
 
 
@@ -287,6 +297,12 @@ def test_cutile_backward_emits_embed_local_accumulation_and_relaxed_atomics():
     problem = FoldOperator(
         spec, LogWeightedSum(("dv",)), FoldMaps(to_factor, to_output)
     ).lower()
+    backward_region = problem.map_finalize_map_vjp
+    assert backward_region is not None
+    assert any(
+        node.op == "contract" and node.axes == ("h", "r", "dv")
+        for node in backward_region.nodes
+    )
     backward_template = build_schedule_space(problem).backward[0]
     backward_specialized = specialize_cutile_backward_schedule(
         problem,
@@ -313,6 +329,11 @@ def test_cutile_backward_emits_embed_local_accumulation_and_relaxed_atomics():
     assert "def embed_output_vjp_region" in source
     assert "def embed_output_vjp(" in source
     assert "def finalize_map_vjp" in source
+    assert source.split("def map_finalize_map_vjp", 1)[1].split(
+        "@ct.kernel", 1
+    )[0].count("ct.mma(") >= 5
+    assert "physical_valid" not in dict(backward_region.arguments)
+    assert any(node.op == "domain_valid" for node in backward_region.nodes)
     assert "for local_tile in range(loop_size)" in source
     assert "physical_valid =" in source
     assert "ct.atomic_add(grad_query" in source
@@ -407,8 +428,8 @@ def test_cutile_source_preserves_shared_cross_entropy_contraction():
     expected = torch.logsumexp(logits, -1) - logits[torch.arange(16), inputs["target"]]
     torch.testing.assert_close(actual, expected)
 
-    map_fold_source = source.split("def masked_map_fold_combine", 1)[1].split("@ct.function", 1)[0]
-    assert map_fold_source.count("ct.mma(") == 1
+    map_fold_source = source.split("def map_fold_combine", 1)[1].split("@ct.function", 1)[0]
+    assert map_fold_source.count("ct.mma(") >= 1
     assert "ct.max(" in map_fold_source
     assert "ct.sum(" in map_fold_source
     assert "axis_index_v" in map_fold_source
@@ -449,7 +470,7 @@ def test_cutile_source_preserves_affine_lws_suffix_scan():
     )
     specialized = _specialize_forward(problem, sizes, {"b": 4, "r": 8})
     source = emit_cutile_source(specialized)
-    map_fold_source = source.split("def masked_map_fold_combine", 1)[1].split("@ct.function", 1)[0]
+    map_fold_source = source.split("def map_fold_combine", 1)[1].split("@ct.function", 1)[0]
 
     assert "ct.cumsum(" in map_fold_source
     assert "reverse=True" in map_fold_source

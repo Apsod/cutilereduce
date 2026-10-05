@@ -157,6 +157,7 @@ class ScheduledBackwardProgram:
     loop_axis: ScheduledAxis
     arguments: tuple[TileBinding, ...]
     gradients: tuple[ScheduledGradient, ...]
+    domain_axes: tuple[str, ...] = ()
     threads_prefix: bool = False
     loop_programs: int = 1
 
@@ -320,6 +321,7 @@ def build_backward_program(
         scheduled(loop_axis),
         arguments,
         tuple(gradients),
+        domain_axes=(*problem.spec.batch_axes, *problem.spec.fold_axes),
         threads_prefix=problem.requires_prefix,
         loop_programs=loop_programs,
     )

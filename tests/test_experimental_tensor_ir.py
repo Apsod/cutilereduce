@@ -23,8 +23,10 @@ from cutilereduce.experimental import (
     compile_fold_backward,
     compile_fold_forward,
     compile_map_finalize_vjp_region,
+    discover_contractions,
     lower_fold,
     lower_scan,
+    optimize_program,
 )
 
 
@@ -267,6 +269,49 @@ def test_contraction_rejects_an_axis_absent_from_an_operand():
 
     with pytest.raises(ValueError, match="must occur in both operands"):
         ctx.contract(lhs, rhs, over=("b",))
+
+
+def test_contraction_recognition_folds_zero_mask_into_a_contraction_operand():
+    ctx = TensorBuilder(("b", "l", "r", "d"))
+    probability = ctx.input("probability", ("b", "l", "r"), "float32")
+    cotangent = ctx.input("cotangent", ("b", "l", "d"), "float32")
+    valid = ctx.input("valid", ("b", "l", "r"), "bool")
+    product = probability * cotangent
+    masked = ctx.where(valid, product, ctx.full(product.axes, 0.0))
+    reduced = ctx.reduce("sum", masked, ("l",))
+    ctx.materialize("gradient", reduced)
+
+    program = optimize_program(ctx.finish())
+    assert len(program.contractions) == 1
+    contraction = program.contractions[0]
+    assert contraction.attribute("contraction_axes") == ContractionAxes(
+        batch=("b",),
+        lhs_free=("r",),
+        rhs_free=("d",),
+        reduce=("l",),
+    )
+    masked_operand = program.node(contraction.inputs[0])
+    assert masked_operand.op == "where"
+    assert masked_operand.axes == ("b", "l", "r")
+    assert program.node(contraction.inputs[1]).id == cotangent.id
+
+
+def test_masked_product_without_single_operand_masking_axes_stays_generic():
+    ctx = TensorBuilder(("b", "l", "r", "d"))
+    lhs = ctx.input("lhs", ("b", "l", "r"), "float32")
+    rhs = ctx.input("rhs", ("b", "l", "d"), "float32")
+    valid = ctx.input("valid", ("r", "d"), "bool")
+    product = lhs * rhs
+    reduced = ctx.reduce(
+        "sum",
+        ctx.where(valid, product, ctx.full(product.axes, 0.0)),
+        ("l",),
+    )
+    ctx.materialize("result", reduced)
+
+    program = discover_contractions(ctx.finish())
+    assert not program.contractions
+    assert program.output_node("result").inputs
 
 
 def test_lws_exposes_phi_and_execution_combine_lowerings():

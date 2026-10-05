@@ -57,7 +57,7 @@ from .ir import (
     TensorSignature,
     TensorValue,
 )
-from .lowering import lower_fold, lower_scan
+from .lowering import lower_fold, lower_fold_accumulate, lower_scan
 from .operator import (
     FoldMaps,
     FoldOperator,
@@ -302,6 +302,7 @@ __all__ = [
     "compile_fold_backward",
     "compile_fold_forward",
     "compile_map_fold_region",
+    "compile_map_fold_combine_region",
     "compile_masked_map_fold_region",
     "compile_map_finalize_vjp_region",
     "compile_project_output_region",
@@ -313,6 +314,7 @@ __all__ = [
     "plan_materializations",
     "simplify_constants",
     "lower_fold",
+    "lower_fold_accumulate",
     "lower_scan",
     "build_schedule_space",
     "format_plan",
