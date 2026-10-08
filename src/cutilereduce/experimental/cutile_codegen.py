@@ -174,10 +174,52 @@ def _emit_region(
                     inputs[1], input_nodes[1].axes, node.axes, sizes, tiles
                 )
                 expression = f"({left}) {symbol} ({right})"
-            case "neg":
-                expression = f"-({inputs[0]})"
-            case "exp" | "log":
-                expression = f"ct.{node.op}({inputs[0]})"
+            case "neg" | "exp" | "log" | "sqrt" | "rsqrt" | "abs" | "sin" | "cos" | "tanh" | "stop_gradient" | "logical_not" | "sigmoid":
+                operand = _aligned(inputs[0], input_nodes[0].axes, node.axes, sizes, tiles)
+                if node.op == "stop_gradient":
+                    expression = operand
+                elif node.op == "neg":
+                    expression = f"-({operand})"
+                elif node.op == "logical_not":
+                    expression = f"~({operand})"
+                elif node.op == "sigmoid":
+                    work = f"({operand}).astype(ct.float32)" if node.dtype in {"float16", "bfloat16"} else operand
+                    name = f"sigmoid_exp_{node.id}"
+                    lines.append(f"    {name} = ct.exp(-ct.abs({work}))")
+                    expression = f"ct.where(({work}) >= 0, 1 / (1 + {name}), {name} / (1 + {name}))"
+                    expression = f"({expression}).astype({_CT_DTYPE[node.dtype]})"
+                else:
+                    expression = f"ct.{node.op}({operand})"
+            case "log1p" | "expm1":
+                raise NotImplementedError(f"CuTile has no stable lowering for {node.op}")
+            case "minimum" | "maximum" | "logical_and" | "logical_or" | "floor_divide" | "remainder":
+                left, right = [_aligned(value, source.axes, node.axes, sizes, tiles) for value, source in zip(inputs, input_nodes, strict=True)]
+                if node.op in {"minimum", "maximum"}:
+                    expression = f"ct.{node.op}({left}, {right}, propagate_nan=True)"
+                elif node.op in {"logical_and", "logical_or"}:
+                    expression = f"({left}) {'&' if node.op == 'logical_and' else '|'} ({right})"
+                else:
+                    # CuTile integer // rounds toward negative infinity.
+                    quotient = f"integer_q_{node.id}"
+                    lines.append(f"    {quotient} = ({left}) // ({right})")
+                    expression = quotient if node.op == "floor_divide" else f"(({left}) - {quotient} * ({right}))"
+            case "clamp":
+                expression = _aligned(inputs[0], input_nodes[0].axes, node.axes, sizes, tiles)
+                for bound, op in (("min", "maximum"), ("max", "minimum")):
+                    value = _attribute(node, bound)
+                    if value is not None:
+                        expression = f"ct.{op}({expression}, {_literal(value)}, propagate_nan=True)"
+            case "powi":
+                from .ops import multiplication_chain
+                exponent = _attribute(node, "exponent")
+                powers = [_aligned(inputs[0], input_nodes[0].axes, node.axes, sizes, tiles)]
+                for left, right in multiplication_chain(abs(exponent)) if exponent else ():
+                    name = f"power_{node.id}_{len(powers)}"
+                    lines.append(f"    {name} = ({powers[left]}) * ({powers[right]})")
+                    powers.append(name)
+                expression = powers[-1] if exponent else f"ct.full({_tuple(_shape(node.axes, sizes, tiles))}, 1, {_CT_DTYPE[node.dtype]})"
+                if exponent < 0:
+                    expression = f"1 / ({expression})"
             case "cast":
                 expression = f"({inputs[0]}).astype({_CT_DTYPE[node.dtype]})"
             case "where" | "mask_identity":

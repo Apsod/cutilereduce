@@ -18,6 +18,42 @@ The experiment separates three concerns:
 - `TensorBuilder` records the user's map and the algebra lowering as an
   axis-aware tensor IR.
 
+## Elementary tensor expressions and gradient cuts
+
+Maps, output maps, and monoid implementations share the same symbolic tensor
+DSL. In addition to arithmetic, contractions, reductions, scans, and explicit
+comparisons, `TensorBuilder` provides:
+
+- `powi(x, n)` (also `x ** n`) for a static Python integer exponent;
+  `sqrt`, `rsqrt`, `abs`, `sin`, `cos`, `tanh`, and `sigmoid`;
+- `minimum`, `maximum`, and `clamp(x, min=..., max=...)`, with constant bounds;
+- `log1p`, `expm1`, and derived stable `softplus` and `logaddexp` expressions;
+- boolean `logical_and`, `logical_or`, `logical_not` (`&`, `|`, `~`), and integer
+  `floor_divide` and `remainder` (`//`, `%`), with Python sign conventions;
+- `stop_gradient(x)`, a forward identity that cuts only that use's VJP path.
+
+Operands broadcast by named axes and must have matching tensor dtypes; use
+explicit casts when necessary. Symbolic tensors cannot control Python `if`
+statements: use `ctx.compare(...)` and `ctx.where(...)`. Integer/boolean
+operations and casts across discrete dtypes do not propagate gradients.
+The VJP of `abs` at zero is zero; binary minimum/maximum divide tie gradients
+equally; clamp passes the input gradient at both boundaries. Constant bounds
+are not differentiable. Invalid mathematical domains, including integer
+division by zero, remain the caller's responsibility.
+
+Integer powers lower to multiplication chains, including reciprocal chains
+for negative exponents. CPU interpretation and native CPU emission support
+the entire operation set. CuTile supports the set except `log1p` and `expm1`:
+emission raises an explicit error rather than replacing them with unstable
+naive formulas. Recipes containing those operations have the same limitation.
+
+`examples/experimental_teacher_tower.py` constructs a three-predictor
+cross-entropy tower using ordinary `Product` algebras. Each next predictor's
+logits are detached only in their teacher-weight role; their own student loss
+still differentiates them. The real teacher uses compact integer class indices
+and `axis_index`, not a materialized one-hot tensor. Individual losses and their
+sum are exposed by the output map.
+
 ## Describing a fold
 
 A `TensorSpec` gives each input its logical axes and dtype. Axis names express
@@ -107,7 +143,9 @@ the identity. Physical padding is separate: the schedule supplies an execution
 domain to the fold region, and invalid lanes contribute the execution-carrier
 identity after `to_execution`. This avoids assuming that `Phi` maps the
 semantic identity to the execution identity. Backward regions use the same
-domain to suppress padded-factor gradients. A backend may skip tiles proven
+domain to zero local semantic cotangents before the map VJP reduces axes shared
+by multiple factors. Masking only the reduced input gradient would incorrectly
+retain contributions from padded lanes. A backend may skip tiles proven
 empty from simple axis-index comparisons. Optimized monoid folds must return
 their exact identity, without NaNs, when every factor is masked.
 
@@ -325,24 +363,39 @@ contiguous CPU tensors. Prefix-free algebraic backward is exposed through a
 custom `torch.autograd.Function`. Its partitioning and chunking are scheduled
 independently of forward. Prefix-dependent backward shares only the persisted
 forward partition boundaries while retaining an independent local chunk size.
-The generic region emitter covers the
-current tensor IR; attention-shaped LWS map-folds use a fused generated C++
-loop with `at::parallel_for`, resident maximum/normalizer/numerator state, and
-direct score recomputation. It does not allocate a logits grid or a replicated
-value-factor grid.
+The generic region emitter covers the current tensor IR. Contractions are
+canonicalized from named axes into `B/M/N/K` and lowered uniformly through
+ATen `mm` or `bmm`, and accumulated contractions use `addmm` or `baddbmm`;
+there are no algebra- or workload-specific CPU emitters.
+Intermediate tensors therefore follow the selected region and tile boundaries.
 
 The executable backend accepts online, fused-tree, and materialized-partial
 forward plans. Chunk and partition extents compile to cached specialized
-`map_fold` functions and partial carriers are merged with the generated
-`E.combine` region using the selected online or tree topology. Prefix plans
-persist exclusive partition-boundary carriers; generated accumulating backward
+`map_fold` and `map_fold_combine` functions. A generated `scheduled_forward`
+C++ driver maps the Cartesian tile grid of all batch axes through
+`at::parallel_for`; inputs that
+carry an owner axis are sliced while shared inputs remain shared. Each owner
+program traverses fold-axis tiles. Serial online folds retain one execution
+state and invoke the shared `map_fold_combine` region for map-fold leaves;
+nested online folds combine each completed child carrier immediately. Tree
+reductions retain their partial carriers, and checkpoint plans preserve their
+partition-boundary state. Each program projects the result and returns saved
+execution state in one extension call. Parallel CPU
+loops lower to `at::parallel_for`; no Python code participates between forward
+tiles. Online carrier storage is independent of loop length, but ATen operations
+can still allocate temporary tensors; configured scratch budgets are not yet
+enforced. Prefix plans persist exclusive partition-boundary carriers; generated accumulating backward
 loads each boundary, performs the local structured execution scan, threads the
 updated prefix through local chunks, and merges the resulting input gradients.
 For a supplied prefix-free `ScheduledBackwardProgram`, the extension instead
 generates one scheduled backward entry point: CPU programs run through
 `at::parallel_for`, persistent gradient tiles remain local across the serial
 tile loop, and completed tiles use direct stores or C++20 relaxed atomic
-additions. Prefix-dependent schedules continue to use the existing executor.
+additions. Prefix-free CPU compilation constructs this fused scheduled program
+automatically when one is not supplied: batch axes form the program grid, the
+fold axis is traversed locally, uniquely owned gradients use direct stores,
+and multiply-owned gradients commit completed local tiles with relaxed atomic
+adds. Prefix-dependent schedules continue to use the existing executor.
 
 `estimate_cpu_plan` counts region operations, materialized carrier/output
 bytes, exposed parallel tasks, and serial steps. `select_cpu_plan` evaluates a
@@ -881,12 +934,14 @@ updated_E = E.combine(
 )
 ```
 
-For LWS, a future compiler rewrite can recognize this complete composition and
-lower it as an online-softmax update. In particular, it can choose the combined
-maximum before forming weights, accumulate the weighted-value contraction
-directly into the state numerator, and avoid constructing a distinct partial
-carrier. This is a derived compiler lowering target with an exact expansion to
-`combine` and `fold`, not a required fourth `Monoid` operation.
+LWS supplies an optimized fold-accumulate lowering for this composition. It
+chooses the combined maximum before forming weights, accumulates the
+weighted-value contraction directly into the state numerator, and avoids
+constructing a distinct partial carrier. CPU serial online folds and CuTile
+loops invoke this shared lowering through `map_fold_combine`. Without a
+specialization, its generic expansion remains `combine(state, fold(values))`.
+Deriving this optimized update automatically from ordinary `combine` and
+`fold` definitions remains future compiler work.
 
 Floating-point tensor expressions require an explicit rewrite policy so that
 user maps and algebra lowerings can distinguish expressions that permit
@@ -916,10 +971,10 @@ assume permissive algebraic manipulation. User-defined numerical schemes that
 depend on strict evaluation order are therefore outside the current supported
 scope.
 
-The current optimizer deliberately stops short of these transformations. Its
-rewrites are local, and internal state residency, in-place accumulation,
-online-fold fusion, and numerical-mode selection remain future planner/backend
-work.
+The current optimizer's rewrites are local. Serial online carrier residency
+is explicit in the CPU driver, but general temporary-buffer reuse, in-place
+accumulation, inference of optimized online updates, and numerical-mode
+selection remain future compiler/backend work.
 
 ## Compiling and inspecting a program
 
@@ -1076,14 +1131,16 @@ Implemented:
 - an algebra-component graph which retains SSA producer sharing, Product
   independence, and semidirect actor-to-payload dependencies; splitting a
   shared producer requires an explicit recompute-or-materialize decision;
-- fused CPU LWS attention map-folds without logits or value-factor grids.
+- uniform named-axis CPU contraction lowering through ATen `mm` and `bmm`,
+  with `addmm` and `baddbmm` for accumulated contractions.
 
 Not implemented yet:
 
 - VJP rules beyond the current bounded tensor-IR subset;
 - accumulator suffix scans for differentiable scans;
 - additional global/algebra-aware optimization passes;
-- accumulating-fold recognition and online carrier-update lowering;
+- automatic inference of optimized fold-accumulate lowerings beyond supplied
+  monoid specializations;
 - explicit carrier ordering/merge capabilities, including compensated sums;
 - explicit SIMD lowering beyond compiler auto-vectorization.
 

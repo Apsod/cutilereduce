@@ -100,6 +100,7 @@ from .planning import (
 from .cpu import (
     CpuLoopKind,
     CpuScheduleConfig,
+    CpuStageConfig,
     CpuScheduledPlan,
     CpuStorage,
     CpuTarget,
@@ -194,6 +195,7 @@ __all__ = [
     "ComponentRelation",
     "CpuLoopKind",
     "CpuScheduleConfig",
+    "CpuStageConfig",
     "CpuScheduledPlan",
     "CpuStorage",
     "CpuTarget",

@@ -8,6 +8,7 @@ from cutilereduce.experimental import (
     CommitMode,
     CpuLoopKind,
     CpuScheduleConfig,
+    CpuStageConfig,
     CpuTarget,
     FoldMaps,
     FoldOperator,
@@ -168,6 +169,41 @@ def test_cpu_schedule_binds_nested_loops_without_nested_parallelism():
     assert "serial carrier_fold chunk" in formatted
 
 
+def test_cpu_schedule_exposes_per_stage_tiles_and_scratch_budget():
+    problem = _add_problem()
+    plan = build_schedule_space(problem).forward[0]
+    scheduled = schedule_cpu(
+        problem,
+        plan,
+        {"b": 3, "f": 130},
+        target=CpuTarget("test", 4, 32, 64, l2_bytes=512 * 1024),
+        config=CpuScheduleConfig(
+            scratch_bytes_per_worker=192 * 1024,
+            stages=(
+                CpuStageConfig(
+                    "map_fold_online",
+                    tile_sizes=(("b", 2), ("f", 32)),
+                    scratch_bytes=96 * 1024,
+                ),
+            ),
+        ),
+    )
+
+    stage = scheduled.forward[0]
+    assert dict(stage.tile_sizes) == {"b": 2, "f": 32}
+    assert stage.scratch_bytes == 96 * 1024
+    assert "tiles[b=2, f=32] scratch<=98304 bytes" in format_cpu_schedule(scheduled)
+
+    with pytest.raises(ValueError, match="unknown stages"):
+        schedule_cpu(
+            problem,
+            plan,
+            {"b": 3, "f": 130},
+            target=CpuTarget("test", 4, 32, 64),
+            config=CpuScheduleConfig(stages=(CpuStageConfig("typo"),)),
+        )
+
+
 def test_cpu_schedule_rejects_incomplete_or_nonpositive_sizes():
     problem = _add_problem()
     plan = build_schedule_space(problem).forward[0]
@@ -280,6 +316,37 @@ def test_cpu_source_emits_named_regions_and_named_axis_reduction():
     assert "at::sum(" in source
     assert "std::vector<torch::Tensor> project_output" in source
     assert 'm.def("map_fold", &map_fold,' in source
+
+
+def test_cpu_source_lowers_named_axis_contractions_to_bmm():
+    spec = FoldSpec(
+        inputs={
+            "lhs": TensorSpec(("b", "f", "k"), dtype="bfloat16"),
+            "rhs": TensorSpec(("b", "f", "k"), dtype="bfloat16"),
+        },
+        batch_axes=("b",),
+        fold_axes=("f",),
+    )
+
+    def to_factor(ctx, inputs):
+        return StructuredValue(
+            {
+                "value": ctx.contract(
+                    ctx.cast(inputs["lhs"], "float32"),
+                    ctx.cast(inputs["rhs"], "float32"),
+                    over=("k",),
+                )
+            }
+        )
+
+    problem = FoldOperator(spec, Add(), FoldMaps(to_factor)).lower()
+    source = emit_cpp_source(
+        problem, {"b": 2, "f": 7, "k": 8}, backward=False
+    )
+
+    assert "at::bmm(" in source
+    assert "at::einsum" not in source
+    assert ".to(at::kFloat)" in source
 
 
 def test_cpu_cost_accounts_for_partial_materialization_and_parallelism():

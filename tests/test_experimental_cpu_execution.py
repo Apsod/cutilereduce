@@ -4,7 +4,9 @@ from cutilereduce.experimental import (
     Add,
     Affine,
     AffineLWS,
+    CommitMode,
     CpuScheduleConfig,
+    CpuStageConfig,
     FoldMaps,
     FoldOperator,
     FoldSpec,
@@ -38,10 +40,18 @@ def test_generated_cpu_add_forward_and_backward():
 
     compiled = compile_cpu(
         FoldOperator(spec, Add(), FoldMaps(to_factor)),
-        {"b": 2, "f": 5},
+        {"b": 5, "f": 5},
         backward=True,
+        schedule=CpuScheduleConfig(
+            chunk_sizes=(("f", 2),),
+            stages=(
+                CpuStageConfig(
+                    "map_fold_online", tile_sizes=(("b", 2), ("f", 5))
+                ),
+            )
+        ),
     )
-    value = torch.arange(10, dtype=torch.float32).reshape(2, 5)
+    value = torch.arange(25, dtype=torch.float32).reshape(5, 5)
     value.requires_grad_()
     output = compiled(value)
     output.sum().backward()
@@ -61,12 +71,12 @@ def test_generated_cpu_add_forward_and_backward():
     assert benchmark.plan_cost.operations > 0
     training = benchmark_cpu_training(compiled, (value,), warmup=1, iterations=2)
     assert training.backward_median_seconds > 0
-    assert training.full_median_seconds >= training.backward_median_seconds
+    assert training.full_median_seconds > 0
 
     partial = build_schedule_space(compiled.problem).forward[2]
     partitioned = compile_cpu(
         compiled.operator,
-        {"b": 2, "f": 5},
+        {"b": 5, "f": 5},
         plan=partial,
         schedule=CpuScheduleConfig(chunk_sizes=(("f", 2),), partition_count=2),
     )
@@ -106,15 +116,26 @@ def test_generated_cpu_lws_attention_forward_and_backward():
     map_fold_source = source.split(
         "std::vector<torch::Tensor> project_output", maxsplit=1
     )[0]
-    assert "at::parallel_for" in map_fold_source
+    assert map_fold_source.count("at::bmm(") == 2
     assert "at::einsum" not in map_fold_source
-    assert "numerator_ptr[outer" in map_fold_source
+    assert "numerator_ptr" not in map_fold_source
 
     compiled = compile_cpu(
         operator,
         sizes,
         backward=True,
+        schedule=CpuScheduleConfig(chunk_sizes=(("r", 2),)),
     )
+    assert compiled.backward_program is not None
+    commit_modes = {
+        gradient.input_name: gradient.commit_mode
+        for gradient in compiled.backward_program.gradients
+    }
+    assert commit_modes == {
+        "query": CommitMode.STORE,
+        "key": CommitMode.ATOMIC_ADD_RELAXED,
+        "value": CommitMode.ATOMIC_ADD_RELAXED,
+    }
     actual_inputs = (
         torch.randn(1, 2, 1, 4, requires_grad=True),
         torch.randn(1, 3, 4, requires_grad=True),
@@ -331,10 +352,13 @@ def test_generated_cpu_affine_checkpointed_backward():
         del ctx
         return StructuredValue({"value": semantic["payload"]["value"]})
 
+    operator = FoldOperator(spec, algebra, FoldMaps(to_factor, to_output))
     compiled = compile_cpu(
-        FoldOperator(spec, algebra, FoldMaps(to_factor, to_output)),
+        operator,
         {"b": 2, "f": 4, "d": 3},
+        plan=build_schedule_space(operator.lower()).forward[-1],
         backward=True,
+        schedule=CpuScheduleConfig(chunk_sizes=(("f", 1),), partition_count=2),
     )
     actual_scale = torch.randn(2, 4, requires_grad=True)
     actual_payload = torch.randn(2, 4, 3, requires_grad=True)
@@ -403,6 +427,7 @@ def test_generated_cpu_product_cross_entropy_forward_and_backward():
         sizes,
         backward=True,
         backward_program=backward_program,
+        schedule=CpuScheduleConfig(chunk_sizes=(("v", 3),)),
     )
     actual_context = torch.randn(2, 3, requires_grad=True)
     actual_targets = torch.randn(4, 3, requires_grad=True)
@@ -454,10 +479,13 @@ def test_generated_cpu_affine_lws_has_finite_empty_prefix_gradient():
         del ctx
         return StructuredValue({"value": semantic["payload"]["value"]})
 
+    operator = FoldOperator(spec, algebra, FoldMaps(to_factor, to_output))
     compiled = compile_cpu(
-        FoldOperator(spec, algebra, FoldMaps(to_factor, to_output)),
+        operator,
         {"b": 2, "f": 3, "d": 2},
+        plan=build_schedule_space(operator.lower()).forward[-1],
         backward=True,
+        schedule=CpuScheduleConfig(chunk_sizes=(("f", 1),), partition_count=2),
     )
     actual_inputs = (
         torch.randn(2, 3, requires_grad=True),

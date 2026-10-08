@@ -399,6 +399,7 @@ def _execute_region(
     *,
     axis_origins: dict[str, int] | None = None,
     axis_sizes: dict[str, int] | None = None,
+    domain_valid: Any | None = None,
 ) -> dict[str, Any]:
     import torch
 
@@ -407,6 +408,7 @@ def _execute_region(
     axis_sizes = axis_sizes or {}
     dtypes = {
         "float32": torch.float32,
+        "float64": torch.float64,
         "float16": torch.float16,
         "bfloat16": torch.bfloat16,
         "bool": torch.bool,
@@ -417,11 +419,24 @@ def _execute_region(
     def axis_extent(axis: str) -> int:
         if axis in axis_sizes:
             return axis_sizes[axis]
-        return next(
-            arguments[name].shape[region.nodes[node_id].axes.index(axis)]
-            for name, node_id in region.arguments
-            if axis in region.nodes[node_id].axes
+        extent = next(
+            (
+                arguments[name].shape[region.nodes[node_id].axes.index(axis)]
+                for name, node_id in region.arguments
+                if axis in region.nodes[node_id].axes
+            ),
+            None,
         )
+        if extent is not None:
+            return extent
+        # AD can eliminate every primal argument carrying a reduced axis.
+        # Explicit validity still supplies that physical domain's extent.
+        if domain_valid is not None:
+            domain = next(node for node in region.nodes if node.op == "domain_valid")
+            if domain_valid.ndim != len(domain.axes):
+                raise ValueError("domain validity must match domain axes")
+            return domain_valid.shape[domain.axes.index(axis)]
+        raise ValueError(f"cannot infer the extent of axis {axis!r}")
 
     for node in region.nodes:
         if node.id in values:
@@ -430,9 +445,13 @@ def _execute_region(
         input_nodes = [region.nodes[value] for value in node.inputs]
         attrs = dict(node.attributes)
         if node.op == "domain_valid":
-            value = torch.ones(
-                tuple(axis_extent(axis) for axis in node.axes), dtype=torch.bool
-            )
+            shape = tuple(axis_extent(axis) for axis in node.axes)
+            if domain_valid is None:
+                value = torch.ones(shape, dtype=torch.bool)
+            else:
+                if domain_valid.dtype != torch.bool or tuple(domain_valid.shape) != shape:
+                    raise ValueError("domain validity must be a boolean tensor over domain axes")
+                value = domain_valid
         elif node.op == "axis_index":
             axis = attrs["axis"]
             extent = axis_sizes.get(axis)
@@ -458,10 +477,24 @@ def _execute_region(
                 "multiply": torch.multiply,
                 "divide": torch.divide,
             }[node.op](left, right)
-        elif node.op == "neg":
-            value = -inputs[0]
-        elif node.op in {"exp", "log"}:
-            value = getattr(torch, node.op)(inputs[0])
+        elif node.op in {"neg", "exp", "log", "sqrt", "rsqrt", "abs", "sin", "cos", "tanh", "sigmoid", "log1p", "expm1", "logical_not"}:
+            value = getattr(torch, node.op)(_align(inputs[0], input_nodes[0].axes, node.axes))
+        elif node.op in {"minimum", "maximum", "logical_and", "logical_or", "floor_divide", "remainder"}:
+            value = getattr(torch, node.op)(*[_align(item, source.axes, node.axes) for item, source in zip(inputs, input_nodes, strict=True)])
+        elif node.op == "stop_gradient":
+            value = _align(inputs[0], input_nodes[0].axes, node.axes).detach()
+        elif node.op == "clamp":
+            value = torch.clamp(_align(inputs[0], input_nodes[0].axes, node.axes), min=attrs["min"], max=attrs["max"])
+        elif node.op == "powi":
+            from .ops import multiplication_chain
+            base = _align(inputs[0], input_nodes[0].axes, node.axes)
+            exponent = attrs["exponent"]
+            powers = [base]
+            for left, right in multiplication_chain(abs(exponent)) if exponent else ():
+                powers.append(powers[left] * powers[right])
+            value = powers[-1] if exponent else torch.ones_like(base)
+            if exponent < 0:
+                value = torch.reciprocal(value)
         elif node.op == "cast":
             value = inputs[0].to(dtypes[node.dtype])
         elif node.op in {"where", "mask_identity"}:

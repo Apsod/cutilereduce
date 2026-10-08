@@ -65,7 +65,7 @@ def estimate_region_work(region: TensorRegion, sizes: dict[str, int]) -> int:
     work = 0
     for node in region.nodes:
         elements = _elements(node.axes, sizes)
-        if node.op in {"argument", "constant", "zero", "full", "cast"}:
+        if node.op in {"argument", "constant", "zero", "full", "cast", "stop_gradient"}:
             continue
         if node.op in {"contract", "contract_accumulate"}:
             partition = node.attribute("contraction_axes")
@@ -76,8 +76,12 @@ def estimate_region_work(region: TensorRegion, sizes: dict[str, int]) -> int:
         elif node.op.startswith("reduce_"):
             over = node.attribute("over")
             work += elements * _elements(over, sizes)
-        elif node.op in {"exp", "log"}:
+        elif node.op in {"exp", "log", "log1p", "expm1", "sin", "cos", "tanh", "sigmoid", "sqrt", "rsqrt"}:
             work += 4 * elements
+        elif node.op == "powi":
+            from .ops import multiplication_chain
+            exponent = node.attribute("exponent")
+            work += elements * (len(multiplication_chain(abs(exponent))) + (exponent < 0) if exponent else 0)
         else:
             work += elements
     return work

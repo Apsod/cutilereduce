@@ -680,7 +680,7 @@ def compile_map_finalize_vjp_region[
             )
         lifted = algebra.to_execution(ctx, factors)
         identity = algebra.execution.identity(ctx)
-        lifted = _mask_algebra_value(ctx, lifted, identity, valid)
+        lifted = cast(ExecutionT, _mask_algebra_value(ctx, lifted, identity, valid))
         scan = lower_scan(
             ctx,
             algebra.execution,
@@ -697,6 +697,13 @@ def compile_map_finalize_vjp_region[
     if primal_by_path.keys() != cotangent_by_path.keys():
         raise ValueError("finalize result does not match semantic factor structure")
 
+    # Validity belongs to factor contributions, before map* reduces axes
+    # absent from an input. Masking the reduced destination loses this information.
+    cotangent_by_path = {
+        path: ctx.where(valid, value, ctx.full(value.axes, 0.0, value.dtype))
+        for path, value in cotangent_by_path.items()
+    }
+
     differentiable_inputs = {
         name: inputs[name]
         for name, input_spec in spec.inputs.items()
@@ -708,20 +715,6 @@ def compile_map_finalize_vjp_region[
         wrt=differentiable_inputs,
     )
     for name, value in input_cotangents.items():
-        surviving = tuple(axis for axis in valid.axes if axis in value.axes)
-        discarded = tuple(axis for axis in valid.axes if axis not in value.axes)
-        if discarded:
-            any_valid = ctx.compare(
-                "greater",
-                ctx.reduce("max", ctx.cast(valid, "int32"), discarded),
-                0,
-            )
-        else:
-            any_valid = valid
-        if surviving:
-            condition = any_valid
-            zero = ctx.full(value.axes, 0.0, value.dtype)
-            value = ctx.where(condition, value, zero)
         ctx.materialize(f"partial_grad_input.{name}", value)
     if updated_prefix is not None:
         for path, value in value_leaves(updated_prefix):

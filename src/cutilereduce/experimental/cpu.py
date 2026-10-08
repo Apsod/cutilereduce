@@ -99,9 +99,43 @@ class CpuTarget:
 
 
 @dataclass(frozen=True)
+class CpuStageConfig:
+    """Physical tensor tiles and scratch budget for one CPU plan stage."""
+
+    name: str
+    tile_sizes: tuple[tuple[str, int], ...] = ()
+    scratch_bytes: int | None = None
+
+    def __post_init__(self) -> None:
+        if not self.name:
+            raise ValueError("CPU stage configuration requires a name")
+        if len(dict(self.tile_sizes)) != len(self.tile_sizes):
+            raise ValueError("CPU stage tile axes must be unique")
+        if any(not axis for axis, _ in self.tile_sizes):
+            raise ValueError("CPU stage tile axes must be named")
+        if any(type(value) is not int or value <= 0 for _, value in self.tile_sizes):
+            raise ValueError("CPU stage tile sizes must be positive integers")
+        if self.scratch_bytes is not None and self.scratch_bytes <= 0:
+            raise ValueError("CPU stage scratch budget must be positive")
+
+
+@dataclass(frozen=True)
 class CpuScheduleConfig:
     chunk_sizes: tuple[tuple[str, int], ...] = ()
     partition_count: int | None = None
+    scratch_bytes_per_worker: int | None = None
+    stages: tuple[CpuStageConfig, ...] = ()
+
+    def __post_init__(self) -> None:
+        if len(dict(self.chunk_sizes)) != len(self.chunk_sizes):
+            raise ValueError("CPU chunk axes must be unique")
+        if self.scratch_bytes_per_worker is not None and (
+            self.scratch_bytes_per_worker <= 0
+        ):
+            raise ValueError("CPU scratch budget must be positive")
+        names = tuple(stage.name for stage in self.stages)
+        if len(set(names)) != len(names):
+            raise ValueError("CPU stage configurations must have unique names")
 
     def chunk_size(self, axis: str, extent: int) -> int:
         configured = dict(self.chunk_sizes).get(axis)
@@ -110,6 +144,9 @@ class CpuScheduleConfig:
         if configured <= 0:
             raise ValueError("CPU chunk sizes must be positive")
         return min(extent, configured)
+
+    def stage(self, name: str) -> CpuStageConfig | None:
+        return next((stage for stage in self.stages if stage.name == name), None)
 
 
 @dataclass(frozen=True)
@@ -150,6 +187,8 @@ class CpuBinding:
 class CpuStage:
     name: str
     bindings: tuple[CpuBinding, ...]
+    tile_sizes: tuple[tuple[str, int], ...] = ()
+    scratch_bytes: int = 0
 
 
 @dataclass(frozen=True)
@@ -298,6 +337,40 @@ def _schedule_stages(
 ) -> tuple[CpuStage, ...]:
     result = []
     for stage in stages:
+        stage_config = config.stage(stage.name)
+        configured_tiles = dict(
+            () if stage_config is None else stage_config.tile_sizes
+        )
+        unknown = set(configured_tiles) - set(sizes)
+        if unknown:
+            raise ValueError(
+                f"CPU stage {stage.name!r} has unknown tile axes: {sorted(unknown)}"
+            )
+        tile_sizes = tuple(
+            (
+                axis,
+                min(
+                    extent,
+                    configured_tiles.get(axis, min(extent, 64)),
+                ),
+            )
+            for axis, extent in sizes.items()
+        )
+        default_scratch = (
+            config.scratch_bytes_per_worker
+            if config.scratch_bytes_per_worker is not None
+            else min(
+                1024 * 1024,
+                max(64 * 1024, (target.l2_bytes * 3) // 4),
+            )
+            if target.l2_bytes is not None
+            else 256 * 1024
+        )
+        scratch_bytes = (
+            stage_config.scratch_bytes
+            if stage_config is not None and stage_config.scratch_bytes is not None
+            else default_scratch
+        )
         bindings = []
         for binding in stage.bindings:
             if not isinstance(binding, PlanBinding):
@@ -319,7 +392,14 @@ def _schedule_stages(
                     storage,
                 )
             )
-        result.append(CpuStage(stage.name, tuple(bindings)))
+        result.append(
+            CpuStage(
+                stage.name,
+                tuple(bindings),
+                tile_sizes=tile_sizes,
+                scratch_bytes=scratch_bytes,
+            )
+        )
     return tuple(result)
 
 
@@ -347,6 +427,17 @@ def schedule_cpu(
     backward_plan = plan.backward if isinstance(plan, TrainingScheduleTemplate) else (
         plan if isinstance(plan, BackwardScheduleTemplate) else None
     )
+    available_stages = {
+        stage.name
+        for selected_plan in (forward_plan, backward_plan)
+        if selected_plan is not None
+        for stage in selected_plan.stages
+    }
+    unknown_stages = {stage.name for stage in config.stages} - available_stages
+    if unknown_stages:
+        raise ValueError(
+            f"CPU configuration has unknown stages: {sorted(unknown_stages)}"
+        )
     forward = () if forward_plan is None else _schedule_stages(
         forward_plan.stages,
         sizes=sizes,
@@ -378,6 +469,10 @@ def format_cpu_schedule(plan: CpuScheduledPlan) -> str:
         lines.append(f"  {direction} {{")
         for stage in stages:
             lines.append(f"    stage {stage.name} {{")
+            tiles = ", ".join(f"{axis}={tile}" for axis, tile in stage.tile_sizes)
+            lines.append(
+                f"      tiles[{tiles}] scratch<={stage.scratch_bytes} bytes"
+            )
             for binding in stage.bindings:
                 lines.append(
                     f"      {binding.name} storage={binding.storage.value}"
@@ -407,5 +502,6 @@ def _format_cpu_expr(expression: CpuExpr, indent: int) -> list[str]:
 __all__ = [
     "CpuBinding", "CpuExpr", "CpuIteration", "CpuLeaf", "CpuLoop",
     "CpuLoopKind", "CpuScheduleConfig", "CpuScheduledPlan", "CpuStage",
+    "CpuStageConfig",
     "CpuStorage", "CpuTarget", "format_cpu_schedule", "schedule_cpu",
 ]

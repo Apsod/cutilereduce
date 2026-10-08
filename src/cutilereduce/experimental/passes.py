@@ -109,6 +109,14 @@ def simplify_constants(program: TensorProgram) -> TensorProgram:
         zero_result = False
         if old.op == "cast" and nodes[inputs[0]].dtype == old.dtype:
             alias = inputs[0]
+        elif old.op == "stop_gradient" and nodes[inputs[0]].op == "stop_gradient" and nodes[inputs[0]].axes == old.axes:
+            alias = inputs[0]
+        elif old.op == "powi" and _attribute(old, "exponent") == 1 and nodes[inputs[0]].axes == old.axes:
+            alias = inputs[0]
+        elif old.op == "powi" and _attribute(old, "exponent") == 0:
+            remap[old.id] = len(nodes)
+            nodes.append(TensorNode(len(nodes), "full", (), old.axes, old.dtype, (("value", 1.0),)))
+            continue
         elif old.op == "neg" and nodes[inputs[0]].op == "neg":
             alias = nodes[inputs[0]].inputs[0]
         elif old.op in {"add", "subtract", "multiply", "divide"}:

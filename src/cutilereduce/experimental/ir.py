@@ -4,6 +4,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any
+import math
+
+from .ops import COMPARISONS, REDUCTIONS, SCANS, ELEMENTWISE_OPS, validate_elementwise
 
 
 @dataclass(frozen=True)
@@ -217,6 +220,56 @@ class TensorValue:
     def __neg__(self) -> TensorValue:
         return self.builder.neg(self)
 
+    def __radd__(self, other: int | float) -> TensorValue:
+        return self + other
+
+    def __rsub__(self, other: int | float) -> TensorValue:
+        return self.builder.elementwise("subtract", self.builder._value(other, self.dtype), self)
+
+    def __rmul__(self, other: int | float) -> TensorValue:
+        return self * other
+
+    def __rtruediv__(self, other: int | float) -> TensorValue:
+        return self.builder.elementwise("divide", self.builder._value(other, self.dtype), self)
+
+    def __pow__(self, exponent: int) -> TensorValue:
+        return self.builder.powi(self, exponent)
+
+    def __abs__(self) -> TensorValue:
+        return self.builder.abs(self)
+
+    def __and__(self, other: TensorValue | bool) -> TensorValue:
+        return self.builder.logical_and(self, other)
+
+    __rand__ = __and__
+
+    def __or__(self, other: TensorValue | bool) -> TensorValue:
+        return self.builder.logical_or(self, other)
+
+    __ror__ = __or__
+
+    def __invert__(self) -> TensorValue:
+        return self.builder.logical_not(self)
+
+    def __floordiv__(self, other: TensorValue | int) -> TensorValue:
+        return self.builder.floor_divide(self, other)
+
+    def __rfloordiv__(self, other: int) -> TensorValue:
+        if type(other) is not int:
+            raise TypeError("integer floor division requires an integer scalar")
+        return self.builder.floor_divide(self.builder._value(other, self.dtype), self)
+
+    def __mod__(self, other: TensorValue | int) -> TensorValue:
+        return self.builder.remainder(self, other)
+
+    def __rmod__(self, other: int) -> TensorValue:
+        if type(other) is not int:
+            raise TypeError("integer remainder requires an integer scalar")
+        return self.builder.remainder(self.builder._value(other, self.dtype), self)
+
+    def __bool__(self) -> bool:
+        raise TypeError("symbolic tensors have no Python truth value; use ctx.where and logical operations")
+
 
 class TensorBuilder:
     """Construct tensor expressions while retaining axis dependencies."""
@@ -293,7 +346,18 @@ class TensorBuilder:
     ) -> TensorValue:
         if lhs.builder is not self:
             raise ValueError("value belongs to another tensor program")
+        if op not in ELEMENTWISE_OPS:
+            raise ValueError(f"unknown elementwise operation: {op!r}")
+        category = ELEMENTWISE_OPS[op].category
+        if rhs is not None and not isinstance(rhs, TensorValue):
+            if category == "boolean" and type(rhs) is not bool:
+                raise ValueError(f"{op} requires a boolean literal")
+            if category == "integer" and type(rhs) is not int:
+                raise ValueError(f"{op} requires an integer literal")
         values = (lhs,) if rhs is None else (lhs, self._value(rhs, lhs.dtype))
+        validate_elementwise(op, tuple(value.dtype for value in values))
+        if op in {"powi", "clamp"}:
+            raise ValueError(f"use ctx.{op} to supply operation attributes")
         axes = self._ordered(set().union(*(value.axes for value in values)))
         return self._add(op, values, axes, lhs.dtype)
 
@@ -306,10 +370,100 @@ class TensorBuilder:
     def neg(self, value: TensorValue) -> TensorValue:
         return self.elementwise("neg", value)
 
+    def sqrt(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("sqrt", value)
+
+    def rsqrt(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("rsqrt", value)
+
+    def abs(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("abs", value)
+
+    def sin(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("sin", value)
+
+    def cos(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("cos", value)
+
+    def tanh(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("tanh", value)
+
+    def sigmoid(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("sigmoid", value)
+
+    def log1p(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("log1p", value)
+
+    def expm1(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("expm1", value)
+
+    def stop_gradient(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("stop_gradient", value)
+
+    def minimum(self, lhs: TensorValue, rhs: TensorValue | int | float) -> TensorValue:
+        return self.elementwise("minimum", lhs, rhs)
+
+    def maximum(self, lhs: TensorValue, rhs: TensorValue | int | float) -> TensorValue:
+        return self.elementwise("maximum", lhs, rhs)
+
+    def powi(self, value: TensorValue, exponent: int) -> TensorValue:
+        self._value(value, value.dtype)
+        validate_elementwise("powi", (value.dtype,))
+        if type(exponent) is not int:
+            raise ValueError("powi requires a Python integer exponent")
+        return self._add("powi", (value,), self._ordered(set(value.axes)), value.dtype, exponent=exponent)
+
+    def clamp(
+        self, value: TensorValue, *, min: int | float | None = None,
+        max: int | float | None = None,
+    ) -> TensorValue:
+        self._value(value, value.dtype)
+        validate_elementwise("clamp", (value.dtype,))
+        if min is None and max is None:
+            raise ValueError("clamp requires at least one bound")
+        for bound in (min, max):
+            if bound is not None:
+                if type(bound) not in {int, float} or math.isnan(bound):
+                    raise ValueError("clamp bounds must be non-NaN numeric constants")
+                if value.dtype.startswith("int") and type(bound) is not int:
+                    raise ValueError("integer clamp requires integer bounds")
+        if min is not None and max is not None and min > max:
+            raise ValueError("clamp minimum must not exceed maximum")
+        return self._add("clamp", (value,), self._ordered(set(value.axes)), value.dtype, min=min, max=max)
+
+    def logical_and(self, lhs: TensorValue, rhs: TensorValue | bool) -> TensorValue:
+        return self.elementwise("logical_and", lhs, rhs)
+
+    def logical_or(self, lhs: TensorValue, rhs: TensorValue | bool) -> TensorValue:
+        return self.elementwise("logical_or", lhs, rhs)
+
+    def logical_not(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("logical_not", value)
+
+    def floor_divide(self, lhs: TensorValue, rhs: TensorValue | int) -> TensorValue:
+        return self.elementwise("floor_divide", lhs, rhs)
+
+    def remainder(self, lhs: TensorValue, rhs: TensorValue | int) -> TensorValue:
+        return self.elementwise("remainder", lhs, rhs)
+
+    def softplus(self, value: TensorValue) -> TensorValue:
+        return self.maximum(value, 0.0) + self.log1p(self.exp(-self.abs(value)))
+
+    def logaddexp(self, lhs: TensorValue, rhs: TensorValue | int | float) -> TensorValue:
+        right = self._value(rhs, lhs.dtype)
+        equal = self.compare("equal", lhs, right)
+        difference = self.where(equal, self.constant(0.0, lhs.dtype), lhs - right)
+        return self.maximum(lhs, right) + self.log1p(self.exp(-self.abs(difference)))
+
     def compare(
         self, op: str, lhs: TensorValue, rhs: TensorValue | int | float
     ) -> TensorValue:
+        if op not in COMPARISONS:
+            raise ValueError(f"unknown comparison: {op!r}")
+        self._value(lhs, lhs.dtype)
         right = self._value(rhs, lhs.dtype)
+        if lhs.dtype != right.dtype:
+            raise ValueError("comparison operands require matching dtypes; use an explicit cast")
         axes = self._ordered(set(lhs.axes) | set(right.axes))
         return self._add(f"compare_{op}", (lhs, right), axes, "bool")
 
@@ -319,6 +473,10 @@ class TensorBuilder:
         when_true: TensorValue,
         when_false: TensorValue,
     ) -> TensorValue:
+        for value in (condition, when_true, when_false):
+            self._value(value, value.dtype)
+        if when_true.dtype != when_false.dtype:
+            raise ValueError("where branches require matching dtypes; use an explicit cast")
         if condition.dtype != "bool":
             raise ValueError("where condition must have bool dtype")
         axes = self._ordered(
@@ -356,11 +514,15 @@ class TensorBuilder:
         return self._add("domain_valid", (), axes, "bool")
 
     def cast(self, value: TensorValue, dtype: str) -> TensorValue:
+        self._value(value, value.dtype)
         if value.dtype == dtype:
             return value
         return self._add("cast", (value,), value.axes, dtype)
 
     def reduce(self, op: str, value: TensorValue, over: tuple[str, ...]) -> TensorValue:
+        if op not in REDUCTIONS:
+            raise ValueError(f"unsupported reduction: {op!r}")
+        self._value(value, value.dtype)
         missing = set(over) - set(value.axes)
         if missing:
             raise ValueError(f"cannot reduce absent axes: {sorted(missing)}")
@@ -376,6 +538,9 @@ class TensorBuilder:
         exclusive: bool = False,
         reverse: bool = False,
     ) -> TensorValue:
+        if op not in SCANS:
+            raise ValueError(f"unsupported scan: {op!r}")
+        self._value(value, value.dtype)
         if over not in value.axes:
             raise ValueError(f"cannot scan absent axis: {over!r}")
         return self._add(

@@ -26,6 +26,7 @@ from .scheduled import (
     CommitMode,
     LocalLifetime,
     ScheduledBackwardProgram,
+    schedule_backward_program,
 )
 from .scheduled_ssa import SpecializedSchedule, liveness, scheduled_to_ssa
 from .target import TargetModel
@@ -33,6 +34,7 @@ from .target import TargetModel
 
 _CPP_DTYPE = {
     "float32": "at::kFloat",
+    "float64": "at::kDouble",
     "bfloat16": "at::kBFloat16",
     "float16": "at::kHalf",
     "bool": "at::kBool",
@@ -46,6 +48,8 @@ def _attr(node: TensorNode, name: str, default: Any = None) -> Any:
 
 
 def _number(value: int | float) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
     if isinstance(value, float) and math.isinf(value):
         sign = "-" if value < 0 else ""
         return f"{sign}std::numeric_limits<float>::infinity()"
@@ -78,193 +82,98 @@ def _align(expression: str, source: tuple[str, ...], target: tuple[str, ...]) ->
     return result
 
 
-def _einsum_equation(
-    lhs: tuple[str, ...], rhs: tuple[str, ...], out: tuple[str, ...]
-) -> str:
-    axes = tuple(dict.fromkeys((*lhs, *rhs, *out)))
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
-    if len(axes) > len(alphabet):
-        raise ValueError("too many axes for initial C++ einsum lowering")
-    letters = dict(zip(axes, alphabet[: len(axes)], strict=True))
-
-    def encode(values):
-        return "".join(letters[axis] for axis in values)
-
-    return f"{encode(lhs)},{encode(rhs)}->{encode(out)}"
+def _product(axes: tuple[str, ...], sizes: dict[str, int]) -> int:
+    return math.prod(sizes[axis] for axis in axes)
 
 
-def _cpp_scalar(dtype: str) -> str:
-    return {
-        "float32": "float",
-        "bfloat16": "at::BFloat16",
-        "float16": "at::Half",
-    }[dtype]
-
-
-def _strides(axes: tuple[str, ...], sizes: dict[str, int]) -> dict[str, int]:
-    stride = 1
-    result = {}
-    for axis in reversed(axes):
-        result[axis] = stride
-        stride *= sizes[axis]
-    return result
-
-
-def _offset(
-    axes: tuple[str, ...], sizes: dict[str, int], coordinates: dict[str, str]
-) -> str:
-    strides = _strides(axes, sizes)
-    terms = [
-        f"({coordinates[axis]}) * {strides[axis]}"
-        for axis in axes
-        if strides[axis] != 0
-    ]
-    return " + ".join(terms) or "0"
-
-
-def _argument_ancestor(region: TensorRegion, node_id: int) -> TensorNode | None:
-    node = region.nodes[node_id]
-    while node.op == "cast":
-        node = region.nodes[node.inputs[0]]
-    return node if node.op == "argument" else None
-
-
-def _emit_fused_lws_map_fold(
-    name: str,
-    region: TensorRegion,
-    sizes: dict[str, int],
+def _canonical_matrix_operand(
+    expression: str,
+    source_axes: tuple[str, ...],
+    target_axes: tuple[str, ...],
+    shape: tuple[int, ...],
     *,
-    parallel: bool,
-) -> str | None:
-    """Recognize and emit the stable attention-shaped LWS fold directly."""
-    results = dict(region.results)
-    required = {"execution.maximum", "execution.normalizer", "execution.numerator"}
-    if set(results) != required:
-        return None
-    maximum = region.nodes[results["execution.maximum"]]
-    normalizer = region.nodes[results["execution.normalizer"]]
-    numerator = region.nodes[results["execution.numerator"]]
-    if maximum.op != "reduce_max" or normalizer.op != "reduce_sum":
-        return None
-    score = region.nodes[maximum.inputs[0]]
-    if score.op != "contract" or numerator.op != "contract":
-        return None
-    score_partition = _attr(score, "contraction_axes")
-    numerator_partition = _attr(numerator, "contraction_axes")
-    if not isinstance(score_partition, ContractionAxes) or not isinstance(
-        numerator_partition, ContractionAxes
-    ):
-        return None
-    if len(score_partition.reduce) != 1 or len(numerator_partition.reduce) != 1:
-        return None
-    fold_axis = numerator_partition.reduce[0]
-    reduction_axis = score_partition.reduce[0]
-    if fold_axis not in score.axes:
-        return None
-    lhs = _argument_ancestor(region, score.inputs[0])
-    rhs = _argument_ancestor(region, score.inputs[1])
-    payload = _argument_ancestor(region, numerator.inputs[1])
-    if lhs is None or rhs is None or payload is None:
-        return None
-    argument_by_id = {node_id: name for name, node_id in region.arguments}
-    if any(node.id not in argument_by_id for node in (lhs, rhs, payload)):
-        return None
-    outer_axes = maximum.axes
-    inner_axes = tuple(axis for axis in numerator.axes if axis not in outer_axes)
-    outer_size = math.prod(sizes[axis] for axis in outer_axes)
-    inner_size = math.prod(sizes[axis] for axis in inner_axes)
-    parameter_names = {node_id: _cpp_name(arg) for arg, node_id in region.arguments}
-    parameters = ", ".join(
-        f"const torch::Tensor& {parameter_names[node_id]}"
-        for _, node_id in region.arguments
-    )
-    lines = [f"std::vector<torch::Tensor> {_cpp_name(name)}({parameters}) {{"]
-    for node in (lhs, rhs, payload):
-        variable = parameter_names[node.id]
-        lines.append(
-            f"  const auto* {variable}_ptr = "
-            f"{variable}.data_ptr<{_cpp_scalar(node.dtype)}>();"
+    source_dtype: str,
+    target_dtype: str,
+) -> str:
+    """Permute and flatten a bounded region value for an ATen GEMM call."""
+    if set(source_axes) != set(target_axes) or len(source_axes) != len(target_axes):
+        raise ValueError(
+            "contraction operand axes do not match the contraction partition"
         )
-    output_shape = _axes_literal(outer_axes, sizes)
-    numerator_shape = _axes_literal(numerator.axes, sizes)
-    loop_open = (
-        f"  at::parallel_for(0, {outer_size}, 1, [&](int64_t begin, int64_t end) {{"
-        if parallel
-        else f"  {{ int64_t begin = 0, end = {outer_size};"
+    result = expression
+    if source_dtype != target_dtype:
+        result = f"({result}).to({_CPP_DTYPE[target_dtype]})"
+    if source_axes != target_axes:
+        permutation = tuple(source_axes.index(axis) for axis in target_axes)
+        result = f"({result}).permute({_dims_literal(permutation)})"
+    return f"({result}).reshape({_dims_literal(shape)})"
+
+
+def _emit_contraction(
+    node: TensorNode,
+    input_nodes: list[TensorNode],
+    inputs: list[str],
+    partition: ContractionAxes,
+    sizes: dict[str, int],
+) -> str:
+    """Lower a named-axis contraction to mm/bmm through canonical B/M/N/K."""
+    batch = partition.batch
+    lhs_free = partition.lhs_free
+    rhs_free = partition.rhs_free
+    reduce = partition.reduce
+    batch_size = _product(batch, sizes)
+    lhs_size = _product(lhs_free, sizes)
+    rhs_size = _product(rhs_free, sizes)
+    reduce_size = _product(reduce, sizes)
+
+    lhs_axes = (*batch, *lhs_free, *reduce)
+    rhs_axes = (*batch, *reduce, *rhs_free)
+    if batch:
+        lhs_shape = (batch_size, lhs_size, reduce_size)
+        rhs_shape = (batch_size, reduce_size, rhs_size)
+    else:
+        lhs_shape = (lhs_size, reduce_size)
+        rhs_shape = (reduce_size, rhs_size)
+    lhs = _canonical_matrix_operand(
+        inputs[0],
+        input_nodes[0].axes,
+        lhs_axes,
+        lhs_shape,
+        source_dtype=input_nodes[0].dtype,
+        target_dtype=node.dtype,
     )
-    loop_close = "  });" if parallel else "  }"
-    lines.extend(
-        [
-            f"  auto maximum = at::empty({output_shape}, at::TensorOptions().dtype(at::kFloat));",
-            f"  auto normalizer = at::empty({output_shape}, at::TensorOptions().dtype(at::kFloat));",
-            f"  auto numerator = at::zeros({numerator_shape}, at::TensorOptions().dtype(at::kFloat));",
-            "  auto* maximum_ptr = maximum.data_ptr<float>();",
-            "  auto* normalizer_ptr = normalizer.data_ptr<float>();",
-            "  auto* numerator_ptr = numerator.data_ptr<float>();",
-            loop_open,
-            "    for (int64_t outer = begin; outer < end; ++outer) {",
-            "      int64_t outer_remainder = outer;",
-        ]
+    rhs = _canonical_matrix_operand(
+        inputs[1],
+        input_nodes[1].axes,
+        rhs_axes,
+        rhs_shape,
+        source_dtype=input_nodes[1].dtype,
+        target_dtype=node.dtype,
     )
-    coordinates: dict[str, str] = {}
-    for axis in reversed(outer_axes):
-        variable = f"i_{_cpp_name(axis)}"
-        coordinates[axis] = variable
-        lines.append(
-            f"      const int64_t {variable} = outer_remainder % {sizes[axis]};"
+    product = f"at::bmm({lhs}, {rhs})" if batch else f"at::mm({lhs}, {rhs})"
+
+    canonical_axes = (*batch, *lhs_free, *rhs_free)
+    canonical_shape = tuple(sizes[axis] for axis in canonical_axes)
+    if node.op == "contract_accumulate":
+        accumulator = _align(inputs[2], input_nodes[2].axes, canonical_axes)
+        if input_nodes[2].dtype != node.dtype:
+            accumulator = f"({accumulator}).to({_CPP_DTYPE[node.dtype]})"
+        matrix_shape = (
+            (batch_size, lhs_size, rhs_size) if batch else (lhs_size, rhs_size)
         )
-        lines.append(f"      outer_remainder /= {sizes[axis]};")
-    score_coordinates = dict(coordinates)
-    score_coordinates[fold_axis] = "fold"
-    score_coordinates[reduction_axis] = "reduce"
-    lhs_offset = _offset(lhs.axes, sizes, score_coordinates)
-    rhs_offset = _offset(rhs.axes, sizes, score_coordinates)
-    score_code = [
-        "        float score = 0.0f;",
-        f"        for (int64_t reduce = 0; reduce < {sizes[reduction_axis]}; ++reduce) {{",
-        f"          score += static_cast<float>({parameter_names[lhs.id]}_ptr[{lhs_offset}]) * static_cast<float>({parameter_names[rhs.id]}_ptr[{rhs_offset}]);",
-        "        }",
-    ]
-    lines.extend(
-        [
-            "      float local_maximum = -std::numeric_limits<float>::infinity();",
-            f"      for (int64_t fold = 0; fold < {sizes[fold_axis]}; ++fold) {{",
-            *score_code,
-            "        local_maximum = std::max(local_maximum, score);",
-            "      }",
-            "      float local_normalizer = 0.0f;",
-            f"      for (int64_t fold = 0; fold < {sizes[fold_axis]}; ++fold) {{",
-            *score_code,
-            "        const float weight = std::exp(score - local_maximum);",
-            "        local_normalizer += weight;",
-            f"        for (int64_t inner = 0; inner < {inner_size}; ++inner) {{",
-            "          int64_t inner_remainder = inner;",
-        ]
-    )
-    payload_coordinates = dict(coordinates)
-    payload_coordinates[fold_axis] = "fold"
-    for axis in reversed(inner_axes):
-        variable = f"i_{_cpp_name(axis)}"
-        payload_coordinates[axis] = variable
-        lines.append(
-            f"          const int64_t {variable} = inner_remainder % {sizes[axis]};"
+        accumulator = (
+            f"({accumulator}).expand({_dims_literal(canonical_shape)})"
+            f".reshape({_dims_literal(matrix_shape)})"
         )
-        lines.append(f"          inner_remainder /= {sizes[axis]};")
-    payload_offset = _offset(payload.axes, sizes, payload_coordinates)
-    lines.extend(
-        [
-            f"          numerator_ptr[outer * {inner_size} + inner] += weight * static_cast<float>({parameter_names[payload.id]}_ptr[{payload_offset}]);",
-            "        }",
-            "      }",
-            "      maximum_ptr[outer] = local_maximum;",
-            "      normalizer_ptr[outer] = local_normalizer;",
-            "    }",
-            loop_close,
-            "  return {maximum, normalizer, numerator};",
-            "}",
-        ]
-    )
-    return "\n".join(lines)
+        operation = "baddbmm" if batch else "addmm"
+        product = f"at::{operation}({accumulator}, {lhs}, {rhs})"
+    result = f"({product}).reshape({_dims_literal(canonical_shape)})"
+    if canonical_axes != node.axes:
+        if set(canonical_axes) != set(node.axes):
+            raise ValueError("contraction result axes do not match its partition")
+        permutation = tuple(canonical_axes.index(axis) for axis in node.axes)
+        result = f"({result}).permute({_dims_literal(permutation)})"
+    return result
 
 
 def _emit_region(
@@ -272,15 +181,8 @@ def _emit_region(
     region: TensorRegion,
     sizes: dict[str, int],
     *,
-    parallel_map_fold: bool,
     nested_names: dict[int, str] | None = None,
 ) -> str:
-    if name == "map_fold":
-        fused = _emit_fused_lws_map_fold(
-            name, region, sizes, parallel=parallel_map_fold
-        )
-        if fused is not None:
-            return fused
     function = _cpp_name(name)
     argument_names = {node_id: _cpp_name(arg) for arg, node_id in region.arguments}
     parameters = ", ".join(
@@ -406,10 +308,31 @@ def _emit_region(
                 left = _align(inputs[0], input_nodes[0].axes, node.axes)
                 right = _align(inputs[1], input_nodes[1].axes, node.axes)
                 expression = f"({left}) {symbols[node.op]} ({right})"
-            case "neg":
-                expression = f"-({inputs[0]})"
-            case "exp" | "log":
-                expression = f"at::{node.op}({inputs[0]})"
+            case "neg" | "exp" | "log" | "sqrt" | "rsqrt" | "abs" | "sin" | "cos" | "tanh" | "sigmoid" | "log1p" | "expm1" | "logical_not":
+                operand = _align(inputs[0], input_nodes[0].axes, node.axes)
+                expression = f"at::{node.op}({operand})"
+            case "minimum" | "maximum" | "logical_and" | "logical_or" | "floor_divide" | "remainder":
+                operands = [_align(value, source.axes, node.axes) for value, source in zip(inputs, input_nodes, strict=True)]
+                expression = f"at::{node.op}({', '.join(operands)})"
+            case "stop_gradient":
+                expression = f"({_align(inputs[0], input_nodes[0].axes, node.axes)}).detach()"
+            case "clamp":
+                expression = _align(inputs[0], input_nodes[0].axes, node.axes)
+                for bound in ("min", "max"):
+                    value = _attr(node, bound)
+                    if value is not None:
+                        expression = f"at::clamp_{bound}({expression}, {_number(value)})"
+            case "powi":
+                from .ops import multiplication_chain
+                exponent = _attr(node, "exponent")
+                powers = [_align(inputs[0], input_nodes[0].axes, node.axes)]
+                for left, right in multiplication_chain(abs(exponent)) if exponent else ():
+                    name = f"power_{node.id}_{len(powers)}"
+                    lines.append(f"  auto {name} = ({powers[left]}) * ({powers[right]});")
+                    powers.append(name)
+                expression = powers[-1] if exponent else f"at::ones_like({powers[0]})"
+                if exponent < 0:
+                    expression = f"at::reciprocal({expression})"
             case "cast":
                 expression = f"({inputs[0]}).to({_CPP_DTYPE[node.dtype]})"
             case "where" | "mask_identity":
@@ -461,12 +384,9 @@ def _emit_region(
                 partition = _attr(node, "contraction_axes")
                 if not isinstance(partition, ContractionAxes):
                     raise TypeError("contract node has invalid axis metadata")
-                equation = _einsum_equation(
-                    input_nodes[0].axes, input_nodes[1].axes, node.axes
+                expression = _emit_contraction(
+                    node, input_nodes, inputs, partition, sizes
                 )
-                expression = f'at::einsum("{equation}", {{{inputs[0]}, {inputs[1]}}})'
-                if node.op == "contract_accumulate":
-                    expression = f"({expression}) + ({inputs[2]})"
             case _:
                 raise NotImplementedError(
                     f"CPU C++ lowering does not support tensor op {node.op!r}"
@@ -542,7 +462,6 @@ def _emit_scheduled_backward(
             name,
             region,
             shape,
-            parallel_map_fold=False,
             nested_names=nested_names,
         )
         for name, shape in zip(variant_names, local_sizes, strict=True)
@@ -670,13 +589,621 @@ def _emit_scheduled_backward(
     return variants, "\n".join(lines)
 
 
+def _emit_scheduled_forward_tile(
+    problem: FoldProgram,
+    scheduled: CpuScheduledPlan,
+    sizes: dict[str, int],
+    extents: tuple[int, ...],
+    *,
+    nested_names: dict[int, str],
+    function_name: str,
+    name_suffix: str,
+    map_fold_name: str,
+    combine_name: str,
+    identity_name: str,
+    project_name: str,
+) -> tuple[list[str], str, int]:
+    """Emit the scheduled fold for one independently owned output tile."""
+    fold_axis = problem.spec.fold_axes[0]
+    full_extent = sizes[fold_axis]
+    variants = []
+    variant_names = {}
+    for extent in extents:
+        if extent == full_extent:
+            variant_names[extent] = map_fold_name
+            continue
+        local_sizes = dict(sizes)
+        local_sizes[fold_axis] = extent
+        name = f"scheduled_map_fold_{extent}_{name_suffix}"
+        variant_names[extent] = name
+        variants.append(
+            _emit_region(
+                name,
+                problem.map_fold,
+                local_sizes,
+                nested_names=nested_names,
+            )
+        )
+
+    accumulate_names = {}
+    for extent in extents:
+        local_sizes = dict(sizes)
+        local_sizes[fold_axis] = extent
+        name = f"scheduled_map_fold_combine_{extent}_{name_suffix}"
+        accumulate_names[extent] = name
+        variants.append(
+            _emit_region(
+                name, problem.map_fold_combine, local_sizes, nested_names=nested_names
+            )
+        )
+
+    parameters = ", ".join(
+        f"const torch::Tensor& {_cpp_name(name)}" for name in problem.spec.inputs
+    )
+    lines = [f"std::vector<torch::Tensor> {function_name}({parameters}) {{"]
+    lines.append(
+        "  auto run_map_fold = [&](int64_t start, int64_t extent) "
+        "-> std::vector<torch::Tensor> {"
+    )
+    for index, (name, spec) in enumerate(problem.spec.inputs.items()):
+        variable = _cpp_name(name)
+        if fold_axis in spec.axes:
+            dimension = spec.axes.index(fold_axis)
+            lines.append(
+                f"    auto sliced_{index} = {variable}.narrow({dimension}, start, extent).contiguous();"
+            )
+        else:
+            lines.append(f"    const auto& sliced_{index} = {variable};")
+    map_arguments = []
+    input_indices = {name: index for index, name in enumerate(problem.spec.inputs)}
+    for name, _ in problem.map_fold.arguments:
+        if name not in input_indices:
+            raise ValueError(f"map_fold argument {name!r} is not an operator input")
+        map_arguments.append(f"sliced_{input_indices[name]}")
+    for extent in extents:
+        lines.append(
+            f"    if (extent == {extent}) return {variant_names[extent]}("
+            f"{', '.join(map_arguments)});"
+        )
+    lines.extend(
+        (
+            '    TORCH_CHECK(false, "missing scheduled map-fold tile variant");',
+            "  };",
+        )
+    )
+
+    carrier_indices = {
+        name: index for index, (name, _) in enumerate(problem.map_fold.results)
+    }
+    carrier_nodes = {
+        name: problem.map_fold.nodes[node_id] for name, node_id in problem.map_fold.results
+    }
+    lines.append(
+        "  auto run_map_fold_combine = [&](int64_t start, int64_t extent, "
+        "const std::vector<torch::Tensor>& state) -> std::vector<torch::Tensor> {"
+    )
+    for index, (name, spec) in enumerate(problem.spec.inputs.items()):
+        variable = _cpp_name(name)
+        if fold_axis in spec.axes:
+            lines.append(
+                f"    auto sliced_{index} = {variable}.narrow("
+                f"{spec.axes.index(fold_axis)}, start, extent).contiguous();"
+            )
+        else:
+            lines.append(f"    const auto& sliced_{index} = {variable};")
+    accumulate_arguments = []
+    for name, node_id in problem.map_fold_combine.arguments:
+        target_axes = problem.map_fold_combine.nodes[node_id].axes
+        if name in input_indices:
+            accumulate_arguments.append(
+                _align(
+                    f"sliced_{input_indices[name]}",
+                    problem.spec.inputs[name].axes,
+                    target_axes,
+                )
+            )
+        elif name.startswith("accumulator."):
+            result_name = "execution." + name.removeprefix("accumulator.")
+            accumulate_arguments.append(
+                _align(
+                    f"state[{carrier_indices[result_name]}]",
+                    carrier_nodes[result_name].axes,
+                    target_axes,
+                )
+            )
+        else:
+            raise ValueError(f"unrecognized map_fold_combine argument {name!r}")
+    accumulate_indices = {
+        name: index for index, (name, _) in enumerate(problem.map_fold_combine.results)
+    }
+    accumulate_nodes = dict(problem.map_fold_combine.results)
+    reordered = ", ".join(
+        _align(
+            f"result[{accumulate_indices[name]}]",
+            problem.map_fold_combine.nodes[accumulate_nodes[name]].axes,
+            carrier_nodes[name].axes,
+        )
+        for name in carrier_indices
+    )
+    for extent in extents:
+        lines.extend(
+            (
+                f"    if (extent == {extent}) {{",
+                f"      auto result = {accumulate_names[extent]}({', '.join(accumulate_arguments)});",
+                f"      return {{{reordered}}};",
+                "    }",
+            )
+        )
+    lines.extend(
+        ('    TORCH_CHECK(false, "missing scheduled accumulate tile variant");', "  };")
+    )
+    identity_indices = {
+        name: index for index, (name, _) in enumerate(problem.execution_identity.results)
+    }
+    identity_nodes = dict(problem.execution_identity.results)
+    identity_parts = []
+    for name, node_id in problem.map_fold.results:
+        carrier = problem.map_fold.nodes[node_id]
+        identity_node = problem.execution_identity.nodes[identity_nodes[name]]
+        aligned = _align(
+            f"identity[{identity_indices[name]}]", identity_node.axes, carrier.axes
+        )
+        identity_parts.append(f"({aligned}).expand({_axes_literal(carrier.axes, sizes)})")
+    identity_values = ", ".join(identity_parts)
+    lines.extend(
+        (
+            "  auto initial_state = [&]() -> std::vector<torch::Tensor> {",
+            f"    auto identity = {identity_name}();",
+            f"    return {{{identity_values}}};",
+            "  };",
+        )
+    )
+    combine_arguments = []
+    for name, node_id in problem.execution_combine.arguments:
+        side, suffix = name.split(".", 1)
+        result_name = f"execution.{suffix}"
+        if result_name not in carrier_indices or side not in {"left", "right"}:
+            raise ValueError("execution_combine arguments do not match map_fold results")
+        combine_arguments.append(
+            _align(
+                f"{side}[{carrier_indices[result_name]}]",
+                carrier_nodes[result_name].axes,
+                problem.execution_combine.nodes[node_id].axes,
+            )
+        )
+    combine_indices = {
+        name: index for index, (name, _) in enumerate(problem.execution_combine.results)
+    }
+    combine_nodes = dict(problem.execution_combine.results)
+    combined_values = ", ".join(
+        _align(
+            f"result[{combine_indices[name]}]",
+            problem.execution_combine.nodes[combine_nodes[name]].axes,
+            carrier_nodes[name].axes,
+        )
+        for name in carrier_indices
+    )
+    lines.extend(
+        (
+            "  auto combine_carriers = [&](const std::vector<torch::Tensor>& left,",
+            "                              const std::vector<torch::Tensor>& right) -> std::vector<torch::Tensor> {",
+            f"    auto result = {combine_name}({', '.join(combine_arguments)});",
+            f"    return {{{combined_values}}};",
+            "  };",
+            "  auto combine_many = [&](std::vector<std::vector<torch::Tensor>> values, bool tree) {",
+            '    TORCH_CHECK(!values.empty(), "scheduled fold produced no carriers");',
+            "    if (!tree) {",
+            "      auto state = std::move(values[0]);",
+            "      for (size_t i = 1; i < values.size(); ++i)",
+            "        state = combine_carriers(state, values[i]);",
+            "      return state;",
+            "    }",
+            "    while (values.size() > 1) {",
+            "      std::vector<std::vector<torch::Tensor>> next;",
+            "      next.reserve((values.size() + 1) / 2);",
+            "      for (size_t i = 0; i < values.size(); i += 2) {",
+            "        if (i + 1 == values.size()) next.push_back(std::move(values[i]));",
+            "        else next.push_back(combine_carriers(values[i], values[i + 1]));",
+            "      }",
+            "      values = std::move(next);",
+            "    }",
+            "    return std::move(values[0]);",
+            "  };",
+        )
+    )
+
+    lambda_names: dict[int, str] = {}
+    lambda_definitions: list[str] = []
+
+    def emit_expression(expression: CpuExpr) -> str:
+        key = id(expression)
+        if key in lambda_names:
+            return lambda_names[key]
+        name = f"eval_carrier_{len(lambda_names)}"
+        lambda_names[key] = name
+        if isinstance(expression, CpuLeaf):
+            if not isinstance(expression.expression, MapFoldRegion):
+                raise TypeError("scheduled forward carrier leaf must call map_fold")
+            body = ["    return run_map_fold(start, extent);"]
+        elif isinstance(expression, CpuLoop) and expression.operation == "carrier_fold":
+            if (
+                expression.iteration.loop.value != "parallel"
+                and expression.topology is FoldTopology.ONLINE
+            ):
+                grain = expression.iteration.grain
+                if isinstance(expression.body, CpuLeaf):
+                    if not isinstance(expression.body.expression, MapFoldRegion):
+                        raise TypeError("online fold leaf must call map_fold")
+                    update = "state = run_map_fold_combine(start + offset, local, state);"
+                else:
+                    child = emit_expression(expression.body)
+                    update = f"state = combine_carriers(state, {child}(start + offset, local));"
+                body = [
+                    "    auto state = initial_state();",
+                    f"    for (int64_t offset = 0; offset < extent; offset += {grain}) {{",
+                    f"      const int64_t local = std::min<int64_t>({grain}, extent - offset);",
+                    f"      {update}",
+                    "    }",
+                    "    return state;",
+                ]
+                definition = [
+                    f"  std::function<std::vector<torch::Tensor>(int64_t, int64_t)> {name};",
+                    f"  {name} = [&](int64_t start, int64_t extent) {{",
+                    *body,
+                    "  };",
+                ]
+                lambda_definitions.extend(definition)
+                return name
+            child = emit_expression(expression.body)
+            grain = expression.iteration.grain
+            tree = "true" if expression.topology is FoldTopology.TREE else "false"
+            body = [
+                f"    const int64_t count = (extent + {grain} - 1) / {grain};",
+                "    std::vector<std::vector<torch::Tensor>> values(count);",
+            ]
+            loop_body = [
+                f"const int64_t offset = index * {grain};",
+                f"const int64_t local = std::min<int64_t>({grain}, extent - offset);",
+                f"values[index] = {child}(start + offset, local);",
+            ]
+            if expression.iteration.loop.value == "parallel":
+                body.extend(
+                    [
+                        "    at::parallel_for(0, count, 1, [&](int64_t begin, int64_t end) {",
+                        "      for (int64_t index = begin; index < end; ++index) {",
+                        *(f"        {line}" for line in loop_body),
+                        "      }",
+                        "    });",
+                    ]
+                )
+            else:
+                body.extend(
+                    [
+                        "    for (int64_t index = 0; index < count; ++index) {",
+                        *(f"      {line}" for line in loop_body),
+                        "    }",
+                    ]
+                )
+            body.append(f"    return combine_many(std::move(values), {tree});")
+        else:
+            raise TypeError("unsupported scheduled forward carrier expression")
+        definition = [
+            f"  std::function<std::vector<torch::Tensor>(int64_t, int64_t)> {name};",
+            f"  {name} = [&](int64_t start, int64_t extent) {{",
+            *body,
+            "  };",
+        ]
+        lambda_definitions.extend(definition)
+        return name
+
+    root = scheduled.forward[0].bindings[0].expression
+    prefix_count = 0
+    if isinstance(root, CpuLoop) and root.operation == "map":
+        child = emit_expression(root.body)
+        grain = root.iteration.grain
+        lines.extend(lambda_definitions)
+        lines.extend(
+            (
+                f"  const int64_t partition_count = ({full_extent} + {grain} - 1) / {grain};",
+                "  std::vector<std::vector<torch::Tensor>> partials(partition_count);",
+            )
+        )
+        map_body = [
+            f"const int64_t start = index * {grain};",
+            f"const int64_t extent = std::min<int64_t>({grain}, {full_extent} - start);",
+            f"partials[index] = {child}(start, extent);",
+        ]
+        if root.iteration.loop.value == "parallel":
+            lines.extend(
+                (
+                    "  at::parallel_for(0, partition_count, 1, [&](int64_t begin, int64_t end) {",
+                    "    for (int64_t index = begin; index < end; ++index) {",
+                    *(f"      {line}" for line in map_body),
+                    "    }",
+                    "  });",
+                )
+            )
+        else:
+            lines.extend(
+                (
+                    "  for (int64_t index = 0; index < partition_count; ++index) {",
+                    *(f"    {line}" for line in map_body),
+                    "  }",
+                )
+            )
+        combine_expression = scheduled.forward[1].bindings[0].expression
+        if (
+            isinstance(combine_expression, CpuLoop)
+            and combine_expression.operation == "exclusive_scan"
+        ):
+            prefix_count = root.iteration.count
+            if problem.execution_identity.arguments:
+                raise ValueError("execution identity must not take arguments")
+            lines.extend(
+                (
+                    f"  auto identity = {identity_name}();",
+                    "  std::vector<std::vector<torch::Tensor>> prefixes;",
+                    "  prefixes.reserve(partials.size());",
+                    "  std::vector<torch::Tensor> prefix_state;",
+                    "  prefix_state.reserve(identity.size());",
+                    "  for (size_t i = 0; i < identity.size(); ++i) {",
+                    "    std::vector<int64_t> shape(partials[0][i].dim() - identity[i].dim(), 1);",
+                    "    shape.insert(shape.end(), identity[i].sizes().begin(), identity[i].sizes().end());",
+                    "    prefix_state.push_back(identity[i].reshape(shape).expand_as(partials[0][i]).clone());",
+                    "  }",
+                    "  for (const auto& partial : partials) {",
+                    "    prefixes.push_back(prefix_state);",
+                    "    prefix_state = combine_carriers(prefix_state, partial);",
+                    "  }",
+                )
+            )
+        topology = (
+            combine_expression.topology
+            if isinstance(combine_expression, CpuLoop)
+            and combine_expression.topology is not None
+            else FoldTopology.ONLINE
+        )
+        tree = "true" if topology is FoldTopology.TREE else "false"
+        lines.append(f"  auto execution = combine_many(partials, {tree});")
+    else:
+        evaluator = emit_expression(root)
+        lines.extend(lambda_definitions)
+        lines.append(f"  auto execution = {evaluator}(0, {full_extent});")
+
+    project_arguments = []
+    for name, node_id in problem.project_output.arguments:
+        candidate = name.replace("saved_execution.", "execution.")
+        if candidate not in carrier_indices:
+            raise ValueError("project_output arguments do not match the carrier")
+        project_arguments.append(
+            _align(
+                f"execution[{carrier_indices[candidate]}]",
+                carrier_nodes[candidate].axes,
+                problem.project_output.nodes[node_id].axes,
+            )
+        )
+    lines.append(f"  auto outputs = {project_name}({', '.join(project_arguments)});")
+    lines.extend(
+        (
+            "  std::vector<torch::Tensor> result;",
+            "  result.insert(result.end(), outputs.begin(), outputs.end());",
+            "  result.insert(result.end(), execution.begin(), execution.end());",
+        )
+    )
+    if prefix_count:
+        lines.extend(
+            (
+                "  for (const auto& prefix : prefixes)",
+                "    result.insert(result.end(), prefix.begin(), prefix.end());",
+            )
+        )
+    lines.extend(("  return result;", "}"))
+    return variants, "\n".join(lines), prefix_count
+
+
+def _emit_scheduled_forward(
+    problem: FoldProgram,
+    scheduled: CpuScheduledPlan,
+    sizes: dict[str, int],
+    extents: tuple[int, ...],
+    *,
+    nested_names: dict[int, str],
+) -> tuple[list[str], str]:
+    """Tile all forward batch axes and emit one native owner-program grid."""
+    owner_axes = problem.spec.batch_axes
+    stage_tiles = dict(scheduled.forward[0].tile_sizes)
+    tile_sizes = {
+        axis: min(sizes[axis], stage_tiles.get(axis, sizes[axis]))
+        for axis in owner_axes
+    }
+    extent_choices = []
+    for axis in owner_axes:
+        tile = tile_sizes[axis]
+        remainder = sizes[axis] % tile
+        extent_choices.append((tile,) if remainder == 0 else (tile, remainder))
+    owner_shapes = tuple(itertools.product(*extent_choices)) if owner_axes else ((),)
+
+    functions: list[str] = []
+    tile_functions: dict[tuple[int, ...], str] = {}
+    prefix_count: int | None = None
+    for shape_index, shape in enumerate(owner_shapes):
+        local_sizes = dict(sizes)
+        local_sizes.update(zip(owner_axes, shape, strict=True))
+        suffix = f"owner_{shape_index}"
+        names = {
+            "map": f"map_fold_{suffix}",
+            "combine": f"execution_combine_{suffix}",
+            "identity": f"execution_identity_{suffix}",
+            "project": f"project_output_{suffix}",
+            "driver": f"scheduled_forward_{suffix}",
+        }
+        functions.extend(
+            _emit_region(
+                names[key],
+                region,
+                local_sizes,
+                nested_names=nested_names,
+            )
+            for key, region in (
+                ("map", problem.map_fold),
+                ("combine", problem.execution_combine),
+                ("identity", problem.execution_identity),
+                ("project", problem.project_output),
+            )
+        )
+        variants, driver, local_prefix_count = _emit_scheduled_forward_tile(
+            problem,
+            scheduled,
+            local_sizes,
+            extents,
+            nested_names=nested_names,
+            function_name=names["driver"],
+            name_suffix=suffix,
+            map_fold_name=names["map"],
+            combine_name=names["combine"],
+            identity_name=names["identity"],
+            project_name=names["project"],
+        )
+        functions.extend((*variants, driver))
+        tile_functions[shape] = names["driver"]
+        if prefix_count is None:
+            prefix_count = local_prefix_count
+        elif prefix_count != local_prefix_count:
+            raise ValueError("owner-tile variants disagree on prefix count")
+    prefix_count = prefix_count or 0
+
+    parameters = ", ".join(
+        f"const torch::Tensor& {_cpp_name(name)}" for name in problem.spec.inputs
+    )
+    lines = [f"std::vector<torch::Tensor> scheduled_forward({parameters}) {{"]
+    output_nodes = [
+        problem.project_output.nodes[node_id]
+        for _, node_id in problem.project_output.results
+    ]
+    carrier_nodes = [
+        problem.map_fold.nodes[node_id] for _, node_id in problem.map_fold.results
+    ]
+    for index, node in enumerate(output_nodes):
+        lines.append(
+            f"  auto output_{index} = at::empty({_axes_literal(node.axes, sizes)}, "
+            f"at::TensorOptions().dtype({_CPP_DTYPE[node.dtype]}));"
+        )
+    for index, node in enumerate(carrier_nodes):
+        lines.append(
+            f"  auto carrier_{index} = at::empty({_axes_literal(node.axes, sizes)}, "
+            f"at::TensorOptions().dtype({_CPP_DTYPE[node.dtype]}));"
+        )
+    for prefix in range(prefix_count):
+        for index, node in enumerate(carrier_nodes):
+            lines.append(
+                f"  auto prefix_{prefix}_{index} = at::empty("
+                f"{_axes_literal(node.axes, sizes)}, "
+                f"at::TensorOptions().dtype({_CPP_DTYPE[node.dtype]}));"
+            )
+    owner_count = math.prod(
+        math.ceil(sizes[axis] / tile_sizes[axis]) for axis in owner_axes
+    )
+    lines.extend(
+        (
+            f"  at::parallel_for(0, {owner_count}, 1, [&](int64_t begin, int64_t end) {{",
+            "    for (int64_t owner = begin; owner < end; ++owner) {",
+            "      int64_t owner_remainder = owner;",
+        )
+    )
+    for axis in reversed(owner_axes):
+        axis_name = _cpp_name(axis)
+        count = math.ceil(sizes[axis] / tile_sizes[axis])
+        lines.extend(
+            (
+                f"      const int64_t tile_index_{axis_name} = owner_remainder % {count};",
+                f"      owner_remainder /= {count};",
+                f"      const int64_t start_{axis_name} = tile_index_{axis_name} * {tile_sizes[axis]};",
+                f"      const int64_t extent_{axis_name} = std::min<int64_t>({tile_sizes[axis]}, {sizes[axis]} - start_{axis_name});",
+            )
+        )
+    input_arguments = []
+    for input_index, (input_name, spec) in enumerate(problem.spec.inputs.items()):
+        variable = _cpp_name(input_name)
+        lines.append(f"      auto tile_input_{input_index} = {variable};")
+        for axis in owner_axes:
+            if axis not in spec.axes:
+                continue
+            dimension = spec.axes.index(axis)
+            axis_name = _cpp_name(axis)
+            lines.append(
+                f"      tile_input_{input_index} = tile_input_{input_index}.narrow("
+                f"{dimension}, start_{axis_name}, extent_{axis_name});"
+            )
+        lines.append(f"      tile_input_{input_index} = tile_input_{input_index}.contiguous();")
+        input_arguments.append(f"tile_input_{input_index}")
+    for shape_index, shape in enumerate(owner_shapes):
+        condition = " && ".join(
+            f"extent_{_cpp_name(axis)} == {extent}"
+            for axis, extent in zip(owner_axes, shape, strict=True)
+        ) or "true"
+        keyword = "if" if shape_index == 0 else "else if"
+        lines.append(f"      {keyword} ({condition}) {{")
+        lines.append(
+            f"        auto local = {tile_functions[shape]}({', '.join(input_arguments)});"
+        )
+        result_nodes = [
+            *output_nodes,
+            *carrier_nodes,
+            *(node for _ in range(prefix_count) for node in carrier_nodes),
+        ]
+        result_variables = [
+            *(f"output_{index}" for index in range(len(output_nodes))),
+            *(f"carrier_{index}" for index in range(len(carrier_nodes))),
+            *(
+                f"prefix_{prefix}_{index}"
+                for prefix in range(prefix_count)
+                for index in range(len(carrier_nodes))
+            ),
+        ]
+        for result_index, (node, destination) in enumerate(
+            zip(result_nodes, result_variables, strict=True)
+        ):
+            lines.append(f"        auto destination_{result_index} = {destination};")
+            for axis in owner_axes:
+                if axis not in node.axes:
+                    continue
+                dimension = node.axes.index(axis)
+                axis_name = _cpp_name(axis)
+                lines.append(
+                    f"        destination_{result_index} = destination_{result_index}.narrow("
+                    f"{dimension}, start_{axis_name}, extent_{axis_name});"
+                )
+            lines.append(
+                f"        destination_{result_index}.copy_(local[{result_index}]);"
+            )
+        lines.append("      }")
+    lines.extend(
+        (
+            '      else { TORCH_CHECK(false, "missing scheduled owner-tile variant"); }',
+            "    }",
+            "  });",
+            "  std::vector<torch::Tensor> result;",
+        )
+    )
+    for index in range(len(output_nodes)):
+        lines.append(f"  result.push_back(output_{index});")
+    for index in range(len(carrier_nodes)):
+        lines.append(f"  result.push_back(carrier_{index});")
+    for prefix in range(prefix_count):
+        for index in range(len(carrier_nodes)):
+            lines.append(f"  result.push_back(prefix_{prefix}_{index});")
+    lines.extend(("  return result;", "}"))
+    return functions, "\n".join(lines)
+
+
 def emit_cpp_source(
     problem: FoldProgram,
     sizes: dict[str, int],
     *,
     backward: bool,
-    parallel_map_fold: bool = True,
     scheduled_backward: ScheduledBackwardProgram | None = None,
+    scheduled_forward: CpuScheduledPlan | None = None,
+    forward_extents: tuple[int, ...] = (),
 ) -> str:
     """Emit one extension containing the independently callable plan regions."""
     regions = {
@@ -712,7 +1239,6 @@ def emit_cpp_source(
             nested_names[id(program)],
             program_to_region(program),
             sizes,
-            parallel_map_fold=False,
             nested_names=nested_names,
         )
         for program in nested_programs
@@ -723,13 +1249,21 @@ def emit_cpp_source(
                 name,
                 region,
                 sizes,
-                parallel_map_fold=parallel_map_fold,
                 nested_names=nested_names,
             )
             for name, region in regions.items()
         )
     ]
     scheduled_functions: list[str] = []
+    if scheduled_forward is not None:
+        variants, kernel = _emit_scheduled_forward(
+            problem,
+            scheduled_forward,
+            sizes,
+            forward_extents,
+            nested_names=nested_names,
+        )
+        scheduled_functions.extend((*variants, kernel))
     if scheduled_backward is not None:
         variants, kernel = _emit_scheduled_backward(
             problem,
@@ -737,7 +1271,7 @@ def emit_cpp_source(
             sizes,
             nested_names=nested_names,
         )
-        scheduled_functions = [*variants, kernel]
+        scheduled_functions.extend((*variants, kernel))
     functions = "\n\n".join(
         [
             *nested_functions,
@@ -753,6 +1287,11 @@ def emit_cpp_source(
     if scheduled_backward is not None:
         bindings += (
             '\n  m.def("scheduled_backward", &scheduled_backward, '
+            "py::call_guard<py::gil_scoped_release>());"
+        )
+    if scheduled_forward is not None:
+        bindings += (
+            '\n  m.def("scheduled_forward", &scheduled_forward, '
             "py::call_guard<py::gil_scoped_release>());"
         )
     atomic_helper = ""
@@ -783,6 +1322,7 @@ void atomic_add_relaxed(torch::Tensor destination, torch::Tensor source) {
 #include <algorithm>
 #include <atomic>
 #include <cmath>
+#include <functional>
 #include <limits>
 #include <vector>
 {atomic_helper}
@@ -870,6 +1410,27 @@ class CompiledCpuFold:
 
     def forward_values(self, *inputs) -> tuple[tuple[Any, ...], dict[str, Any]]:
         values = self._validate_inputs(inputs)
+        if hasattr(self.module, "scheduled_forward"):
+            flat = list(self.module.scheduled_forward(*inputs))
+            output_count = len(self.problem.project_output.results)
+            carrier_count = len(self.problem.map_fold.results)
+            outputs = tuple(flat[:output_count])
+            carrier_values = flat[output_count : output_count + carrier_count]
+            execution = _bind_results(self.problem.map_fold, carrier_values)
+            saved = dict(execution)
+            prefix_values = flat[output_count + carrier_count :]
+            if len(prefix_values) % carrier_count:
+                raise ValueError("scheduled forward returned malformed prefixes")
+            for index in range(len(prefix_values) // carrier_count):
+                offset = index * carrier_count
+                for (name, _), value in zip(
+                    self.problem.map_fold.results,
+                    prefix_values[offset : offset + carrier_count],
+                    strict=True,
+                ):
+                    suffix = name.removeprefix("execution.")
+                    saved[f"prefix_execution.{index}.{suffix}"] = value
+            return outputs, saved
         fold_axis = self.problem.spec.fold_axes[0]
         fold_extent = dict(self.scheduled.sizes)[fold_axis]
         forward = self.scheduled.forward
@@ -1114,15 +1675,26 @@ class CompiledCpuFold:
             gradients = self._independent_backward(inputs, values)
         else:
             gradients = self._prefix_backward(inputs, execution, values)
-        return tuple(
-            gradients.get(f"partial_grad_input.{name}") if spec.differentiable else None
-            for name, spec in self.problem.spec.inputs.items()
-        )
+        result_nodes = dict(backward_region.results)
+        input_gradients = []
+        for name, spec in self.problem.spec.inputs.items():
+            result_name = f"partial_grad_input.{name}"
+            value = gradients.get(result_name) if spec.differentiable else None
+            if value is not None:
+                axes = backward_region.nodes[result_nodes[result_name]].axes
+                if axes != spec.axes:
+                    value = value.permute(tuple(axes.index(axis) for axis in spec.axes))
+            input_gradients.append(value)
+        return tuple(input_gradients)
 
     def _merge_input_gradients(self, results: list[dict[str, Any]]) -> dict[str, Any]:
         import torch
 
         fold_axis = self.problem.spec.fold_axes[0]
+        region = self.problem.map_finalize_map_vjp
+        if region is None:
+            raise ValueError("independent backward region is unavailable")
+        result_nodes = dict(region.results)
         gradients = {}
         for name, spec in self.problem.spec.inputs.items():
             key = f"partial_grad_input.{name}"
@@ -1130,7 +1702,8 @@ class CompiledCpuFold:
             if not parts:
                 continue
             if fold_axis in spec.axes:
-                gradients[key] = torch.cat(parts, dim=spec.axes.index(fold_axis))
+                axes = region.nodes[result_nodes[key]].axes
+                gradients[key] = torch.cat(parts, dim=axes.index(fold_axis))
             else:
                 value = parts[0]
                 for part in parts[1:]:
@@ -1264,7 +1837,8 @@ class CompiledCpuFold:
         for name, parts in fold_gradients.items():
             if not parts:
                 continue
-            dimension = self.problem.spec.inputs[name].axes.index(fold_axis)
+            result_name = f"partial_grad_input.{name}"
+            dimension = region.nodes[dict(region.results)[result_name]].axes.index(fold_axis)
             gradients[f"partial_grad_input.{name}"] = torch.cat(parts, dim=dimension)
         return gradients
 
@@ -1385,9 +1959,19 @@ def compile_cpu(
             configured_chunks = (
                 backward_schedule.chunk_sizes if backward_schedule is not None else ()
             )
+            configured_scratch = (
+                backward_schedule.scratch_bytes_per_worker
+                if backward_schedule is not None
+                else None
+            )
+            configured_stages = (
+                backward_schedule.stages if backward_schedule is not None else ()
+            )
             backward_schedule = CpuScheduleConfig(
                 chunk_sizes=configured_chunks,
                 partition_count=forward_partition_count,
+                scratch_bytes_per_worker=configured_scratch,
+                stages=configured_stages,
             )
         backward_scheduled = schedule_cpu(
             problem,
@@ -1403,15 +1987,57 @@ def compile_cpu(
             forward_scheduled.forward,
             backward_scheduled.backward,
         )
+    if backward and backward_program is None and not problem.requires_prefix:
+        if len(problem.spec.fold_axes) != 1:
+            raise NotImplementedError(
+                "automatic fused CPU backward currently requires one fold axis"
+            )
+        automatic_config = backward_schedule or CpuScheduleConfig()
+        loop_axis = problem.spec.fold_axes[0]
+        program_axes = problem.spec.batch_axes
+        explicit_tiles = dict(automatic_config.chunk_sizes)
+        partition_counts = {axis: 1 for axis in program_axes}
+        while (
+            math.prod(partition_counts.values()) < scheduled.target.worker_count
+            and program_axes
+        ):
+            axis = max(
+                program_axes,
+                key=lambda candidate: sizes[candidate]
+                / partition_counts[candidate],
+            )
+            if partition_counts[axis] >= sizes[axis]:
+                break
+            partition_counts[axis] = min(
+                sizes[axis], partition_counts[axis] * 2
+            )
+        tiles = {
+            axis: min(
+                sizes[axis],
+                explicit_tiles.get(
+                    axis,
+                    math.ceil(sizes[axis] / partition_counts[axis]),
+                ),
+            )
+            for axis in program_axes
+        }
+        tiles[loop_axis] = automatic_config.chunk_size(
+            loop_axis, sizes[loop_axis]
+        )
+        backward_program = schedule_backward_program(
+            problem,
+            sizes,
+            loop_axis=loop_axis,
+            program_axes=program_axes,
+            tiles=tiles,
+        )
     fold_axis = problem.spec.fold_axes[0]
     full_extent = sizes[fold_axis]
 
     def required_extents(
         expression: CpuExpr,
         extent: int,
-        *,
-        parallel_active: bool = False,
-    ) -> tuple[set[int], set[int]]:
+    ) -> set[int]:
         if isinstance(expression, CpuLeaf):
             requires_specialized_module = isinstance(
                 expression.expression, MapFoldRegion
@@ -1419,37 +2045,21 @@ def compile_cpu(
                 isinstance(expression.expression, RegionCall)
                 and expression.expression.region.startswith("map_finalize")
             )
-            extents = {extent} if requires_specialized_module else set()
-            return extents, extents if parallel_active else set()
+            return {extent} if requires_specialized_module else set()
         if not isinstance(expression, CpuLoop):
-            return set(), set()
+            return set()
         result: set[int] = set()
-        parallel_result: set[int] = set()
-        nested_parallel = (
-            parallel_active or expression.iteration.loop.value == "parallel"
-        )
         offset = 0
         while offset < extent:
             local = min(expression.iteration.grain, extent - offset)
-            child, child_parallel = required_extents(
-                expression.body,
-                local,
-                parallel_active=nested_parallel,
-            )
-            result.update(child)
-            parallel_result.update(child_parallel)
+            result.update(required_extents(expression.body, local))
             offset += local
-        return result, parallel_result
+        return result
 
     extents = {full_extent}
-    parallel_extents: set[int] = set()
     for stage in (*scheduled.forward, *scheduled.backward):
         for binding in stage.bindings:
-            required, parallel_required = required_extents(
-                binding.expression, full_extent
-            )
-            extents.update(required)
-            parallel_extents.update(parallel_required)
+            extents.update(required_extents(binding.expression, full_extent))
     modules = {}
     compile_start = time.perf_counter()
     for extent in sorted(extents):
@@ -1459,8 +2069,9 @@ def compile_cpu(
             problem,
             local_sizes,
             backward=backward,
-            parallel_map_fold=extent not in parallel_extents,
             scheduled_backward=(backward_program if extent == full_extent else None),
+            scheduled_forward=(scheduled if extent == full_extent else None),
+            forward_extents=(tuple(sorted(extents)) if extent == full_extent else ()),
         )
         key = json.dumps(
             {

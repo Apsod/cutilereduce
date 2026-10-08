@@ -5,6 +5,7 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 
 from .ir import ContractionAxes, TensorBuilder, TensorValue
+from .ops import ELEMENTWISE_OPS, FLOAT_DTYPES
 
 
 def _sum_to(
@@ -64,6 +65,8 @@ def vjp(
         primal_ids.add(node_id)
         if node_id in stop_ids:
             continue
+        if ctx.nodes[node_id].op == "stop_gradient":
+            continue
         pending.extend(ctx.nodes[node_id].inputs)
 
     gradients: dict[int, TensorValue] = {}
@@ -77,10 +80,18 @@ def vjp(
         if node_id in stop_ids:
             continue
         node = ctx.nodes[node_id]
+        if node.dtype not in FLOAT_DTYPES:
+            continue
         inputs = tuple(TensorValue(ctx, value) for value in node.inputs)
+        contract = ELEMENTWISE_OPS.get(node.op)
+        if contract is not None and contract.differentiation == "none":
+            continue
 
         def add_input(index: int, value: TensorValue) -> None:
             operand = inputs[index]
+            if operand.dtype not in FLOAT_DTYPES:
+                return
+            value = ctx.cast(value, operand.dtype)
             _accumulate(gradients, operand.id, _sum_to(ctx, value, operand.axes))
 
         match node.op:
@@ -105,8 +116,48 @@ def vjp(
                 add_input(0, cotangent * TensorValue(ctx, node_id))
             case "log":
                 add_input(0, cotangent / inputs[0])
+            case "powi":
+                exponent = node.attribute("exponent")
+                if exponent != 0:
+                    add_input(0, cotangent * exponent * ctx.powi(inputs[0], exponent - 1))
+            case "sqrt":
+                add_input(0, cotangent / (2.0 * TensorValue(ctx, node_id)))
+            case "rsqrt":
+                add_input(0, -0.5 * cotangent * ctx.powi(TensorValue(ctx, node_id), 3))
+            case "sin":
+                add_input(0, cotangent * ctx.cos(inputs[0]))
+            case "cos":
+                add_input(0, -cotangent * ctx.sin(inputs[0]))
+            case "tanh":
+                add_input(0, cotangent * (1.0 - ctx.powi(TensorValue(ctx, node_id), 2)))
+            case "sigmoid":
+                output = TensorValue(ctx, node_id)
+                add_input(0, cotangent * output * (1.0 - output))
+            case "log1p":
+                add_input(0, cotangent / (1.0 + inputs[0]))
+            case "expm1":
+                add_input(0, cotangent * ctx.exp(inputs[0]))
+            case "abs":
+                zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
+                add_input(0, ctx.where(ctx.compare("gt", inputs[0], 0), cotangent,
+                    ctx.where(ctx.compare("lt", inputs[0], 0), -cotangent, zero)))
+            case "minimum" | "maximum":
+                zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
+                tie = ctx.compare("eq", inputs[0], inputs[1])
+                for index in (0, 1):
+                    wins = ctx.compare("lt" if node.op == "minimum" else "gt", inputs[index], inputs[1-index])
+                    add_input(index, ctx.where(tie, cotangent * 0.5, ctx.where(wins, cotangent, zero)))
+            case "clamp":
+                gradient = cotangent
+                zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
+                for bound, comparison in (("min", "ge"), ("max", "le")):
+                    value = node.attribute(bound)
+                    if value is not None:
+                        gradient = ctx.where(ctx.compare(comparison, inputs[0], value), gradient, zero)
+                add_input(0, gradient)
             case "cast":
-                add_input(0, ctx.cast(cotangent, inputs[0].dtype))
+                if node.dtype in FLOAT_DTYPES and inputs[0].dtype in FLOAT_DTYPES:
+                    add_input(0, ctx.cast(cotangent, inputs[0].dtype))
             case "where" | "mask_identity":
                 zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
                 add_input(1, ctx.where(inputs[0], cotangent, zero))
@@ -150,6 +201,8 @@ def vjp(
 
     result = {}
     for name, value in wrt.items():
+        if value.dtype not in FLOAT_DTYPES:
+            continue
         gradient = gradients.get(value.id)
         if gradient is not None:
             result[name] = gradient
