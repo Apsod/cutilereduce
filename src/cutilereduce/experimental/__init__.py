@@ -1,6 +1,6 @@
 """Experimental algebra-driven, target-independent fold compiler."""
 
-from .algebra import (
+from cutilereduce.experimental.algebra import (
     Add,
     AddMonoid,
     Affine,
@@ -31,7 +31,7 @@ from .algebra import (
     TensorField,
     TensorStructure,
 )
-from .fold import (
+from cutilereduce.experimental.compiler.fold import (
     FoldFactor,
     FoldSpec,
     MapFunction,
@@ -47,7 +47,7 @@ from .fold import (
     compile_map_finalize_vjp_region,
     compile_project_output_region,
 )
-from .ir import (
+from cutilereduce.experimental.ir.core import (
     ContractionAxes,
     TensorBuilder,
     TensorNode,
@@ -57,13 +57,13 @@ from .ir import (
     TensorSignature,
     TensorValue,
 )
-from .lowering import lower_fold, lower_fold_accumulate, lower_scan
-from .operator import (
+from cutilereduce.experimental.algebra.lowering import lower_fold, lower_fold_accumulate, lower_scan
+from cutilereduce.experimental.compiler.operator import (
     FoldMaps,
     FoldOperator,
     FoldProgram,
 )
-from .passes import (
+from cutilereduce.experimental.ir.passes import (
     AxisAffineIndex,
     TileMaskComparison,
     canonicalize_contractions,
@@ -74,7 +74,7 @@ from .passes import (
     plan_materializations,
     simplify_constants,
 )
-from .planning import (
+from cutilereduce.experimental.planning.templates import (
     ArtifactKind,
     BackwardScheduleTemplate,
     BackwardRequirements,
@@ -97,7 +97,7 @@ from .planning import (
     build_schedule_space,
     format_plan,
 )
-from .cpu import (
+from cutilereduce.experimental.backends.cpu.schedule import (
     CpuLoopKind,
     CpuScheduleConfig,
     CpuStageConfig,
@@ -107,15 +107,16 @@ from .cpu import (
     format_cpu_schedule,
     schedule_cpu,
 )
-from .cpu_codegen import CompiledCpuFold, compile_cpu, emit_cpp_source
-from .cpu_cost import (
+from cutilereduce.experimental.backends.cpu.runtime import CompiledCpuFold, compile_cpu
+from cutilereduce.experimental.backends.cpu.codegen import emit_cpp_source
+from cutilereduce.experimental.backends.cpu.cost import (
     CpuPlanChoice,
     CpuPlanCost,
     estimate_cpu_plan,
     estimate_region_work,
     select_cpu_plan,
 )
-from .cpu_benchmark import (
+from cutilereduce.experimental.backends.cpu.benchmark import (
     CpuBenchmarkResult,
     CpuRssMeasurement,
     CpuTrainingBenchmarkResult,
@@ -125,7 +126,7 @@ from .cpu_benchmark import (
     measure_cpu_peak_rss,
     scheduled_memory_metrics,
 )
-from .scheduled import (
+from cutilereduce.experimental.planning.scheduled import (
     Accumulate,
     AtomicAdd,
     CallRegion,
@@ -146,7 +147,7 @@ from .scheduled import (
     resolve_writes,
     schedule_backward_program,
 )
-from .scheduled_ssa import (
+from cutilereduce.experimental.planning.ssa import (
     AxisPartition,
     LoopCarry,
     ScheduledLoop,
@@ -163,7 +164,7 @@ from .scheduled_ssa import (
     lower_backward_stage,
     scheduled_to_ssa,
 )
-from .algebra_graph import (
+from cutilereduce.experimental.compiler.algebra_graph import (
     AlgebraComponent,
     AlgebraicComponentGraph,
     ComponentPath,
@@ -175,15 +176,17 @@ from .algebra_graph import (
     format_algebraic_graph,
     split_algebraic_graph,
 )
-from .tiled import (
+from cutilereduce.experimental.backends.reference import (
     execute_tiled_backward_cpu,
     execute_tiled_fold_cpu,
-    format_tiled_fold,
+)
+from cutilereduce.experimental.planning.tiled import format_tiled_fold
+from cutilereduce.experimental.backends.cutile.schedule import (
     specialize_cutile_schedule,
     specialize_cutile_backward_schedule,
 )
-from .cutile_codegen import emit_cutile_backward_source, emit_cutile_source
-from .target import TargetModel
+from cutilereduce.experimental.backends.cutile.codegen import emit_cutile_backward_source, emit_cutile_source
+from cutilereduce.experimental.planning.target import TargetModel
 
 __all__ = [
     "AxisAffineIndex",

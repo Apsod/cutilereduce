@@ -21,9 +21,9 @@ from cutilereduce.experimental import (
     emit_cpp_source,
     schedule_cpu,
 )
-from cutilereduce.experimental.cpu_codegen import _emit_region
-from cutilereduce.experimental.ir import TensorBuilder
-from cutilereduce.experimental.passes import program_to_region
+from cutilereduce.experimental.backends.cpu.regions import _emit_region
+from cutilereduce.experimental.ir.core import TensorBuilder
+from cutilereduce.experimental.ir.passes import program_to_region
 
 
 @pytest.mark.parametrize("plan_index", [0, 1, 2])

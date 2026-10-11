@@ -4,9 +4,9 @@ import pytest
 import torch
 
 from cutilereduce.experimental import TensorRegionBuilder, TensorSignature
-from cutilereduce.experimental.autodiff import vjp
-from cutilereduce.experimental.cutile_codegen import _emit_region
-from cutilereduce.experimental.tiled import _execute_region
+from cutilereduce.experimental.ir.autodiff import vjp
+from cutilereduce.experimental.backends.cutile.regions import _emit_region
+from cutilereduce.experimental.backends.reference import _execute_region
 
 
 @pytest.mark.parametrize(
@@ -64,7 +64,7 @@ def test_integer_power(exponent):
 
 
 def test_stop_gradient_is_branch_local_and_survives_optimization():
-    from cutilereduce.experimental.passes import program_to_region
+    from cutilereduce.experimental.ir.passes import program_to_region
     from cutilereduce.experimental import TensorBuilder
 
     ctx = TensorBuilder(("d",))
@@ -142,7 +142,7 @@ def test_validation_and_stable_backend_limit():
 def test_native_elementwise_region():
     import hashlib
     from torch.utils.cpp_extension import load_inline
-    from cutilereduce.experimental.cpu_codegen import _emit_region as emit_cpp
+    from cutilereduce.experimental.backends.cpu.regions import _emit_region as emit_cpp
 
     ctx = TensorRegionBuilder(("d",))
     x = ctx.expect("x", TensorSignature(("d",), "float64"))
@@ -273,7 +273,7 @@ def test_discrete_cast_cuts_gradient():
 
 def test_unary_reorders_noncanonical_axes():
     from cutilereduce.experimental import TensorBuilder
-    from cutilereduce.experimental.passes import program_to_region
+    from cutilereduce.experimental.ir.passes import program_to_region
 
     ctx = TensorBuilder(("b", "d"))
     x = ctx.input("x", ("d", "b"), "float32")

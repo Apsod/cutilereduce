@@ -6,6 +6,48 @@ tile callbacks. Its output is a target-independent tensor program: it makes
 contractions, reductions, surviving axes, dtypes, and materialization
 boundaries explicit before target-specific CPU or cuTile emission.
 
+## Package organization and dependencies
+
+The implementation is organized by responsibility:
+
+```text
+experimental/
+  ir/                 Tensor SSA, operation contracts, map VJPs, rewrite passes
+  algebra/            Monoid/FoldAlgebra definitions and fold/scan fallbacks
+  compiler/           FoldSpec, maps, operator regions, algebra component graphs
+  planning/           Schedule templates, write ownership, scheduled SSA, targets
+  backends/
+    reference.py      Deterministic tensor-region and tiled-schedule interpreter
+    cpu/
+      schedule.py     CPU schedule specialization and storage decisions
+      regions.py      Tensor-region → ATen C++ emission
+      codegen.py      Scheduled stages → C++ loops, buffers, and writes
+      runtime.py      Extension compilation, argument binding, autograd execution
+      cost.py         Analytical schedule costs and selection
+      benchmark.py    Timing and memory measurements
+    cutile/
+      schedule.py     CuTile schedule specialization
+      regions.py      Tensor-region → CuTile function emission
+      codegen.py      Scheduled stages → CuTile kernels
+```
+
+Dependencies point from backends to planning/compiler/algebra/IR, never from
+those layers to a backend. The tensor IR is independent of the fold algebra;
+algebras depend on the IR, compiler regions depend on both, and planning
+consumes the resulting operator program. Monoid fold/scan fallbacks belong to
+`algebra.lowering`, not to a target backend. The reference interpreter consumes
+scheduled SSA without owning CuTile specialization.
+
+Backend region emitters interpret tensor operations; scheduled emitters own
+loops, loads, stores, and gradient commits. CPU runtime execution is separate
+from source generation. CuTile currently provides specialization and source
+generation, not an end-to-end launch runtime.
+
+The existing public imports from `cutilereduce.experimental` remain available.
+Backend entry points are also available from `experimental.backends.cpu` and
+`experimental.backends.cutile`. Internal imports should use the canonical
+subpackages above; the former flat implementation module paths are removed.
+
 The experiment separates three concerns:
 
 - `FoldSpec` describes input tensors, identifies the axes that the algebra must

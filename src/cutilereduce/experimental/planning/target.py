@@ -35,7 +35,9 @@ class TargetModel:
     def supports_schedule(self, name: str) -> bool:
         return not self.supported_schedules or name in self.supported_schedules
 
-    def estimate(self, program: object, schedule: object, shape: dict[str, int]) -> float | None:
+    def estimate(
+        self, program: object, schedule: object, shape: dict[str, int]
+    ) -> float | None:
         if self.cost_hook is None:
             return None
         return float(self.cost_hook(program, schedule, shape))

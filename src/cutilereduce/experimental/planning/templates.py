@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 
-from .operator import FoldProgram
+from cutilereduce.experimental.compiler.operator import FoldProgram
 
 
 class FoldTopology(Enum):
@@ -204,7 +204,8 @@ class ScheduleSpace:
         return _compose_training_schedule(forward, backward)
 
     def analyze_shape(
-        self, schedule: ForwardScheduleTemplate | BackwardScheduleTemplate,
+        self,
+        schedule: ForwardScheduleTemplate | BackwardScheduleTemplate,
         shape: dict[str, int],
     ) -> dict[str, range]:
         """Return shape-bounded symbolic parameter domains, without a target."""
@@ -214,19 +215,24 @@ class ScheduleSpace:
         if set(shape) != expected or any(
             type(extent) is not int or extent <= 0 for extent in shape.values()
         ):
-            raise ValueError("shape must define every logical axis with a positive extent")
-        return {parameter.name: parameter.domain(shape) for parameter in schedule.parameters}
+            raise ValueError(
+                "shape must define every logical axis with a positive extent"
+            )
+        return {
+            parameter.name: parameter.domain(shape) for parameter in schedule.parameters
+        }
 
-    def select_forward(
-        self, shape: dict[str, int], target
-    ) -> ForwardScheduleTemplate:
+    def select_forward(self, shape: dict[str, int], target) -> ForwardScheduleTemplate:
         """Select a legal template using a target cost hook when supplied."""
         candidates = tuple(
-            schedule for schedule in self.forward
+            schedule
+            for schedule in self.forward
             if target.supports_schedule(schedule.name)
         )
         if not candidates:
-            raise NotImplementedError(f"target {target.name!r} supports no forward schedule")
+            raise NotImplementedError(
+                f"target {target.name!r} supports no forward schedule"
+            )
         for schedule in candidates:
             self.analyze_shape(schedule, shape)
         if target.cost_hook is None:
@@ -241,11 +247,14 @@ class ScheduleSpace:
     ) -> BackwardScheduleTemplate:
         """Select a backward template independently of the forward topology."""
         candidates = tuple(
-            schedule for schedule in self.backward
+            schedule
+            for schedule in self.backward
             if target.supports_schedule(schedule.name)
         )
         if not candidates:
-            raise NotImplementedError(f"target {target.name!r} supports no backward schedule")
+            raise NotImplementedError(
+                f"target {target.name!r} supports no backward schedule"
+            )
         for schedule in candidates:
             self.analyze_shape(schedule, shape)
         if target.cost_hook is None:
@@ -261,15 +270,23 @@ def _parameters_for(stages: tuple[PlanStage, ...]) -> tuple[ScheduleParameter, .
     for stage in stages:
         for binding in stage.bindings:
             for node in _walk(binding.expression):
-                if not isinstance(node, (ParallelMap, CarrierFold, CarrierScan, GradientFold)):
+                if not isinstance(
+                    node, (ParallelMap, CarrierFold, CarrierScan, GradientFold)
+                ):
                     continue
-                kind = "partition_count" if node.iteration.kind == "partitions" else "chunk_size"
+                kind = (
+                    "partition_count"
+                    if node.iteration.kind == "partitions"
+                    else "chunk_size"
+                )
                 parameter = ScheduleParameter(
                     node.iteration.parameter, node.iteration.axis, kind
                 )
                 previous = found.setdefault(parameter.name, parameter)
                 if previous != parameter:
-                    raise ValueError(f"inconsistent schedule parameter {parameter.name!r}")
+                    raise ValueError(
+                        f"inconsistent schedule parameter {parameter.name!r}"
+                    )
     return tuple(found.values())
 
 
@@ -288,9 +305,7 @@ def _walk(expression: PlanExpr):
 
 
 def _references(expression: PlanExpr) -> tuple[str, ...]:
-    return tuple(
-        node.name for node in _walk(expression) if isinstance(node, Reference)
-    )
+    return tuple(node.name for node in _walk(expression) if isinstance(node, Reference))
 
 
 def _validate_expr(problem: FoldProgram, expression: PlanExpr) -> None:
@@ -309,9 +324,7 @@ def _validate_expr(problem: FoldProgram, expression: PlanExpr) -> None:
                 raise ValueError(f"unknown planning region: {node.region!r}")
 
 
-def validate_forward_plan(
-    problem: FoldProgram, plan: ForwardScheduleTemplate
-) -> None:
+def validate_forward_plan(problem: FoldProgram, plan: ForwardScheduleTemplate) -> None:
     available = set(problem.spec.inputs)
     for stage in plan.stages:
         stage_names: set[str] = set()
@@ -324,12 +337,11 @@ def validate_forward_plan(
                     f"{sorted(missing)}"
                 )
             stage_names.add(binding.name)
-        available.update(
-            binding.name for binding in stage.bindings if binding.persist
-        )
+        available.update(binding.name for binding in stage.bindings if binding.persist)
     if not any(
         binding.artifact is ArtifactKind.GLOBAL_EXECUTION
-        for stage in plan.stages for binding in stage.bindings
+        for stage in plan.stages
+        for binding in stage.bindings
     ):
         raise ValueError("forward plan does not produce global execution state")
 
@@ -369,7 +381,9 @@ def _output_stage(global_name: str = "global_execution") -> PlanStage:
     )
 
 
-def _generate_forward_schedules(problem: FoldProgram) -> tuple[ForwardScheduleTemplate, ...]:
+def _generate_forward_schedules(
+    problem: FoldProgram,
+) -> tuple[ForwardScheduleTemplate, ...]:
     """Construct the initial recursive, hardware-independent forward plans."""
     partition, chunk = _fold_iterations(problem)
     online = ForwardScheduleTemplate(
@@ -380,9 +394,7 @@ def _generate_forward_schedules(problem: FoldProgram) -> tuple[ForwardScheduleTe
                 (
                     PlanBinding(
                         "global_execution",
-                        CarrierFold(
-                            chunk, MapFoldRegion(), FoldTopology.ONLINE
-                        ),
+                        CarrierFold(chunk, MapFoldRegion(), FoldTopology.ONLINE),
                         persist=True,
                         artifact=ArtifactKind.GLOBAL_EXECUTION,
                     ),
@@ -461,9 +473,7 @@ def _generate_forward_schedules(problem: FoldProgram) -> tuple[ForwardScheduleTe
                     (
                         PlanBinding(
                             "prefix_execution",
-                            CarrierScan(
-                                partition, Reference("partial_execution")
-                            ),
+                            CarrierScan(partition, Reference("partial_execution")),
                             persist=True,
                             artifact=ArtifactKind.PREFIX_EXECUTION,
                         ),
@@ -491,7 +501,9 @@ def _generate_forward_schedules(problem: FoldProgram) -> tuple[ForwardScheduleTe
     return plans
 
 
-def _generate_backward_schedules(problem: FoldProgram) -> tuple[BackwardScheduleTemplate, ...]:
+def _generate_backward_schedules(
+    problem: FoldProgram,
+) -> tuple[BackwardScheduleTemplate, ...]:
     """Construct backward topology independently of any forward topology."""
     if problem.embed_output_vjp is None:
         return ()
@@ -563,7 +575,8 @@ def _compose_training_schedule(
     """Match backward requirements against artifacts persisted by forward."""
     artifacts = {
         binding.artifact
-        for stage in forward.stages for binding in stage.bindings
+        for stage in forward.stages
+        for binding in stage.bindings
         if binding.artifact is not None
     }
     required = {ArtifactKind.GLOBAL_EXECUTION}
@@ -579,13 +592,21 @@ def _compose_training_schedule(
     return TrainingScheduleTemplate(forward, backward, persistence)
 
 
-def format_plan(plan: ForwardScheduleTemplate | BackwardScheduleTemplate | TrainingScheduleTemplate) -> str:
+def format_plan(
+    plan: ForwardScheduleTemplate | BackwardScheduleTemplate | TrainingScheduleTemplate,
+) -> str:
     """Render the recursive topology without introducing hardware concepts."""
     if isinstance(plan, TrainingScheduleTemplate):
-        return "training {\n" + _indent(format_plan(plan.forward)) + "\n" + _indent(
-            format_plan(plan.backward)
-        ) + "\n}"
-    lines = [f"{'backward' if isinstance(plan, BackwardScheduleTemplate) else 'forward'} {plan.name} {{"]
+        return (
+            "training {\n"
+            + _indent(format_plan(plan.forward))
+            + "\n"
+            + _indent(format_plan(plan.backward))
+            + "\n}"
+        )
+    lines = [
+        f"{'backward' if isinstance(plan, BackwardScheduleTemplate) else 'forward'} {plan.name} {{"
+    ]
     for stage in plan.stages:
         lines.append(f"  stage {stage.name} {{")
         for binding in stage.bindings:
@@ -601,9 +622,7 @@ def _indent(value: str, amount: int = 2) -> str:
 
 
 def _format_binding(binding: PlanBinding, indent: int) -> list[str]:
-    suffix = (
-        f" persist[{binding.artifact.value}]" if binding.artifact else ""
-    )
+    suffix = f" persist[{binding.artifact.value}]" if binding.artifact else ""
     head = " " * indent + f"{binding.name} ={suffix}"
     return [head, *_format_expr(binding.expression, indent + 2)]
 
@@ -619,7 +638,9 @@ def _format_expr(expression: PlanExpr, indent: int) -> list[str]:
             return [f"{prefix}call map_fold(current_region)"]
         case ParallelMap(iteration=iteration, body=body):
             line = f"{prefix}parallel {iteration.index} in {iteration.kind}({iteration.axis}, {iteration.parameter})"
-        case CarrierFold(iteration=iteration, body=body, topology=topology, reorder=reorder):
+        case CarrierFold(
+            iteration=iteration, body=body, topology=topology, reorder=reorder
+        ):
             order = ", reorder" if reorder else ""
             line = f"{prefix}{topology.value}_fold {iteration.index} in {iteration.kind}({iteration.axis}, {iteration.parameter}){order}"
         case CarrierScan(iteration=iteration, body=body, exclusive=exclusive):
@@ -633,10 +654,28 @@ def _format_expr(expression: PlanExpr, indent: int) -> list[str]:
 
 
 __all__ = [
-    "ArtifactKind", "BackwardScheduleTemplate", "BackwardRequirements", "CarrierFold",
-    "CarrierScan", "FoldTopology", "ForwardScheduleTemplate", "GradientFold", "Iteration", "MapFoldRegion",
-    "ParallelMap", "PersistencePlan", "PlanBinding", "PlanExpr", "PlanStage",
-    "ScheduleParameter", "ScheduleSpace", "build_schedule_space",
-    "Reference", "RegionCall", "TrainingScheduleTemplate", "format_plan",
-    "validate_backward_plan", "validate_forward_plan",
+    "ArtifactKind",
+    "BackwardScheduleTemplate",
+    "BackwardRequirements",
+    "CarrierFold",
+    "CarrierScan",
+    "FoldTopology",
+    "ForwardScheduleTemplate",
+    "GradientFold",
+    "Iteration",
+    "MapFoldRegion",
+    "ParallelMap",
+    "PersistencePlan",
+    "PlanBinding",
+    "PlanExpr",
+    "PlanStage",
+    "ScheduleParameter",
+    "ScheduleSpace",
+    "build_schedule_space",
+    "Reference",
+    "RegionCall",
+    "TrainingScheduleTemplate",
+    "format_plan",
+    "validate_backward_plan",
+    "validate_forward_plan",
 ]

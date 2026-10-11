@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import cast
 
-from .algebra import (
+from cutilereduce.experimental.algebra import (
     AlgebraStructure,
     AlgebraValue,
     CompositeValue,
@@ -15,7 +15,7 @@ from .algebra import (
     TensorStructure,
     value_leaves,
 )
-from .fold import (
+from cutilereduce.experimental.compiler.fold import (
     FoldSpec,
     MapFunction,
     OutputFunction,
@@ -27,8 +27,12 @@ from .fold import (
     compile_map_finalize_vjp_region,
     compile_project_output_region,
 )
-from .ir import TensorRegion, TensorRegionBuilder, TensorSignature
-from .passes import program_to_region
+from cutilereduce.experimental.ir.core import (
+    TensorRegion,
+    TensorRegionBuilder,
+    TensorSignature,
+)
+from cutilereduce.experimental.ir.passes import program_to_region
 
 
 @dataclass(frozen=True)

@@ -8,8 +8,8 @@ from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 
-from .operator import FoldProgram
-from .planning import (
+from cutilereduce.experimental.compiler.operator import FoldProgram
+from cutilereduce.experimental.planning.templates import (
     BackwardScheduleTemplate,
     CarrierFold,
     CarrierScan,
@@ -86,15 +86,9 @@ class CpuTarget:
             worker_count=max(1, os.cpu_count() or 1),
             vector_bytes=vector_bytes,
             cache_line_bytes=64,
-            l1_data_bytes=_cache_size(
-                "/sys/devices/system/cpu/cpu0/cache/index0/size"
-            ),
-            l2_bytes=_cache_size(
-                "/sys/devices/system/cpu/cpu0/cache/index2/size"
-            ),
-            l3_bytes=_cache_size(
-                "/sys/devices/system/cpu/cpu0/cache/index3/size"
-            ),
+            l1_data_bytes=_cache_size("/sys/devices/system/cpu/cpu0/cache/index0/size"),
+            l2_bytes=_cache_size("/sys/devices/system/cpu/cpu0/cache/index2/size"),
+            l3_bytes=_cache_size("/sys/devices/system/cpu/cpu0/cache/index3/size"),
         )
 
 
@@ -193,7 +187,9 @@ class CpuStage:
 
 @dataclass(frozen=True)
 class CpuScheduledPlan:
-    source: ForwardScheduleTemplate | BackwardScheduleTemplate | TrainingScheduleTemplate
+    source: (
+        ForwardScheduleTemplate | BackwardScheduleTemplate | TrainingScheduleTemplate
+    )
     sizes: tuple[tuple[str, int], ...]
     target: CpuTarget
     forward: tuple[CpuStage, ...]
@@ -338,9 +334,7 @@ def _schedule_stages(
     result = []
     for stage in stages:
         stage_config = config.stage(stage.name)
-        configured_tiles = dict(
-            () if stage_config is None else stage_config.tile_sizes
-        )
+        configured_tiles = dict(() if stage_config is None else stage_config.tile_sizes)
         unknown = set(configured_tiles) - set(sizes)
         if unknown:
             raise ValueError(
@@ -375,11 +369,7 @@ def _schedule_stages(
         for binding in stage.bindings:
             if not isinstance(binding, PlanBinding):
                 raise TypeError("invalid plan binding")
-            storage = (
-                CpuStorage.MATERIALIZED
-                if binding.persist
-                else CpuStorage.PRIVATE
-            )
+            storage = CpuStorage.MATERIALIZED if binding.persist else CpuStorage.PRIVATE
             bindings.append(
                 CpuBinding(
                     binding.name,
@@ -421,11 +411,15 @@ def schedule_cpu(
         raise ValueError("all CPU extents must be positive integers")
     target = target or CpuTarget.detect()
     config = config or CpuScheduleConfig()
-    forward_plan = plan.forward if isinstance(plan, TrainingScheduleTemplate) else (
-        plan if isinstance(plan, ForwardScheduleTemplate) else None
+    forward_plan = (
+        plan.forward
+        if isinstance(plan, TrainingScheduleTemplate)
+        else (plan if isinstance(plan, ForwardScheduleTemplate) else None)
     )
-    backward_plan = plan.backward if isinstance(plan, TrainingScheduleTemplate) else (
-        plan if isinstance(plan, BackwardScheduleTemplate) else None
+    backward_plan = (
+        plan.backward
+        if isinstance(plan, TrainingScheduleTemplate)
+        else (plan if isinstance(plan, BackwardScheduleTemplate) else None)
     )
     available_stages = {
         stage.name
@@ -438,17 +432,25 @@ def schedule_cpu(
         raise ValueError(
             f"CPU configuration has unknown stages: {sorted(unknown_stages)}"
         )
-    forward = () if forward_plan is None else _schedule_stages(
-        forward_plan.stages,
-        sizes=sizes,
-        target=target,
-        config=config,
+    forward = (
+        ()
+        if forward_plan is None
+        else _schedule_stages(
+            forward_plan.stages,
+            sizes=sizes,
+            target=target,
+            config=config,
+        )
     )
-    backward = () if backward_plan is None else _schedule_stages(
-        backward_plan.stages,
-        sizes=sizes,
-        target=target,
-        config=config,
+    backward = (
+        ()
+        if backward_plan is None
+        else _schedule_stages(
+            backward_plan.stages,
+            sizes=sizes,
+            target=target,
+            config=config,
+        )
     )
     return CpuScheduledPlan(
         plan,
@@ -460,9 +462,7 @@ def schedule_cpu(
 
 
 def format_cpu_schedule(plan: CpuScheduledPlan) -> str:
-    lines = [
-        f"cpu[{plan.target.architecture}, workers={plan.target.worker_count}] {{"
-    ]
+    lines = [f"cpu[{plan.target.architecture}, workers={plan.target.worker_count}] {{"]
     for direction, stages in (("forward", plan.forward), ("backward", plan.backward)):
         if not stages:
             continue
@@ -470,13 +470,9 @@ def format_cpu_schedule(plan: CpuScheduledPlan) -> str:
         for stage in stages:
             lines.append(f"    stage {stage.name} {{")
             tiles = ", ".join(f"{axis}={tile}" for axis, tile in stage.tile_sizes)
-            lines.append(
-                f"      tiles[{tiles}] scratch<={stage.scratch_bytes} bytes"
-            )
+            lines.append(f"      tiles[{tiles}] scratch<={stage.scratch_bytes} bytes")
             for binding in stage.bindings:
-                lines.append(
-                    f"      {binding.name} storage={binding.storage.value}"
-                )
+                lines.append(f"      {binding.name} storage={binding.storage.value}")
                 lines.extend(_format_cpu_expr(binding.expression, 8))
             lines.append("    }")
         lines.append("  }")
@@ -500,8 +496,18 @@ def _format_cpu_expr(expression: CpuExpr, indent: int) -> list[str]:
 
 
 __all__ = [
-    "CpuBinding", "CpuExpr", "CpuIteration", "CpuLeaf", "CpuLoop",
-    "CpuLoopKind", "CpuScheduleConfig", "CpuScheduledPlan", "CpuStage",
+    "CpuBinding",
+    "CpuExpr",
+    "CpuIteration",
+    "CpuLeaf",
+    "CpuLoop",
+    "CpuLoopKind",
+    "CpuScheduleConfig",
+    "CpuScheduledPlan",
+    "CpuStage",
     "CpuStageConfig",
-    "CpuStorage", "CpuTarget", "format_cpu_schedule", "schedule_cpu",
+    "CpuStorage",
+    "CpuTarget",
+    "format_cpu_schedule",
+    "schedule_cpu",
 ]

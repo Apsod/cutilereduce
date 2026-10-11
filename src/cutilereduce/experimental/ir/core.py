@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from typing import Any
 import math
 
-from .ops import COMPARISONS, REDUCTIONS, SCANS, ELEMENTWISE_OPS, validate_elementwise
+from cutilereduce.experimental.ir.ops import (
+    COMPARISONS,
+    REDUCTIONS,
+    SCANS,
+    ELEMENTWISE_OPS,
+    validate_elementwise,
+)
 
 
 @dataclass(frozen=True)
@@ -62,7 +68,9 @@ class TensorProgram:
     @property
     def contractions(self) -> tuple[TensorNode, ...]:
         return tuple(
-            node for node in self.nodes if node.op in {"contract", "contract_accumulate"}
+            node
+            for node in self.nodes
+            if node.op in {"contract", "contract_accumulate"}
         )
 
     @property
@@ -224,13 +232,17 @@ class TensorValue:
         return self + other
 
     def __rsub__(self, other: int | float) -> TensorValue:
-        return self.builder.elementwise("subtract", self.builder._value(other, self.dtype), self)
+        return self.builder.elementwise(
+            "subtract", self.builder._value(other, self.dtype), self
+        )
 
     def __rmul__(self, other: int | float) -> TensorValue:
         return self * other
 
     def __rtruediv__(self, other: int | float) -> TensorValue:
-        return self.builder.elementwise("divide", self.builder._value(other, self.dtype), self)
+        return self.builder.elementwise(
+            "divide", self.builder._value(other, self.dtype), self
+        )
 
     def __pow__(self, exponent: int) -> TensorValue:
         return self.builder.powi(self, exponent)
@@ -268,7 +280,9 @@ class TensorValue:
         return self.builder.remainder(self.builder._value(other, self.dtype), self)
 
     def __bool__(self) -> bool:
-        raise TypeError("symbolic tensors have no Python truth value; use ctx.where and logical operations")
+        raise TypeError(
+            "symbolic tensors have no Python truth value; use ctx.where and logical operations"
+        )
 
 
 class TensorBuilder:
@@ -411,10 +425,19 @@ class TensorBuilder:
         validate_elementwise("powi", (value.dtype,))
         if type(exponent) is not int:
             raise ValueError("powi requires a Python integer exponent")
-        return self._add("powi", (value,), self._ordered(set(value.axes)), value.dtype, exponent=exponent)
+        return self._add(
+            "powi",
+            (value,),
+            self._ordered(set(value.axes)),
+            value.dtype,
+            exponent=exponent,
+        )
 
     def clamp(
-        self, value: TensorValue, *, min: int | float | None = None,
+        self,
+        value: TensorValue,
+        *,
+        min: int | float | None = None,
         max: int | float | None = None,
     ) -> TensorValue:
         self._value(value, value.dtype)
@@ -429,7 +452,14 @@ class TensorBuilder:
                     raise ValueError("integer clamp requires integer bounds")
         if min is not None and max is not None and min > max:
             raise ValueError("clamp minimum must not exceed maximum")
-        return self._add("clamp", (value,), self._ordered(set(value.axes)), value.dtype, min=min, max=max)
+        return self._add(
+            "clamp",
+            (value,),
+            self._ordered(set(value.axes)),
+            value.dtype,
+            min=min,
+            max=max,
+        )
 
     def logical_and(self, lhs: TensorValue, rhs: TensorValue | bool) -> TensorValue:
         return self.elementwise("logical_and", lhs, rhs)
@@ -449,7 +479,9 @@ class TensorBuilder:
     def softplus(self, value: TensorValue) -> TensorValue:
         return self.maximum(value, 0.0) + self.log1p(self.exp(-self.abs(value)))
 
-    def logaddexp(self, lhs: TensorValue, rhs: TensorValue | int | float) -> TensorValue:
+    def logaddexp(
+        self, lhs: TensorValue, rhs: TensorValue | int | float
+    ) -> TensorValue:
         right = self._value(rhs, lhs.dtype)
         equal = self.compare("equal", lhs, right)
         difference = self.where(equal, self.constant(0.0, lhs.dtype), lhs - right)
@@ -463,7 +495,9 @@ class TensorBuilder:
         self._value(lhs, lhs.dtype)
         right = self._value(rhs, lhs.dtype)
         if lhs.dtype != right.dtype:
-            raise ValueError("comparison operands require matching dtypes; use an explicit cast")
+            raise ValueError(
+                "comparison operands require matching dtypes; use an explicit cast"
+            )
         axes = self._ordered(set(lhs.axes) | set(right.axes))
         return self._add(f"compare_{op}", (lhs, right), axes, "bool")
 
@@ -476,7 +510,9 @@ class TensorBuilder:
         for value in (condition, when_true, when_false):
             self._value(value, value.dtype)
         if when_true.dtype != when_false.dtype:
-            raise ValueError("where branches require matching dtypes; use an explicit cast")
+            raise ValueError(
+                "where branches require matching dtypes; use an explicit cast"
+            )
         if condition.dtype != "bool":
             raise ValueError("where condition must have bool dtype")
         axes = self._ordered(

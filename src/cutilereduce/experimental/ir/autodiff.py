@@ -4,8 +4,12 @@ from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
 
-from .ir import ContractionAxes, TensorBuilder, TensorValue
-from .ops import ELEMENTWISE_OPS, FLOAT_DTYPES
+from cutilereduce.experimental.ir.core import (
+    ContractionAxes,
+    TensorBuilder,
+    TensorValue,
+)
+from cutilereduce.experimental.ir.ops import ELEMENTWISE_OPS, FLOAT_DTYPES
 
 
 def _sum_to(
@@ -119,7 +123,9 @@ def vjp(
             case "powi":
                 exponent = node.attribute("exponent")
                 if exponent != 0:
-                    add_input(0, cotangent * exponent * ctx.powi(inputs[0], exponent - 1))
+                    add_input(
+                        0, cotangent * exponent * ctx.powi(inputs[0], exponent - 1)
+                    )
             case "sqrt":
                 add_input(0, cotangent / (2.0 * TensorValue(ctx, node_id)))
             case "rsqrt":
@@ -139,21 +145,38 @@ def vjp(
                 add_input(0, cotangent * ctx.exp(inputs[0]))
             case "abs":
                 zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
-                add_input(0, ctx.where(ctx.compare("gt", inputs[0], 0), cotangent,
-                    ctx.where(ctx.compare("lt", inputs[0], 0), -cotangent, zero)))
+                add_input(
+                    0,
+                    ctx.where(
+                        ctx.compare("gt", inputs[0], 0),
+                        cotangent,
+                        ctx.where(ctx.compare("lt", inputs[0], 0), -cotangent, zero),
+                    ),
+                )
             case "minimum" | "maximum":
                 zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
                 tie = ctx.compare("eq", inputs[0], inputs[1])
                 for index in (0, 1):
-                    wins = ctx.compare("lt" if node.op == "minimum" else "gt", inputs[index], inputs[1-index])
-                    add_input(index, ctx.where(tie, cotangent * 0.5, ctx.where(wins, cotangent, zero)))
+                    wins = ctx.compare(
+                        "lt" if node.op == "minimum" else "gt",
+                        inputs[index],
+                        inputs[1 - index],
+                    )
+                    add_input(
+                        index,
+                        ctx.where(
+                            tie, cotangent * 0.5, ctx.where(wins, cotangent, zero)
+                        ),
+                    )
             case "clamp":
                 gradient = cotangent
                 zero = ctx.full(cotangent.axes, 0.0, cotangent.dtype)
                 for bound, comparison in (("min", "ge"), ("max", "le")):
                     value = node.attribute(bound)
                     if value is not None:
-                        gradient = ctx.where(ctx.compare(comparison, inputs[0], value), gradient, zero)
+                        gradient = ctx.where(
+                            ctx.compare(comparison, inputs[0], value), gradient, zero
+                        )
                 add_input(0, gradient)
             case "cast":
                 if node.dtype in FLOAT_DTYPES and inputs[0].dtype in FLOAT_DTYPES:

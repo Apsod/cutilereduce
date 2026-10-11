@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .cpu import (
+from cutilereduce.experimental.backends.cpu.schedule import (
     CpuExpr,
     CpuLeaf,
     CpuLoop,
@@ -15,10 +15,14 @@ from .cpu import (
     CpuTarget,
     schedule_cpu,
 )
-from .ir import ContractionAxes, TensorRegion
-from .operator import FoldProgram
-from .planning import MapFoldRegion, Reference, RegionCall
-from .planning import ForwardScheduleTemplate
+from cutilereduce.experimental.ir.core import ContractionAxes, TensorRegion
+from cutilereduce.experimental.compiler.operator import FoldProgram
+from cutilereduce.experimental.planning.templates import (
+    MapFoldRegion,
+    Reference,
+    RegionCall,
+)
+from cutilereduce.experimental.planning.templates import ForwardScheduleTemplate
 
 
 _DTYPE_BYTES = {
@@ -76,12 +80,28 @@ def estimate_region_work(region: TensorRegion, sizes: dict[str, int]) -> int:
         elif node.op.startswith("reduce_"):
             over = node.attribute("over")
             work += elements * _elements(over, sizes)
-        elif node.op in {"exp", "log", "log1p", "expm1", "sin", "cos", "tanh", "sigmoid", "sqrt", "rsqrt"}:
+        elif node.op in {
+            "exp",
+            "log",
+            "log1p",
+            "expm1",
+            "sin",
+            "cos",
+            "tanh",
+            "sigmoid",
+            "sqrt",
+            "rsqrt",
+        }:
             work += 4 * elements
         elif node.op == "powi":
-            from .ops import multiplication_chain
+            from cutilereduce.experimental.ir.ops import multiplication_chain
+
             exponent = node.attribute("exponent")
-            work += elements * (len(multiplication_chain(abs(exponent))) + (exponent < 0) if exponent else 0)
+            work += elements * (
+                len(multiplication_chain(abs(exponent))) + (exponent < 0)
+                if exponent
+                else 0
+            )
         else:
             work += elements
     return work
@@ -115,9 +135,7 @@ def _expr_cost(
     count = expression.iteration.count
     work *= count
     if expression.operation == "carrier_fold" and count > 1:
-        work += (count - 1) * estimate_region_work(
-            problem.execution_combine, sizes
-        )
+        work += (count - 1) * estimate_region_work(problem.execution_combine, sizes)
     if expression.iteration.loop is CpuLoopKind.PARALLEL:
         tasks *= count
     else:
@@ -135,9 +153,7 @@ def _result_bytes(
     )
 
 
-def estimate_cpu_plan(
-    problem: FoldProgram, scheduled: CpuScheduledPlan
-) -> CpuPlanCost:
+def estimate_cpu_plan(problem: FoldProgram, scheduled: CpuScheduledPlan) -> CpuPlanCost:
     sizes = dict(scheduled.sizes)
     operations = 0
     materialized = 0
@@ -153,7 +169,11 @@ def estimate_cpu_plan(
             serial += local_serial
             if binding.storage.value != "materialized":
                 continue
-            if binding.name in {"global_execution", "partial_execution", "prefix_execution"}:
+            if binding.name in {
+                "global_execution",
+                "partial_execution",
+                "prefix_execution",
+            }:
                 multiplicity = 1
                 if binding.name != "global_execution" and isinstance(
                     binding.expression, CpuLoop
@@ -182,9 +202,7 @@ def select_cpu_plan(
     target = target or CpuTarget.detect()
     axis = problem.spec.fold_axes[0]
     extent = sizes[axis]
-    chunks = tuple(
-        sorted({extent, min(extent, 128), min(extent, 64), min(extent, 32)})
-    )
+    chunks = tuple(sorted({extent, min(extent, 128), min(extent, 64), min(extent, 32)}))
     choices = []
     for plan in plans:
         partition_counts = (
@@ -213,6 +231,9 @@ def select_cpu_plan(
 
 
 __all__ = [
-    "CpuPlanChoice", "CpuPlanCost", "estimate_cpu_plan",
-    "estimate_region_work", "select_cpu_plan",
+    "CpuPlanChoice",
+    "CpuPlanCost",
+    "estimate_cpu_plan",
+    "estimate_region_work",
+    "select_cpu_plan",
 ]

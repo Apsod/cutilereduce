@@ -6,7 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import cast
 
-from .algebra import (
+from cutilereduce.experimental.algebra import (
     AlgebraStructure,
     AlgebraValue,
     CompositeStructure,
@@ -17,10 +17,14 @@ from .algebra import (
     TensorStructure,
     value_leaves,
 )
-from .autodiff import vjp
-from .ir import TensorBuilder, TensorProgram, TensorValue
-from .lowering import lower_fold, lower_fold_accumulate, lower_scan
-from .passes import optimize_program
+from cutilereduce.experimental.ir.autodiff import vjp
+from cutilereduce.experimental.ir.core import TensorBuilder, TensorProgram, TensorValue
+from cutilereduce.experimental.algebra.lowering import (
+    lower_fold,
+    lower_fold_accumulate,
+    lower_scan,
+)
+from cutilereduce.experimental.ir.passes import optimize_program
 
 
 @dataclass(frozen=True)
@@ -185,10 +189,7 @@ def _zero_like_value(ctx: TensorBuilder, value: AlgebraValue) -> AlgebraValue:
             }
         )
     return CompositeValue(
-        {
-            name: _zero_like_value(ctx, item)
-            for name, item in value.components.items()
-        }
+        {name: _zero_like_value(ctx, item) for name, item in value.components.items()}
     )
 
 

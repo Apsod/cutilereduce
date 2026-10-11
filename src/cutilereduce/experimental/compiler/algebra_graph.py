@@ -6,10 +6,19 @@ from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any
 
-from .algebra import FoldAlgebra, ProductAlgebra, SemidirectProductAlgebra, value_leaves
-from .ir import TensorRegion, TensorRegionBuilder, TensorSignature
-from .fold import FoldFactor
-from .operator import FoldOperator
+from cutilereduce.experimental.algebra import (
+    FoldAlgebra,
+    ProductAlgebra,
+    SemidirectProductAlgebra,
+    value_leaves,
+)
+from cutilereduce.experimental.ir.core import (
+    TensorRegion,
+    TensorRegionBuilder,
+    TensorSignature,
+)
+from cutilereduce.experimental.compiler.fold import FoldFactor
+from cutilereduce.experimental.compiler.operator import FoldOperator
 
 
 type ComponentPath = tuple[str, ...]

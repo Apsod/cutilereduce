@@ -71,7 +71,7 @@ class AffineLWSMonoid(SemidirectProductMonoid):
         *,
         fold_axes: tuple[str, ...],
     ) -> CompositeValue:
-        from ..lowering import lower_fold
+        from .lowering import lower_fold
 
         self.validate(values, label="affine-LWS values")
         if len(fold_axes) != 1:
@@ -116,7 +116,7 @@ class AffineLWSExecutionMonoid(SemidirectProductMonoid):
         *,
         fold_axes: tuple[str, ...],
     ) -> CompositeValue:
-        from ..lowering import lower_fold
+        from .lowering import lower_fold
 
         self.validate(values, label="affine-LWS execution values")
         if len(fold_axes) != 1:

@@ -5,7 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from .ir import ContractionAxes, TensorNode, TensorProgram, TensorRegion
+from cutilereduce.experimental.ir.core import (
+    ContractionAxes,
+    TensorNode,
+    TensorProgram,
+    TensorRegion,
+)
 
 
 @dataclass(frozen=True)
@@ -109,13 +114,25 @@ def simplify_constants(program: TensorProgram) -> TensorProgram:
         zero_result = False
         if old.op == "cast" and nodes[inputs[0]].dtype == old.dtype:
             alias = inputs[0]
-        elif old.op == "stop_gradient" and nodes[inputs[0]].op == "stop_gradient" and nodes[inputs[0]].axes == old.axes:
+        elif (
+            old.op == "stop_gradient"
+            and nodes[inputs[0]].op == "stop_gradient"
+            and nodes[inputs[0]].axes == old.axes
+        ):
             alias = inputs[0]
-        elif old.op == "powi" and _attribute(old, "exponent") == 1 and nodes[inputs[0]].axes == old.axes:
+        elif (
+            old.op == "powi"
+            and _attribute(old, "exponent") == 1
+            and nodes[inputs[0]].axes == old.axes
+        ):
             alias = inputs[0]
         elif old.op == "powi" and _attribute(old, "exponent") == 0:
             remap[old.id] = len(nodes)
-            nodes.append(TensorNode(len(nodes), "full", (), old.axes, old.dtype, (("value", 1.0),)))
+            nodes.append(
+                TensorNode(
+                    len(nodes), "full", (), old.axes, old.dtype, (("value", 1.0),)
+                )
+            )
             continue
         elif old.op == "neg" and nodes[inputs[0]].op == "neg":
             alias = nodes[inputs[0]].inputs[0]
@@ -313,8 +330,10 @@ def discover_contractions(program: TensorProgram) -> TensorProgram:
                             rhs = masked
                     else:
                         lhs = rhs = None
-                if lhs is not None and rhs is not None and reduction <= (
-                    set(lhs.axes) & set(rhs.axes)
+                if (
+                    lhs is not None
+                    and rhs is not None
+                    and reduction <= (set(lhs.axes) & set(rhs.axes))
                 ):
                     result_axes = tuple(
                         axis
@@ -322,9 +341,7 @@ def discover_contractions(program: TensorProgram) -> TensorProgram:
                         if axis in (set(lhs.axes) | set(rhs.axes)) - reduction
                     )
                     if result_axes == old.axes:
-                        partition = _contraction_axes(
-                            program.axes, lhs, rhs, reduce
-                        )
+                        partition = _contraction_axes(program.axes, lhs, rhs, reduce)
                         contraction = TensorNode(
                             id=len(nodes),
                             op="contract",

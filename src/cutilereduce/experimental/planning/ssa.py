@@ -6,8 +6,8 @@ import math
 from dataclasses import dataclass
 from typing import Any
 
-from .ir import TensorSignature
-from .scheduled import (
+from cutilereduce.experimental.ir.core import TensorSignature
+from cutilereduce.experimental.planning.scheduled import (
     CommitMode,
     LocalLifetime,
     ScheduledAxis,

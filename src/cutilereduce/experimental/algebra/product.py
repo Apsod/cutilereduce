@@ -63,7 +63,7 @@ class ProductMonoid(ProductSemigroup, Monoid[CompositeValue]):
         fold_axes: tuple[str, ...],
     ) -> CompositeValue:
         self.validate(values, label="product values")
-        from ..lowering import lower_fold
+        from .lowering import lower_fold
 
         return CompositeValue(
             {
@@ -82,7 +82,7 @@ class ProductMonoid(ProductSemigroup, Monoid[CompositeValue]):
         fold_axes: tuple[str, ...],
         domain_valid: TensorValue,
     ) -> CompositeValue:
-        from ..lowering import lower_fold
+        from .lowering import lower_fold
 
         return CompositeValue(
             {
@@ -106,7 +106,7 @@ class ProductMonoid(ProductSemigroup, Monoid[CompositeValue]):
         fold_axes: tuple[str, ...],
         domain_valid: TensorValue,
     ) -> CompositeValue:
-        from ..lowering import lower_fold_accumulate
+        from .lowering import lower_fold_accumulate
 
         return CompositeValue(
             {
@@ -130,7 +130,7 @@ class ProductMonoid(ProductSemigroup, Monoid[CompositeValue]):
         scan_axis: str,
         initial: CompositeValue,
     ) -> ScanResult[CompositeValue]:
-        from ..lowering import lower_scan
+        from .lowering import lower_scan
 
         scans = {
             name: lower_scan(

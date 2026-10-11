@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from typing import cast
 
-from .algebra.base import (
+from cutilereduce.experimental.algebra.base import (
     AlgebraValue,
     CompositeValue,
     Monoid,
@@ -12,7 +12,7 @@ from .algebra.base import (
     StructuredValue,
     value_leaves,
 )
-from .ir import TensorBuilder, TensorProgram, TensorValue
+from cutilereduce.experimental.ir.core import TensorBuilder, TensorProgram, TensorValue
 
 
 def _replace_leaves(
@@ -22,10 +22,7 @@ def _replace_leaves(
 ) -> AlgebraValue:
     if isinstance(template, StructuredValue):
         return StructuredValue(
-            {
-                name: leaves[(*prefix, name)]
-                for name in template.fields
-            }
+            {name: leaves[(*prefix, name)] for name in template.fields}
         )
     return CompositeValue(
         {
@@ -81,7 +78,9 @@ def _mask_domain_identity[ValueT: AlgebraValue](
     identity_leaves = dict(value_leaves(identity))
     group = len(ctx.nodes)
     masked = {
-        path: ctx.mask_identity(domain_valid, value, identity_leaves[path], mask_group=group)
+        path: ctx.mask_identity(
+            domain_valid, value, identity_leaves[path], mask_group=group
+        )
         for path, value in value_leaves(values)
     }
     return cast(ValueT, _replace_leaves(values, masked))
@@ -162,9 +161,7 @@ def lower_scan[ValueT: AlgebraValue](
     scan_axis: str,
     initial: ValueT,
 ) -> ScanResult[ValueT]:
-    specialized = monoid.lower_scan(
-        ctx, values, scan_axis=scan_axis, initial=initial
-    )
+    specialized = monoid.lower_scan(ctx, values, scan_axis=scan_axis, initial=initial)
     if specialized is not None:
         return specialized
     monoid.validate(values, label="generic scan values")

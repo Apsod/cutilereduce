@@ -14,9 +14,9 @@ from cutilereduce.experimental import (
     StructuredValue,
     TensorSpec,
 )
-from cutilereduce.experimental.tiled import _execute_region
-from cutilereduce.experimental.fold import compile_masked_map_fold_region
-from cutilereduce.experimental.passes import program_to_region
+from cutilereduce.experimental.backends.reference import _execute_region
+from cutilereduce.experimental.compiler.fold import compile_masked_map_fold_region
+from cutilereduce.experimental.ir.passes import program_to_region
 
 
 def run_padded_backward(operator, inputs, valid):

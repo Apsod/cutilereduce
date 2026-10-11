@@ -10,9 +10,13 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
-from .cpu_codegen import CompiledCpuFold
-from .cpu_cost import CpuPlanCost, estimate_cpu_plan
-from .scheduled import CommitMode, LocalLifetime, ScheduledBackwardProgram
+from cutilereduce.experimental.backends.cpu.runtime import CompiledCpuFold
+from cutilereduce.experimental.backends.cpu.cost import CpuPlanCost, estimate_cpu_plan
+from cutilereduce.experimental.planning.scheduled import (
+    CommitMode,
+    LocalLifetime,
+    ScheduledBackwardProgram,
+)
 
 
 _DTYPE_BYTES = {

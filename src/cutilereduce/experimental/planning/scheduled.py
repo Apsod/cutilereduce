@@ -12,7 +12,7 @@ from dataclasses import dataclass, replace
 from enum import Enum
 import math
 
-from .operator import FoldProgram
+from cutilereduce.experimental.compiler.operator import FoldProgram
 
 
 class LocalLifetime(Enum):
