@@ -1,4 +1,8 @@
-# Experimental algebra-driven fold IR
+# Experimental fold compiler: design notes
+
+Long-form design notes and rationale. The user-facing contract, scope, and
+status live in [README.md](README.md); where the two disagree, the README is
+authoritative.
 
 This package explores a user interface in which a fold is described by its
 logical tensor interactions and its algebra, rather than by handwritten fused

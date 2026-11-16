@@ -68,9 +68,9 @@ The initial `LogWeightedSum` lowering acts only on the specified fold axes;
 named tensor operations automatically preserve every other dependency. Its
 attention test demonstrates that a weighted value field is lowered directly to
 a batched-GEMM-shaped contraction rather than materialized as a broadcast
-tensor over outer, fold, and value axes. This package is intentionally separate
-from the existing executable fold implementation while the IR and algebra
-interfaces evolve.
+tensor over outer, fold, and value axes. This package is intended to replace
+the executable fold implementation, which remains as a correctness and
+performance reference.
 
 ## Function Interface
 
