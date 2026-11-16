@@ -9,8 +9,8 @@ dependencies = [
     "ninja>=1.13.0",
     "polars>=1.42.0",
     "torch",
-    "cuda-tile[tileiras]>=1.6.0",
-    "cuda-toolkit[tileiras]>=13.4",
+    "cuda-tile[tileiras]==1.8.1",
+    "cuda-toolkit[tileiras,nvvm,nvcc]<13.5",
 ]
 
 [build-system]

@@ -64,7 +64,7 @@ def _physical_valid_lines(
         name = f"valid_{axis}"
         lines.append(
             f"{name} = ct.reshape(({coordinate} * {partition.tile} + "
-            f"ct.arange({partition.tile})) < {partition.extent}, {_tuple(shape)})"
+            f"ct.arange({partition.tile}, dtype=ct.int32)) < {partition.extent}, {_tuple(shape)})"
         )
         terms.append(name)
     lines.append(f"physical_valid = {' & '.join(terms)}")
@@ -120,6 +120,41 @@ def _tile_mask_guard(
     return None
 
 
+def _initial_state_lines(
+    identity: TensorRegion,
+    map_fold_combine: TensorRegion,
+    sizes: dict[str, int],
+    tiles: dict[str, int],
+) -> list[str]:
+    """Lift logical carrier identities to the physical loop-carry tile shape."""
+    accumulator_nodes = tuple(
+        map_fold_combine.nodes[node_id]
+        for name, node_id in map_fold_combine.arguments
+        if name.startswith("accumulator.")
+    )
+    identity_nodes = tuple(
+        identity.nodes[node_id] for _, node_id in identity.results
+    )
+    if len(identity_nodes) != len(accumulator_nodes):
+        raise ValueError("execution identity and accumulator fields disagree")
+    values = []
+    for index, (source, target) in enumerate(
+        zip(identity_nodes, accumulator_nodes, strict=True)
+    ):
+        retained_axes = tuple(axis for axis in target.axes if axis in source.axes)
+        if retained_axes != source.axes:
+            raise ValueError("execution identity axes are incompatible with accumulator")
+        source_shape = tuple(
+            (tiles.get(axis, sizes[axis])) if axis in source.axes else 1
+            for axis in target.axes
+        )
+        values.append(
+            f"ct.broadcast_to(ct.reshape(state[{index}], {_tuple(source_shape)}), "
+            f"{_tuple(_shape(target.axes, sizes, tiles))})"
+        )
+    return ["    state = execution_identity()", f"    state = {_tuple(tuple(values))}"]
+
+
 def emit_cutile_source(
     specialized: SpecializedSchedule,
 ) -> str:
@@ -161,6 +196,18 @@ def emit_cutile_source(
     destinations = tuple(
         dict(commit.attributes)["destination"] for commit in stage.commits
     )
+    identity_positions = {
+        name: index for index, (name, _) in enumerate(regions["execution_identity"].results)
+    }
+    try:
+        project_state = ", ".join(
+            f"state[{identity_positions[name]}]"
+            for name, _ in regions["project_output"].arguments
+        )
+    except KeyError as error:
+        raise ValueError(
+            "project output requires an execution field not produced by identity"
+        ) from error
     parameters = ", ".join(
         (*buffers, *(f"out_{name.replace('.', '_')}" for name in destinations))
     )
@@ -187,7 +234,12 @@ def emit_cutile_source(
             f"    loop_size = {base}",
             f"    loop_extra = {loop_coordinate} < {remainder}",
             f"    loop_offset = {base} * {loop_coordinate} + ct.minimum({loop_coordinate}, {remainder})",
-            "    state = execution_identity()",
+            *_initial_state_lines(
+                regions["execution_identity"],
+                regions["map_fold_combine"],
+                sizes,
+                tiles,
+            ),
         )
     )
     lines.extend(
@@ -252,7 +304,7 @@ def emit_cutile_source(
         )
     )
     lines.extend(load_lines("        "))
-    lines.append("    visible = project_output(*state)")
+    lines.append(f"    visible = project_output({project_state})")
     owner_indices = tuple(
         coordinates.get(axis, "0") for axis in problem.spec.batch_axes
     )

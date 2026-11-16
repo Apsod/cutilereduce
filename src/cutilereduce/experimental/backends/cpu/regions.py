@@ -7,6 +7,7 @@ from typing import Any
 
 from cutilereduce.experimental.ir.core import (
     ContractionAxes,
+    ContractionPrecision,
     TensorNode,
     TensorProgram,
     TensorRegion,
@@ -99,6 +100,16 @@ def _emit_contraction(
     sizes: dict[str, int],
 ) -> str:
     """Lower a named-axis contraction to mm/bmm through canonical B/M/N/K."""
+    precision = _attr(node, "precision")
+    if precision is not None and not isinstance(precision, ContractionPrecision):
+        raise TypeError("contract node has invalid precision metadata")
+    if precision is not None and precision.operand_dtype is not None:
+        # CPU has no equivalent tensor-core instruction. Preserve the same
+        # numerical contract by quantizing operands before the FP32 GEMM.
+        inputs = [
+            f"(({value}).to({_CPP_DTYPE[precision.operand_dtype]}).to({_CPP_DTYPE[node.dtype]}))"
+            for value in inputs[:2]
+        ] + inputs[2:]
     batch = partition.batch
     lhs_free = partition.lhs_free
     rhs_free = partition.rhs_free

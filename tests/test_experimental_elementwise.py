@@ -306,6 +306,28 @@ def test_cutile_elementary_emission_is_valid_python():
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_reference_factory_values_follow_input_device():
+    ctx = TensorRegionBuilder(("d",))
+    ctx.expect("x", TensorSignature(("d",), "float32"))
+    ctx.yield_value("constant", ctx.constant(1.0))
+    ctx.yield_value("index", ctx.axis_index("d"))
+    ctx.yield_value("zero", ctx.zero(("d",)))
+    ctx.yield_value("full", ctx.full(("d",), 2.0))
+    ctx.yield_value("valid", ctx.domain_valid(("d",)))
+
+    actual = _execute_region(
+        ctx.finish_region(), {"x": torch.zeros(4, device="cuda")}
+    )
+
+    assert all(value.device.type == "cuda" for value in actual.values())
+    torch.testing.assert_close(actual["constant"], torch.tensor(1.0, device="cuda"))
+    torch.testing.assert_close(actual["index"], torch.arange(4, device="cuda"))
+    torch.testing.assert_close(actual["zero"], torch.zeros(4, device="cuda"))
+    torch.testing.assert_close(actual["full"], torch.full((4,), 2.0, device="cuda"))
+    torch.testing.assert_close(actual["valid"], torch.ones(4, dtype=torch.bool, device="cuda"))
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
 def test_generated_cutile_elementary_gpu(tmp_path):
     import importlib.util
     import cuda.tile as ct

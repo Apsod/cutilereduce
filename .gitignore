@@ -9,6 +9,7 @@ wheels/
 notebook/Untitled.ipynb
 *.zip
 theory.pdf
+results
 
 # Virtual environments
 .venv

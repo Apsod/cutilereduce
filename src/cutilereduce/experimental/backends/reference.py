@@ -36,6 +36,15 @@ def _execute_region(
     import torch
 
     values = {node_id: arguments[name] for name, node_id in region.arguments}
+    tensors = [
+        value
+        for value in (*arguments.values(), domain_valid)
+        if isinstance(value, torch.Tensor)
+    ]
+    devices = {value.device for value in tensors}
+    if len(devices) > 1:
+        raise ValueError("reference execution requires tensor inputs on one device")
+    device = next(iter(devices), None)
     axis_origins = axis_origins or {}
     axis_sizes = axis_sizes or {}
     dtypes = {
@@ -79,7 +88,7 @@ def _execute_region(
         if node.op == "domain_valid":
             shape = tuple(axis_extent(axis) for axis in node.axes)
             if domain_valid is None:
-                value = torch.ones(shape, dtype=torch.bool)
+                value = torch.ones(shape, dtype=torch.bool, device=device)
             else:
                 if (
                     domain_valid.dtype != torch.bool
@@ -98,13 +107,16 @@ def _execute_region(
                 axis_origins.get(axis, 0),
                 axis_origins.get(axis, 0) + extent,
                 dtype=dtypes[node.dtype],
+                device=device,
             )
         elif node.op == "constant":
-            value = torch.tensor(attrs["value"], dtype=dtypes[node.dtype])
+            value = torch.tensor(
+                attrs["value"], dtype=dtypes[node.dtype], device=device
+            )
         elif node.op in {"zero", "full"}:
             shape = tuple(axis_extent(axis) for axis in node.axes)
             fill = 0 if node.op == "zero" else attrs["value"]
-            value = torch.full(shape, fill, dtype=dtypes[node.dtype])
+            value = torch.full(shape, fill, dtype=dtypes[node.dtype], device=device)
         elif node.op in {"add", "subtract", "multiply", "divide"}:
             left = _align(inputs[0], input_nodes[0].axes, node.axes)
             right = _align(inputs[1], input_nodes[1].axes, node.axes)
@@ -197,6 +209,18 @@ def _execute_region(
                 inputs[0].sum(dims) if node.op == "reduce_sum" else inputs[0].amax(dims)
             )
         elif node.op in {"contract", "contract_accumulate"}:
+            precision = attrs.get("precision")
+            if precision is not None and precision.operand_dtype is not None:
+                # Model a low-precision operand conversion while retaining the
+                # declared accumulator dtype for the reference reduction.
+                lhs = inputs[0].to(dtypes[precision.operand_dtype]).to(
+                    dtypes[node.dtype]
+                )
+                rhs = inputs[1].to(dtypes[precision.operand_dtype]).to(
+                    dtypes[node.dtype]
+                )
+            else:
+                lhs, rhs = inputs[:2]
             axes = tuple(dict.fromkeys((*input_nodes[0].axes, *input_nodes[1].axes)))
             letters = dict(
                 zip(
@@ -210,7 +234,7 @@ def _execute_region(
                 return "".join(letters[axis] for axis in xs)
 
             equation = f"{encode(input_nodes[0].axes)},{encode(input_nodes[1].axes)}->{encode(node.axes)}"
-            value = torch.einsum(equation, inputs[0], inputs[1])
+            value = torch.einsum(equation, lhs, rhs)
             if node.op == "contract_accumulate":
                 value = value + inputs[2]
         else:

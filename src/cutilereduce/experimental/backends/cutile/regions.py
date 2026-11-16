@@ -5,7 +5,12 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from cutilereduce.experimental.ir.core import ContractionAxes, TensorNode, TensorRegion
+from cutilereduce.experimental.ir.core import (
+    ContractionAxes,
+    ContractionPrecision,
+    TensorNode,
+    TensorRegion,
+)
 
 
 _CT_DTYPE = {
@@ -83,6 +88,9 @@ def _contract(
     partition = _attribute(node, "contraction_axes")
     if not isinstance(partition, ContractionAxes):
         raise TypeError("contract node is missing contraction-axis metadata")
+    precision = _attribute(node, "precision")
+    if precision is not None and not isinstance(precision, ContractionPrecision):
+        raise TypeError("contract node has invalid precision metadata")
     batch = partition.batch
     lhs_order = (*batch, *partition.lhs_free, *partition.reduce)
     rhs_order = (*batch, *partition.rhs_free, *partition.reduce)
@@ -95,6 +103,10 @@ def _contract(
 
     lhs = reorder(inputs[0], input_nodes[0].axes, lhs_order)
     rhs = reorder(inputs[1], input_nodes[1].axes, rhs_order)
+    if precision is not None and precision.operand_dtype is not None:
+        operand = _CT_DTYPE[precision.operand_dtype]
+        lhs = f"({lhs}).astype({operand})"
+        rhs = f"({rhs}).astype({operand})"
     batch_size = _product(_shape(batch, sizes, tiles))
     batch_shape = (batch_size,) if batch else ()
     m = _product(_shape(partition.lhs_free, sizes, tiles))

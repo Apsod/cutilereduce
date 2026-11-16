@@ -390,16 +390,20 @@ def canonicalize_contractions(program: TensorProgram) -> TensorProgram:
         lhs = nodes[node.inputs[0]]
         rhs = nodes[node.inputs[1]]
         partition = _contraction_axes(program.axes, lhs, rhs, old_partition.reduce)
+        attributes: list[tuple[str, object]] = [
+            ("contraction_axes", partition),
+            ("implementation", partition.kind),
+        ]
+        precision = _attribute(node, "precision")
+        if precision is not None:
+            attributes.append(("precision", precision))
         nodes[index] = TensorNode(
             id=node.id,
             op=node.op,
             inputs=node.inputs,
             axes=node.axes,
             dtype=node.dtype,
-            attributes=(
-                ("contraction_axes", partition),
-                ("implementation", partition.kind),
-            ),
+            attributes=tuple(attributes),
         )
     return TensorProgram(program.axes, tuple(nodes), program.outputs)
 

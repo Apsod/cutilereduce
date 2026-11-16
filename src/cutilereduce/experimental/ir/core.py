@@ -34,6 +34,31 @@ class ContractionAxes:
 
 
 @dataclass(frozen=True)
+class ContractionPrecision:
+    """Numerical contract for a contraction, independent of its realization.
+
+    ``operand_dtype`` describes the representation supplied to the multiply.
+    ``accumulator_dtype`` describes the reduction accumulator and result.  A
+    realization may narrow operands only when ``allow_operand_rounding`` is
+    explicit; this is needed, for example, for the FP32 softmax weights in a
+    BF16 tensor-core weighted-value contraction.
+    """
+
+    operand_dtype: str | None = None
+    accumulator_dtype: str | None = None
+    allow_operand_rounding: bool = False
+
+    def __post_init__(self) -> None:
+        floating = {"float16", "bfloat16", "float32", "float64"}
+        for name, dtype in (
+            ("operand_dtype", self.operand_dtype),
+            ("accumulator_dtype", self.accumulator_dtype),
+        ):
+            if dtype is not None and dtype not in floating:
+                raise ValueError(f"{name} must be a floating-point dtype, got {dtype!r}")
+
+
+@dataclass(frozen=True)
 class TensorNode:
     id: int
     op: str
@@ -618,6 +643,7 @@ class TensorBuilder:
         *,
         over: tuple[str, ...],
         dtype: str | None = None,
+        precision: ContractionPrecision | None = None,
     ) -> TensorValue:
         missing_lhs = set(over) - set(lhs.axes)
         missing_rhs = set(over) - set(rhs.axes)
@@ -636,13 +662,36 @@ class TensorBuilder:
             reduce=self._ordered(reduced),
         )
         output_axes = self._ordered(lhs_axes | rhs_axes)
+        result_dtype = dtype or lhs.dtype
+        if precision is not None:
+            if (
+                precision.accumulator_dtype is not None
+                and precision.accumulator_dtype != result_dtype
+            ):
+                raise ValueError(
+                    "contraction result dtype must equal its precision "
+                    f"accumulator dtype: {result_dtype!r} != "
+                    f"{precision.accumulator_dtype!r}"
+                )
+            if (
+                precision.operand_dtype is not None
+                and not precision.allow_operand_rounding
+                and any(
+                    value.dtype != precision.operand_dtype for value in (lhs, rhs)
+                )
+            ):
+                raise ValueError(
+                    "contraction operand dtype differs from its precision contract; "
+                    "use an explicit cast or allow_operand_rounding=True"
+                )
         return self._add(
             "contract",
             (lhs, rhs),
             output_axes,
-            dtype or lhs.dtype,
+            result_dtype,
             contraction_axes=partition,
             implementation=partition.kind,
+            precision=precision,
         )
 
     def contract_accumulate(
@@ -653,9 +702,12 @@ class TensorBuilder:
         *,
         over: tuple[str, ...],
         dtype: str | None = None,
+        precision: ContractionPrecision | None = None,
     ) -> TensorValue:
         """Contract two tensors directly into an existing output accumulator."""
-        result = self.contract(lhs, rhs, over=over, dtype=dtype)
+        result = self.contract(
+            lhs, rhs, over=over, dtype=dtype, precision=precision
+        )
         if accumulator.axes != result.axes:
             raise ValueError(
                 "contraction accumulator axes must match the contraction result: "
@@ -731,6 +783,7 @@ class TensorRegionBuilder(TensorBuilder):
 
 __all__ = [
     "ContractionAxes",
+    "ContractionPrecision",
     "TensorBuilder",
     "TensorNode",
     "TensorProgram",

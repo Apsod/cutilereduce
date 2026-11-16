@@ -1,7 +1,12 @@
+import importlib.util
+import math
+
+import pytest
 import torch
 
 from cutilereduce.experimental import (
     AxisPartition,
+    ContractionPrecision,
     FoldMaps,
     FoldFactor,
     FoldOperator,
@@ -109,6 +114,119 @@ def test_cpu_mock_executes_single_owner_tiled_attention_fold():
     assert domain_conditions
     assert all("dv" not in node.axes for node in domain_conditions)
     assert source.count("ct.load(query,") == 1
+
+
+def test_cutile_source_honors_bfloat16_contraction_contract():
+    sizes = {"h": 1, "l": 4, "g": 1, "r": 4, "dqk": 4, "dv": 4}
+    spec = FoldSpec(
+        inputs={
+            "query": TensorSpec(("h", "l", "g", "dqk"), "bfloat16"),
+            "key": TensorSpec(("h", "r", "dqk"), "bfloat16"),
+            "value": TensorSpec(("h", "r", "dv"), "bfloat16"),
+        },
+        batch_axes=("h", "l", "g"),
+        fold_axes=("r",),
+    )
+
+    def to_factor(ctx, inputs):
+        return StructuredValue(
+            {
+                "log_weight": ctx.contract(
+                    inputs["query"], inputs["key"], over=("dqk",), dtype="float32"
+                ),
+                "value": ctx.cast(inputs["value"], "float32"),
+            }
+        )
+
+    precision = ContractionPrecision(
+        operand_dtype="bfloat16",
+        accumulator_dtype="float32",
+        allow_operand_rounding=True,
+    )
+    program = FoldOperator(
+        spec,
+        LogWeightedSum(("dv",), contraction_precision=precision),
+        FoldMaps(to_factor),
+    ).lower(backward=False)
+    source = emit_cutile_source(_specialize_forward(program, sizes, {"l": 4, "r": 4}))
+
+    numerator = source.split("def map_fold_combine", 1)[1]
+    assert numerator.count(".astype(ct.bfloat16)") >= 2
+    assert "ct.mma(" in numerator
+    contracted = [node for node in program.map_fold_combine.nodes if node.op == "contract_accumulate"]
+    assert len(contracted) == 1
+    assert contracted[0].dtype == "float32"
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="requires a CUDA GPU")
+def test_generated_cutile_attention_forward_gpu(tmp_path):
+    import cuda.tile as ct
+
+    sizes = {"h": 1, "l": 5, "g": 1, "r": 7, "dqk": 4, "dv": 4}
+    spec = FoldSpec(
+        inputs={
+            "query": TensorSpec(("h", "l", "g", "dqk"), "bfloat16"),
+            "key": TensorSpec(("h", "r", "dqk"), "bfloat16"),
+            "value": TensorSpec(("h", "r", "dv"), "bfloat16"),
+        },
+        batch_axes=("h", "l", "g"),
+        fold_axes=("r",),
+    )
+
+    def to_factor(ctx, inputs):
+        return StructuredValue(
+            {
+                "log_weight": ctx.contract(
+                    inputs["query"], inputs["key"], over=("dqk",), dtype="float32"
+                ),
+                "value": ctx.cast(inputs["value"], "float32"),
+            }
+        )
+
+    def to_output(ctx, semantic):
+        del ctx
+        return StructuredValue({"value": semantic["value"]})
+
+    tensor_core_bf16 = ContractionPrecision(
+        operand_dtype="bfloat16",
+        accumulator_dtype="float32",
+        allow_operand_rounding=True,
+    )
+    program = FoldOperator(
+        spec,
+        LogWeightedSum(("dv",), contraction_precision=tensor_core_bf16),
+        FoldMaps(to_factor, to_output),
+    ).lower(backward=False)
+    specialized = _specialize_forward(program, sizes, {"l": 4, "r": 4})
+    path = tmp_path / "generated_attention.py"
+    source = emit_cutile_source(specialized)
+    assert ".astype(ct.bfloat16)" in source.split("def map_fold_combine", 1)[1]
+    path.write_text(source)
+    module_spec = importlib.util.spec_from_file_location("generated_attention", path)
+    assert module_spec is not None and module_spec.loader is not None
+    module = importlib.util.module_from_spec(module_spec)
+    module_spec.loader.exec_module(module)
+
+    inputs = {
+        "query": torch.randn(1, 5, 1, 4, device="cuda", dtype=torch.bfloat16),
+        "key": torch.randn(1, 7, 4, device="cuda", dtype=torch.bfloat16),
+        "value": torch.randn(1, 7, 4, device="cuda", dtype=torch.bfloat16),
+    }
+    output = torch.empty(1, 5, 1, 4, device="cuda")
+    stage = specialized.implementation.stages[0]
+    grid = (math.prod(partition.programs for partition in stage.grid_partitions),)
+    ct.launch(
+        torch.cuda.current_stream(),
+        grid,
+        module.single_owner_tiled_fold,
+        (*inputs.values(), output),
+    )
+    expected = torch.einsum(
+        "hlgr,hrv->hlgv",
+        torch.einsum("hlgd,hrd->hlgr", inputs["query"].float(), inputs["key"].float()).softmax(-1),
+        inputs["value"].float(),
+    )
+    torch.testing.assert_close(output, expected, atol=2e-2, rtol=2e-2)
 
 
 def test_axis_partition_balances_tiles_and_permits_idle_programs():

@@ -49,6 +49,7 @@ from cutilereduce.experimental.compiler.fold import (
 )
 from cutilereduce.experimental.ir.core import (
     ContractionAxes,
+    ContractionPrecision,
     TensorBuilder,
     TensorNode,
     TensorProgram,
@@ -191,6 +192,7 @@ from cutilereduce.experimental.planning.target import TargetModel
 __all__ = [
     "AxisAffineIndex",
     "ContractionAxes",
+    "ContractionPrecision",
     "AlgebraComponent",
     "AlgebraicComponentGraph",
     "AxisPartition",

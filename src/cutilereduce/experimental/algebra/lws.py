@@ -12,7 +12,7 @@ from .base import (
     TensorField,
     TensorStructure,
 )
-from ..ir import TensorBuilder, TensorValue
+from ..ir import ContractionPrecision, TensorBuilder, TensorValue
 
 
 class LogWeightedMonoid(Monoid[StructuredValue]):
@@ -127,8 +127,14 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
 
     commutative = True
 
-    def __init__(self, value_axes: tuple[str, ...], dtype: str = "float32"):
+    def __init__(
+        self,
+        value_axes: tuple[str, ...],
+        dtype: str = "float32",
+        contraction_precision: ContractionPrecision | None = None,
+    ):
         self.dtype = dtype
+        self.contraction_precision = contraction_precision
         scalar = TensorField(dtype=dtype)
         self.value_field = TensorField(value_axes, dtype)
         self.structure = TensorStructure(
@@ -199,7 +205,12 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
         normalizer = ctx.reduce("sum", scales * values["normalizer"], fold_axes)
-        numerator = ctx.contract(scales, values["numerator"], over=fold_axes)
+        numerator = ctx.contract(
+            scales,
+            values["numerator"],
+            over=fold_axes,
+            precision=self.contraction_precision,
+        )
         return StructuredValue(
             {
                 "maximum": maximum,
@@ -237,7 +248,12 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
         normalizer = ctx.reduce("sum", scales * values["normalizer"], fold_axes)
-        numerator = ctx.contract(scales, values["numerator"], over=fold_axes)
+        numerator = ctx.contract(
+            scales,
+            values["numerator"],
+            over=fold_axes,
+            precision=self.contraction_precision,
+        )
         return StructuredValue(
             {"maximum": maximum, "normalizer": normalizer, "numerator": numerator}
         )
@@ -279,6 +295,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             tile_scales,
             values["numerator"],
             over=fold_axes,
+            precision=self.contraction_precision,
         )
         return StructuredValue(
             {"maximum": maximum, "normalizer": normalizer, "numerator": numerator}
@@ -332,6 +349,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
             tile_scales,
             values["numerator"],
             over=fold_axes,
+            precision=self.contraction_precision,
         )
         return StructuredValue(
             {"maximum": maximum, "normalizer": normalizer, "numerator": numerator}
@@ -343,11 +361,18 @@ class LogWeightedSum(FoldAlgebra[StructuredValue, StructuredValue, StructuredVal
 
     finalize_context = FinalizeContext.NONE
 
-    def __init__(self, value_axes: tuple[str, ...], dtype: str = "float32"):
+    def __init__(
+        self,
+        value_axes: tuple[str, ...],
+        dtype: str = "float32",
+        contraction_precision: ContractionPrecision | None = None,
+    ):
         scalar = TensorField(dtype=dtype)
         value = TensorField(value_axes, dtype)
         self.semantic = LogWeightedMonoid({"value": value}, dtype)
-        self.execution = LWSExecutionMonoid(value_axes, dtype)
+        self.execution = LWSExecutionMonoid(
+            value_axes, dtype, contraction_precision=contraction_precision
+        )
         self.accumulator = LogWeightedMonoid({"scalar": scalar, "value": value}, dtype)
         self.value_axes = value_axes
 

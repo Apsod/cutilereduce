@@ -5,6 +5,7 @@ from cutilereduce.experimental import (
     Affine,
     AffineLWS,
     ContractionAxes,
+    ContractionPrecision,
     FinalizeContext,
     FoldMaps,
     FoldFactor,
@@ -132,6 +133,37 @@ def test_attention_fold_lowers_weighted_values_to_one_batched_gemm():
     )
     assert weighted_value.attribute("implementation") == "batched_gemm"
     assert weighted_value.dtype == "float32"
+
+
+def test_contraction_precision_is_explicit_and_survives_algebra_lowering():
+    tensor_core_bf16 = ContractionPrecision(
+        operand_dtype="bfloat16",
+        accumulator_dtype="float32",
+        allow_operand_rounding=True,
+    )
+    program = compile_fold(
+        attention_spec(),
+        LogWeightedSum(("dv",), contraction_precision=tensor_core_bf16),
+        attention_map,
+    )
+
+    weighted_value = program.contractions[-1]
+    assert weighted_value.attribute("precision") == tensor_core_bf16
+    assert weighted_value.dtype == "float32"
+
+    ctx = TensorBuilder(("m", "n", "k"))
+    lhs = ctx.input("lhs", ("m", "k"), "float32")
+    rhs = ctx.input("rhs", ("n", "k"), "float32")
+    with pytest.raises(ValueError, match="allow_operand_rounding"):
+        ctx.contract(
+            lhs,
+            rhs,
+            over=("k",),
+            dtype="float32",
+            precision=ContractionPrecision(
+                operand_dtype="bfloat16", accumulator_dtype="float32"
+            ),
+        )
 
 
 def test_fold_operator_builds_the_logical_planning_contract():

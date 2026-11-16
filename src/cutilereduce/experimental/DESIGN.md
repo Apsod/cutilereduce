@@ -162,6 +162,27 @@ products, matrix-vector products, matrix products, and their batched variants
 are instances of the same operation and are classified from their named axes.
 Elementwise operations use lazy named-axis broadcasting.
 
+A contraction may additionally carry a `ContractionPrecision` contract.  This
+separates the logical result dtype from the operand representation and
+accumulator dtype used by a realization.  For example, an attention numerator
+can explicitly permit BF16 operands with an FP32 accumulator:
+
+```python
+from cutilereduce.experimental import ContractionPrecision
+
+tensor_core_bf16 = ContractionPrecision(
+    operand_dtype="bfloat16",
+    accumulator_dtype="float32",
+    allow_operand_rounding=True,
+)
+algebra = LogWeightedSum(("dv",), contraction_precision=tensor_core_bf16)
+```
+
+`allow_operand_rounding` is deliberately opt-in.  It permits the execution
+carrier's FP32 softmax weights to be rounded for a BF16 MMA; without it, the
+IR requires either matching operand dtypes or an explicit semantic cast.  The
+contract belongs to the operation/algebra, not to a CuTile-specific user map.
+
 Logical coordinates are available without exposing physical tile IDs:
 
 ```python
