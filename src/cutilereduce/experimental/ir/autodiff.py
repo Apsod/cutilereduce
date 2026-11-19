@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping
+import math
 
 from cutilereduce.experimental.ir.core import (
     ContractionAxes,
@@ -118,8 +119,12 @@ def vjp(
                 add_input(0, -cotangent)
             case "exp":
                 add_input(0, cotangent * TensorValue(ctx, node_id))
+            case "exp2":
+                add_input(0, math.log(2.0) * cotangent * TensorValue(ctx, node_id))
             case "log":
                 add_input(0, cotangent / inputs[0])
+            case "log2":
+                add_input(0, cotangent / (math.log(2.0) * inputs[0]))
             case "powi":
                 exponent = node.attribute("exponent")
                 if exponent != 0:

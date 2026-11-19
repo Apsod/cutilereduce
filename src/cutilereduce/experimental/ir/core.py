@@ -403,8 +403,14 @@ class TensorBuilder:
     def exp(self, value: TensorValue) -> TensorValue:
         return self.elementwise("exp", value)
 
+    def exp2(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("exp2", value)
+
     def log(self, value: TensorValue) -> TensorValue:
         return self.elementwise("log", value)
+
+    def log2(self, value: TensorValue) -> TensorValue:
+        return self.elementwise("log2", value)
 
     def neg(self, value: TensorValue) -> TensorValue:
         return self.elementwise("neg", value)

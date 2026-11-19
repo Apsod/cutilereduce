@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import cast
 
 from .add import Add, AddMonoid
@@ -173,6 +174,36 @@ class AffineLWS(SemidirectProductAlgebra):
         )
         self.value_axes = value_axes
 
+    def to_execution(
+        self, ctx: TensorBuilder, semantic: CompositeValue
+    ) -> CompositeValue:
+        """Use log2 coordinates consistently across the affine carrier."""
+        self.semantic.validate(semantic, label="affine-LWS semantic value")
+        acting = cast(StructuredValue, semantic["acting"])
+        return CompositeValue(
+            {
+                "acting": StructuredValue(
+                    {"value": acting["value"] * math.log2(math.e)}
+                ),
+                "payload": self.payload.to_execution(ctx, semantic["payload"]),
+            }
+        )
+
+    def to_semantic(
+        self, ctx: TensorBuilder, execution: CompositeValue
+    ) -> CompositeValue:
+        """Convert the affine shift and LWS payload back to natural logs."""
+        self.execution.validate(execution, label="affine-LWS execution carrier")
+        acting = cast(StructuredValue, execution["acting"])
+        return CompositeValue(
+            {
+                "acting": StructuredValue(
+                    {"value": acting["value"] * math.log(2.0)}
+                ),
+                "payload": self.payload.to_semantic(ctx, execution["payload"]),
+            }
+        )
+
     def embed(
         self,
         ctx: TensorBuilder,
@@ -221,7 +252,9 @@ class AffineLWS(SemidirectProductAlgebra):
             raise ValueError("affine-LWS finalize requires an E prefix")
         self.semantic.validate(factor, label="affine-LWS local factor")
         self.accumulator.validate(accumulator, label="affine-LWS accumulator")
-        prefix_scale = cast(StructuredValue, prefix["acting"])["value"]
+        prefix_scale = (
+            cast(StructuredValue, prefix["acting"])["value"] * math.log(2.0)
+        )
         prefix_execution_payload = cast(StructuredValue, prefix["payload"])
         prefix_normalizer = prefix_execution_payload["normalizer"]
         has_prefix_payload = ctx.compare(
@@ -234,8 +267,11 @@ class AffineLWS(SemidirectProductAlgebra):
         )
         prefix_payload = StructuredValue(
             {
-                "log_weight": prefix_execution_payload["maximum"]
-                + ctx.log(safe_prefix_normalizer),
+                "log_weight": math.log(2.0)
+                * (
+                    prefix_execution_payload["maximum"]
+                    + ctx.log2(safe_prefix_normalizer)
+                ),
                 "value": prefix_execution_payload["numerator"]
                 / safe_prefix_normalizer,
             }

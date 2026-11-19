@@ -129,7 +129,9 @@ def _execute_region(
         elif node.op in {
             "neg",
             "exp",
+            "exp2",
             "log",
+            "log2",
             "sqrt",
             "rsqrt",
             "abs",

@@ -41,7 +41,9 @@ This repository is still a prototype. The current landed version supports:
 - basic spec construction, cost estimation, and sweep utilities;
 - working example-style experiments in [`examples/xentropy.py`](examples/xentropy.py),
   [`examples/attention.py`](examples/attention.py), and
-  [`examples/affine_attention.py`](examples/affine_attention.py).
+  [`examples/affine_attention.py`](examples/affine_attention.py);
+- a forward-only experimental attention executable in
+  [`examples/experimental_attention.py`](examples/experimental_attention.py).
 
 Not yet landed:
 
@@ -60,8 +62,8 @@ Not yet landed:
 algebra-driven interface. Given an experimental `FoldSpec`, a `FoldAlgebra`,
 and a logical map function, `compile_fold` produces an abstract tensor program
 with named axes, reductions, contractions, implementation hints, and explicit
-materialization boundaries. It does not emit CUDA Tile or PyTorch operations.
-See the [experimental interface README](src/cutilereduce/experimental/README.md)
+materialization boundaries. Its initial CuTile target emits the online forward
+schedule. See the [experimental design](src/cutilereduce/experimental/DESIGN.md)
 for the user model and current design boundaries.
 
 The initial `LogWeightedSum` lowering acts only on the specified fold axes;
@@ -136,6 +138,23 @@ before launching embed, leaving the two launches adjacent on the stream.
 
 ### Scaling results
 
+#### Experimental fixed-tile attention (forward only)
+
+These measurements use [`examples/experimental_attention.py`](examples/experimental_attention.py)
+on the RTX 5080, with BF16 inputs, FP32 accumulation, and fixed tiles
+`h=1, l=128, g=1, r=32`. The workload is `h=4, g=8, dqk=dv=128` and
+`L=R=N`; no per-size tuning is performed. Timings are steady-state milliseconds.
+
+| N | Experimental CuTile forward | PyTorch SDPA forward |
+| ---: | ---: | ---: |
+| 1,024 | 0.517 | 0.239 |
+| 2,048 | 1.782 | 0.797 |
+| 4,096 | 6.634 | 2.871 |
+| 8,192 | 25.380 | 10.811 |
+| 16,384 | 100.484 | 42.378 |
+
+#### Legacy tuned experiments
+
 The following scaling measurements were collected on an RTX 5080 with
 `--torch-compile --programmatic-dependent-launch --benchmark-memory
 --accuracy-matrix`. Each row retunes the workload at the stated square problem
@@ -152,7 +171,7 @@ steady-state milliseconds.
 | 8,192 | 0.464 | 0.498 | 1.4 | 1.2 |
 | 16,384 | 1.3 | 1.6 | 4.3 | 4.5 |
 
-#### Attention
+#### Legacy attention
 
 | N | CuTile forward | PyTorch SDPA forward | CuTile forward + backward | PyTorch SDPA forward + backward |
 | ---: | ---: | ---: | ---: | ---: |
@@ -267,6 +286,7 @@ Run examples from the repository root:
 uv run -m examples.attention --heads 4 --l 4096 --r 4096 --validate
 uv run -m examples.xentropy --batch 1024 --v 4096 --d 128
 uv run -m examples.affine_attention --help
+uv run -m examples.experimental_attention --length 4096 --right 4096 --validate
 ```
 
 The CPU-only analytical sweep in
@@ -288,3 +308,12 @@ benchmarking.
 `--validate` or `--accuracy-matrix` enables validation in all examples.
 All examples support `--forward-only` for tuning and running only the forward
 pass. It currently cannot be combined with `--torch-compile`.
+
+`examples.experimental_attention` is deliberately separate: it uses the
+experimental algebra-driven path directly, has no tuner or backward executor,
+and fixes `h=1, l=128, g=1, r=32` program tiles. Its matching scaling command
+is:
+
+```console
+scripts/scale_experimental_attention.sh 1024 2048 4096 8192 16384 --validate
+```

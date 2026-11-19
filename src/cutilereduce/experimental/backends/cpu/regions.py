@@ -304,7 +304,9 @@ def _emit_region(
             case (
                 "neg"
                 | "exp"
+                | "exp2"
                 | "log"
+                | "log2"
                 | "sqrt"
                 | "rsqrt"
                 | "abs"

@@ -94,6 +94,7 @@ def _contract(
     batch = partition.batch
     lhs_order = (*batch, *partition.lhs_free, *partition.reduce)
     rhs_order = (*batch, *partition.rhs_free, *partition.reduce)
+    rhs_direct_order = (*batch, *partition.reduce, *partition.rhs_free)
 
     def reorder(value: str, source: tuple[str, ...], target: tuple[str, ...]) -> str:
         if source == target:
@@ -102,19 +103,30 @@ def _contract(
         return f"ct.permute({value}, {_tuple(permutation)})"
 
     lhs = reorder(inputs[0], input_nodes[0].axes, lhs_order)
-    rhs = reorder(inputs[1], input_nodes[1].axes, rhs_order)
+    # MMA consumes its RHS as KxN. When the logical producer already carries
+    # that order, retain it instead of permuting to NxK only to transpose it
+    # back. Score contractions normally use the fallback; the LWS numerator's
+    # value input is naturally KxN.
+    rhs_is_direct = input_nodes[1].axes == rhs_direct_order
+    rhs = reorder(
+        inputs[1], input_nodes[1].axes, rhs_direct_order if rhs_is_direct else rhs_order
+    )
     if precision is not None and precision.operand_dtype is not None:
         operand = _CT_DTYPE[precision.operand_dtype]
-        lhs = f"({lhs}).astype({operand})"
-        rhs = f"({rhs}).astype({operand})"
+        if input_nodes[0].dtype != precision.operand_dtype:
+            lhs = f"({lhs}).astype({operand})"
+        if input_nodes[1].dtype != precision.operand_dtype:
+            rhs = f"({rhs}).astype({operand})"
     batch_size = _product(_shape(batch, sizes, tiles))
     batch_shape = (batch_size,) if batch else ()
     m = _product(_shape(partition.lhs_free, sizes, tiles))
     n = _product(_shape(partition.rhs_free, sizes, tiles))
     k = _product(_shape(partition.reduce, sizes, tiles))
     lhs = f"ct.reshape({lhs}, {_tuple((*batch_shape, m, k))})"
-    rhs = f"ct.reshape({rhs}, {_tuple((*batch_shape, n, k))})"
-    rhs = f"ct.transpose({rhs})" if not batch else f"ct.transpose({rhs}, 1, 2)"
+    rhs_shape = (*batch_shape, k, n) if rhs_is_direct else (*batch_shape, n, k)
+    rhs = f"ct.reshape({rhs}, {_tuple(rhs_shape)})"
+    if not rhs_is_direct:
+        rhs = f"ct.transpose({rhs})" if not batch else f"ct.transpose({rhs}, 1, 2)"
     accumulator = (
         f"ct.reshape({inputs[2]}, {_tuple((*batch_shape, m, n))})"
         if node.op == "contract_accumulate"
@@ -181,7 +193,9 @@ def _emit_region(
             case (
                 "neg"
                 | "exp"
+                | "exp2"
                 | "log"
+                | "log2"
                 | "sqrt"
                 | "rsqrt"
                 | "abs"

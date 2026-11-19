@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
+import math
 
 from .base import (
     FinalizeContext,
@@ -126,6 +127,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
     """Stable execution carrier for an LWS with one tensor payload."""
 
     commutative = True
+    log_base = 2
 
     def __init__(
         self,
@@ -144,6 +146,11 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
                 "numerator": self.value_field,
             }
         )
+
+    @staticmethod
+    def _exp(ctx: TensorBuilder, value: TensorValue) -> TensorValue:
+        """Evaluate a difference in the execution carrier's log₂ coordinates."""
+        return ctx.exp2(value)
 
     def identity(self, ctx: TensorBuilder) -> StructuredValue:
         return StructuredValue(
@@ -170,12 +177,12 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         left_scale = ctx.where(
             nonempty,
-            ctx.exp(left["maximum"] - safe_maximum),
+            self._exp(ctx, left["maximum"] - safe_maximum),
             ctx.constant(0.0, self.dtype),
         )
         right_scale = ctx.where(
             nonempty,
-            ctx.exp(right["maximum"] - safe_maximum),
+            self._exp(ctx, right["maximum"] - safe_maximum),
             ctx.constant(0.0, self.dtype),
         )
         return StructuredValue(
@@ -201,7 +208,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         scales = ctx.where(
             nonempty,
-            ctx.exp(values["maximum"] - safe_maximum),
+            self._exp(ctx, values["maximum"] - safe_maximum),
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
         normalizer = ctx.reduce("sum", scales * values["normalizer"], fold_axes)
@@ -244,7 +251,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         )
         scales = ctx.where(
             valid_nonempty,
-            ctx.exp(values["maximum"] - safe_maximum),
+            self._exp(ctx, values["maximum"] - safe_maximum),
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
         normalizer = ctx.reduce("sum", scales * values["normalizer"], fold_axes)
@@ -279,12 +286,12 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         initial_scale = ctx.where(
             nonempty,
-            ctx.exp(initial["maximum"] - safe_maximum),
+            self._exp(ctx, initial["maximum"] - safe_maximum),
             ctx.constant(0.0, self.dtype),
         )
         tile_scales = ctx.where(
             nonempty,
-            ctx.exp(values["maximum"] - safe_maximum),
+            self._exp(ctx, values["maximum"] - safe_maximum),
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
         normalizer = initial_scale * initial["normalizer"] + ctx.reduce(
@@ -328,7 +335,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         safe_maximum = ctx.where(nonempty, maximum, ctx.constant(0.0, self.dtype))
         initial_scale = ctx.where(
             nonempty,
-            ctx.exp(initial["maximum"] - safe_maximum),
+            self._exp(ctx, initial["maximum"] - safe_maximum),
             ctx.constant(0.0, self.dtype),
         )
         valid_nonempty = ctx.where(
@@ -338,7 +345,7 @@ class LWSExecutionMonoid(Monoid[StructuredValue]):
         )
         tile_scales = ctx.where(
             valid_nonempty,
-            ctx.exp(values["maximum"] - safe_maximum),
+            self._exp(ctx, values["maximum"] - safe_maximum),
             ctx.full(values["maximum"].axes, 0.0, self.dtype),
         )
         normalizer = initial_scale * initial["normalizer"] + ctx.reduce(
@@ -383,7 +390,7 @@ class LogWeightedSum(FoldAlgebra[StructuredValue, StructuredValue, StructuredVal
         log_weight = semantic["log_weight"]
         return StructuredValue(
             {
-                "maximum": log_weight,
+                "maximum": log_weight * math.log2(math.e),
                 "normalizer": ctx.full(log_weight.axes, 1.0, log_weight.dtype),
                 "numerator": semantic["value"],
             }
@@ -395,12 +402,15 @@ class LogWeightedSum(FoldAlgebra[StructuredValue, StructuredValue, StructuredVal
         self.execution.validate(execution, label="LWS execution carrier")
         return StructuredValue(
             {
-                "log_weight": execution["maximum"]
-                + ctx.log(
-                    ctx.where(
-                        ctx.compare("greater", execution["normalizer"], 0.0),
-                        execution["normalizer"],
-                        ctx.constant(1.0, execution["normalizer"].dtype),
+                "log_weight": math.log(2.0)
+                * (
+                    execution["maximum"]
+                    + ctx.log2(
+                        ctx.where(
+                            ctx.compare("greater", execution["normalizer"], 0.0),
+                            execution["normalizer"],
+                            ctx.constant(1.0, execution["normalizer"].dtype),
+                        )
                     )
                 ),
                 "value": ctx.where(

@@ -151,8 +151,10 @@ def test_cutile_source_honors_bfloat16_contraction_contract():
     source = emit_cutile_source(_specialize_forward(program, sizes, {"l": 4, "r": 4}))
 
     numerator = source.split("def map_fold_combine", 1)[1]
-    assert numerator.count(".astype(ct.bfloat16)") >= 2
+    assert numerator.count(".astype(ct.bfloat16)") == 1
+    assert "ct.exp2(" in numerator
     assert "ct.mma(" in numerator
+    assert "ct.permute(value" not in numerator
     contracted = [node for node in program.map_fold_combine.nodes if node.op == "contract_accumulate"]
     assert len(contracted) == 1
     assert contracted[0].dtype == "float32"
@@ -201,6 +203,7 @@ def test_generated_cutile_attention_forward_gpu(tmp_path):
     path = tmp_path / "generated_attention.py"
     source = emit_cutile_source(specialized)
     assert ".astype(ct.bfloat16)" in source.split("def map_fold_combine", 1)[1]
+    assert "ct.exp2(" in source.split("def map_fold_combine", 1)[1]
     path.write_text(source)
     module_spec = importlib.util.spec_from_file_location("generated_attention", path)
     assert module_spec is not None and module_spec.loader is not None
@@ -469,8 +472,10 @@ def test_cutile_backward_emits_embed_local_accumulation_and_relaxed_atomics():
     output = torch.einsum("hlgr,hrv->hlgv", probabilities, value)
     cotangent = torch.randn_like(output)
     output.backward(cotangent)
-    maximum = scores.amax(-1)
-    weights = torch.exp(scores - maximum[..., None])
+    # LWS's execution carrier tracks maxima in log2 coordinates, while the
+    # semantic score used above is in natural-log coordinates.
+    maximum = scores.amax(-1) * math.log2(math.e)
+    weights = torch.exp2(scores * math.log2(math.e) - maximum[..., None])
     normalizer = weights.sum(-1)
     numerator = torch.einsum("hlgr,hrv->hlgv", weights, value.detach())
     actual = execute_tiled_backward_cpu(

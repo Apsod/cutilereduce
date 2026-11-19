@@ -1043,6 +1043,34 @@ is explicit in the CPU driver, but general temporary-buffer reuse, in-place
 accumulation, inference of optimized online updates, and numerical-mode
 selection remain future compiler/backend work.
 
+### Future: realization passes and heuristic tuning
+
+Algebra-aware realization passes and schedule tuning are complementary.  A
+pass can expose an equivalent, target-appropriate implementation--for example,
+flatten compatible execution axes into an MMA row axis, choose a stable LWS
+combine normal form, remove a proven-redundant validity guard, or realize a
+declared contraction precision.  It does not decide that this realization is
+best for a particular GPU and problem size.
+
+The experimental path therefore needs a heuristic tuner again.  It should
+generate and benchmark alternatives over both schedule and realization choices:
+
+- tiles, program counts, loop ownership, and resident versus streamed inputs;
+- physical execution-carrier layouts such as keeping `(l, g)` or flattening
+  them into a `row` axis;
+- legal carrier/lowering variants, including stable LWS combine forms and
+  precision realizations; and
+- eligible plan families, such as online, partial/tree combine, scan, and
+  eventually communication-aware distributed plans.
+
+The richer IR makes this tuner more informed than the legacy callback tuner:
+it can reject illegal candidates from named-axis dependencies, monoid laws,
+carrier structure, precision contracts, mask domains, and liveness/resource
+estimates before compilation.  Analytical costing should rank the survivors;
+on-device measurement remains the final authority.  Semantic IR remains
+unchanged throughout this search, so the selected realization can be swapped
+without changing the user map or its correctness contract.
+
 ## Compiling and inspecting a program
 
 ```python

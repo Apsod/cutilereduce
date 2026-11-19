@@ -27,7 +27,9 @@ ELEMENTWISE_OPS = {
         name: ElementwiseOp(1, "float")
         for name in (
             "exp",
+            "exp2",
             "log",
+            "log2",
             "sqrt",
             "rsqrt",
             "powi",

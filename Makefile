@@ -1,7 +1,7 @@
 .PHONY: lint test quality typecheck
 
 lint:
-	PYTHONPATH=. uv run ruff check ./src ./tests ./examples ./notebook/xentropy_sweep.ipynb
+	PYTHONPATH=. uv run ruff check ./src ./tests ./examples
 
 test:
 	PYTHONPATH=. uv run pytest

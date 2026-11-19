@@ -6,7 +6,11 @@ from typing import Any
 
 from cutilereduce.experimental.ir.core import TensorRegion
 from cutilereduce.experimental.compiler.operator import FoldProgram
-from cutilereduce.experimental.ir.passes import AxisAffineIndex, discover_tile_mask
+from cutilereduce.experimental.ir.passes import (
+    AxisAffineIndex,
+    discover_tile_mask,
+    realize_contraction_precision,
+)
 from cutilereduce.experimental.planning.ssa import (
     ScheduledOperation,
     SpecializedSchedule,
@@ -185,7 +189,7 @@ def emit_cutile_source(
         )
     regions = {
         "execution_identity": problem.execution_identity,
-        "map_fold_combine": problem.map_fold_combine,
+        "map_fold_combine": realize_contraction_precision(problem.map_fold_combine),
         "project_output": problem.project_output,
     }
     tiles = {partition.axis: partition.tile for partition in stage.effective_partitions}
