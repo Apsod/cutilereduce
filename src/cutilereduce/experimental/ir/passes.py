@@ -7,6 +7,7 @@ from typing import Any
 
 from cutilereduce.experimental.ir.core import (
     ContractionAxes,
+    ContractionPrecision,
     TensorNode,
     TensorProgram,
     TensorRegion,
@@ -408,6 +409,66 @@ def canonicalize_contractions(program: TensorProgram) -> TensorProgram:
     return TensorProgram(program.axes, tuple(nodes), program.outputs)
 
 
+def realize_contraction_precision(region: TensorRegion) -> TensorRegion:
+    """Expose exact low-precision producers to a contracted realization.
+
+    A semantic map often widens a BF16 input to FP32 because its semantic
+    carrier is FP32.  If a contraction explicitly asks for BF16 operands, that
+    widening followed by a BF16 realization is an exact round trip.  Bypass it
+    locally at the contracted use so the backend can retain the input layout.
+    This pass is only valid after a target has selected the contraction
+    precision contract; it never introduces a lossy conversion on its own.
+    """
+
+    exact_widenings = {
+        ("float16", "float32"),
+        ("float16", "float64"),
+        ("bfloat16", "float32"),
+        ("bfloat16", "float64"),
+        ("float32", "float64"),
+    }
+    nodes: list[TensorNode] = []
+    for node in region.nodes:
+        inputs = node.inputs
+        precision = _attribute(node, "precision")
+        if (
+            node.op in {"contract", "contract_accumulate"}
+            and isinstance(precision, ContractionPrecision)
+            and precision.operand_dtype is not None
+        ):
+            rewritten = list(inputs)
+            for index, input_id in enumerate(inputs[:2]):
+                source = region.nodes[input_id]
+                if source.op != "cast":
+                    continue
+                producer = region.nodes[source.inputs[0]]
+                if (
+                    producer.dtype == precision.operand_dtype
+                    and (producer.dtype, source.dtype) in exact_widenings
+                ):
+                    rewritten[index] = producer.id
+            inputs = tuple(rewritten)
+        nodes.append(
+            TensorNode(
+                node.id,
+                node.op,
+                inputs,
+                node.axes,
+                node.dtype,
+                node.attributes,
+            )
+        )
+    symbolic = eliminate_dead_code(
+        TensorProgram(region.axes, tuple(nodes), region.results)
+    )
+    arguments = tuple(
+        (str(_attribute(node, "name")), node.id)
+        for node in symbolic.nodes
+        if node.op == "argument"
+    )
+    return TensorRegion(symbolic.axes, symbolic.nodes, arguments, symbolic.outputs)
+
+
 def plan_materializations(program: TensorProgram) -> TensorProgram:
     """Validate the prototype's conservative output-only store policy."""
     output_ids = {node_id for _, node_id in program.outputs}
@@ -479,5 +540,6 @@ __all__ = [
     "optimize_program",
     "plan_materializations",
     "program_to_region",
+    "realize_contraction_precision",
     "simplify_constants",
 ]
