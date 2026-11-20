@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import math
+import sys
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -16,6 +17,7 @@ from cutilereduce.experimental.backends.cpu.schedule import (
     CpuLoop,
     CpuScheduleConfig,
     CpuScheduledPlan,
+    CpuTarget,
 )
 from cutilereduce.experimental.ir.core import TensorRegion
 from cutilereduce.experimental.compiler.operator import FoldOperator, FoldProgram
@@ -35,6 +37,21 @@ from cutilereduce.experimental.planning.target import TargetModel
 
 
 from .codegen import emit_cpp_source
+
+
+def _cpu_build_flags(*, scheduled_backward: bool = False):
+    """Match ATen's parallel backend when compiling local generated loops."""
+    import torch
+
+    cflags = ["-O3", "-march=native"]
+    ldflags = []
+    if scheduled_backward:
+        cflags.append("-std=c++20")
+    if sys.platform.startswith("linux") and torch.backends.openmp.is_available():
+        # ParallelOpenMP.h only enables its parallel_for template under _OPENMP.
+        cflags.append("-fopenmp")
+        ldflags.append("-fopenmp")
+    return cflags, ldflags
 
 
 def _region_arguments(region: TensorRegion, values: dict[str, Any]) -> list[Any]:
@@ -602,6 +619,7 @@ def compile_cpu(
     schedule: CpuScheduleConfig | None = None,
     backward_schedule: CpuScheduleConfig | None = None,
     backward_program: ScheduledBackwardProgram | None = None,
+    target: CpuTarget | None = None,
 ) -> CompiledCpuFold:
     """Compile size-specialized symbolic regions into a cached C++ extension."""
     from torch.utils.cpp_extension import load_inline
@@ -630,7 +648,7 @@ def compile_cpu(
                 for candidate in candidates
                 if candidate.name == "partial_scan_checkpoints"
             )
-        choice = select_cpu_plan(problem, candidates, sizes)
+        choice = select_cpu_plan(problem, candidates, sizes, target=target)
         selected = choice.plan
         schedule = choice.config
     else:
@@ -649,6 +667,7 @@ def compile_cpu(
         problem,
         selected,
         sizes,
+        target=target,
         config=schedule,
     )
     scheduled = forward_scheduled
@@ -772,23 +791,24 @@ def compile_cpu(
             scheduled_forward=(scheduled if extent == full_extent else None),
             forward_extents=(tuple(sorted(extents)) if extent == full_extent else ()),
         )
+        extra_cflags, extra_ldflags = _cpu_build_flags(scheduled_backward=backward_program is not None)
         key = json.dumps(
             {
                 "source": source,
+                "cflags": extra_cflags,
+                "ldflags": extra_ldflags,
                 "sizes": sorted(local_sizes.items()),
                 "target": scheduled.target.architecture,
             },
             sort_keys=True,
         ).encode()
         name = "cutilereduce_cpu_" + hashlib.sha256(key).hexdigest()[:16]
-        extra_cflags = ["-O3", "-march=native"]
-        if backward_program is not None:
-            extra_cflags.append("-std=c++20")
         modules[extent] = load_inline(
             name=name,
             cpp_sources=source,
             functions=None,
             extra_cflags=extra_cflags,
+            extra_ldflags=extra_ldflags,
             with_cuda=False,
             verbose=verbose,
         )

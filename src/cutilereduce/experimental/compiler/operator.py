@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
+from functools import cached_property
+from types import MappingProxyType
 from typing import cast
 
 from cutilereduce.experimental.algebra import (
@@ -65,6 +67,15 @@ class FoldProgram:
             raise ValueError(
                 "a commutative semantic monoid must have prefix-free finalize"
             )
+
+    @cached_property
+    def region_facts(self):
+        """DSL-derived facts shared by every planner and backend."""
+        from cutilereduce.experimental.ir.facts import analyze_region_facts
+
+        return MappingProxyType({field.name: analyze_region_facts(region)
+                                 for field in fields(self)
+                                 if isinstance(region := getattr(self, field.name), TensorRegion)})
 
     @property
     def requires_prefix(self) -> bool:

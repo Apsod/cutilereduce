@@ -313,12 +313,13 @@ def test_cpu_source_emits_named_regions_and_named_axis_reduction():
     source = emit_cpp_source(problem, {"b": 3, "f": 7}, backward=True)
 
     assert "std::vector<torch::Tensor> map_fold" in source
-    assert "at::sum(" in source
+    assert "fused reduction" in source
+    assert "accumulated = accumulated +" in source
     assert "std::vector<torch::Tensor> project_output" in source
     assert 'm.def("map_fold", &map_fold,' in source
 
 
-def test_cpu_source_lowers_named_axis_contractions_to_bmm():
+def test_cpu_source_fuses_named_axis_dot_reductions():
     spec = FoldSpec(
         inputs={
             "lhs": TensorSpec(("b", "f", "k"), dtype="bfloat16"),
@@ -344,7 +345,8 @@ def test_cpu_source_lowers_named_axis_contractions_to_bmm():
         problem, {"b": 2, "f": 7, "k": 8}, backward=False
     )
 
-    assert "at::bmm(" in source
+    assert "fused reduction" in source
+    assert "accumulated = accumulated +" in source
     assert "at::einsum" not in source
     assert ".to(at::kFloat)" in source
 

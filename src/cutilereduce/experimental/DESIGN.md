@@ -1237,7 +1237,7 @@ Not implemented yet:
 - automatic inference of optimized fold-accumulate lowerings beyond supplied
   monoid specializations;
 - explicit carrier ordering/merge capabilities, including compensated sums;
-- explicit SIMD lowering beyond compiler auto-vectorization.
+- broader CPU SIMD coverage beyond the FP32/FP64 fused pointwise and trailing-reduction loops.
 
 The package is intentionally independent of the existing executable fold
 implementation while these interfaces are still being tested.

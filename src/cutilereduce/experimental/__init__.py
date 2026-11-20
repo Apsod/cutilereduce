@@ -189,7 +189,65 @@ from cutilereduce.experimental.backends.cutile.schedule import (
 from cutilereduce.experimental.backends.cutile.codegen import emit_cutile_backward_source, emit_cutile_source
 from cutilereduce.experimental.planning.target import TargetModel
 
+from cutilereduce.experimental.ir.cost import OperationCost, RegionCost, KernelCost, RegionRealizationCost, analyze_region
+from cutilereduce.experimental.planning.analysis import (
+    AnalyticalTarget, AnalyticalSweep, CandidateEstimate, PlanningProblem,
+    ScheduleCandidate, ScheduleCost, StageCost, RegionInvocation,
+)
+from cutilereduce.experimental.planning.tuning import (
+    TuningMeasurement, TuningResult, load_candidate, tune_candidates,
+)
+from cutilereduce.experimental.backends.cpu.analysis import CpuCostModel, analyze_cpu_region
+from cutilereduce.experimental.backends.cpu.tuning import (
+    compile_cpu_candidate, cpu_analytical_target, tune_cpu,
+)
+from cutilereduce.experimental.backends.cutile.runtime import (
+    CompiledCuTileFold, compile_cutile_candidate,
+)
+from cutilereduce.experimental.backends.cutile.tuning import tune_cutile
+
+from cutilereduce.experimental.ir.facts import (
+    ValueFacts, ContractionFacts, RegionFacts, analyze_region_facts,
+)
+from cutilereduce.experimental.planning.accounting import (
+    AxisDomain, BufferAccounting, ContributionOwnership, ExecutionScope,
+    ScheduleDomain, contribution_ownership,
+)
+
 __all__ = [
+    "ValueFacts",
+    "ContractionFacts",
+    "RegionFacts",
+    "analyze_region_facts",
+    "AxisDomain",
+    "BufferAccounting",
+    "ContributionOwnership",
+    "ExecutionScope",
+    "ScheduleDomain",
+    "contribution_ownership",
+
+    "KernelCost", "RegionRealizationCost", "RegionInvocation", "CpuCostModel", "analyze_cpu_region",
+    "OperationCost",
+    "RegionCost",
+    "analyze_region",
+    "AnalyticalTarget",
+    "AnalyticalSweep",
+    "CandidateEstimate",
+    "PlanningProblem",
+    "ScheduleCandidate",
+    "ScheduleCost",
+    "StageCost",
+    "TuningMeasurement",
+    "TuningResult",
+    "load_candidate",
+    "tune_candidates",
+    "compile_cpu_candidate",
+    "cpu_analytical_target",
+    "tune_cpu",
+    "CompiledCuTileFold",
+    "compile_cutile_candidate",
+    "tune_cutile",
+
     "AxisAffineIndex",
     "ContractionAxes",
     "ContractionPrecision",

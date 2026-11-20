@@ -1,0 +1,154 @@
+{
+  "sizes": {
+    "h": 1,
+    "l": 2048,
+    "g": 1,
+    "r": 2048,
+    "dqk": 32,
+    "dv": 32
+  },
+  "dtype": "float32",
+  "iterations": 120,
+  "validation": "outputs and random-cotangent input VJPs",
+  "hardware": {
+    "architecture": "x86_64",
+    "worker_count": 8,
+    "vector_bytes": 64,
+    "cache_line_bytes": 64,
+    "l1_data_bytes": 49152,
+    "l2_bytes": 1310720,
+    "l3_bytes": 12582912
+  },
+  "candidates": {
+    "full": {
+      "candidate": {
+        "family": "fused_tree",
+        "parameters": {
+          "tile.g": 1,
+          "tile.h": 1,
+          "tile.l": 2048,
+          "tile.r": 2048
+        },
+        "backward": true,
+        "loop_axis": "r"
+      },
+      "compile_seconds": 0.39020193399846903,
+      "gradient_commits": {
+        "query": "store",
+        "key": "store",
+        "value": "store"
+      }
+    },
+    "query_128": {
+      "candidate": {
+        "family": "fused_tree",
+        "parameters": {
+          "backward_tile.l": 128,
+          "backward_tile.r": 2048,
+          "tile.g": 1,
+          "tile.h": 1,
+          "tile.l": 128,
+          "tile.r": 2048
+        },
+        "backward": true,
+        "loop_axis": "l"
+      },
+      "compile_seconds": 0.050435921002645046,
+      "gradient_commits": {
+        "query": "store",
+        "key": "store",
+        "value": "store"
+      }
+    }
+  },
+  "results": {
+    "1": {
+      "forward": {
+        "torch_eager": {
+          "median_ms": 14.821581498836167,
+          "p25_ms": 14.175559001159854,
+          "p75_ms": 17.77058900188422,
+          "speedup_over_eager": 1.0
+        },
+        "full": {
+          "median_ms": 13.429647500743158,
+          "p25_ms": 12.790788998245262,
+          "p75_ms": 13.919994999014307,
+          "speedup_over_eager": 1.1036463539356476
+        },
+        "query_128": {
+          "median_ms": 9.597477001079824,
+          "p25_ms": 9.41418100046576,
+          "p75_ms": 9.954454999387963,
+          "speedup_over_eager": 1.54432060604767
+        }
+      },
+      "forward_backward": {
+        "torch_eager": {
+          "median_ms": 42.129810999540496,
+          "p25_ms": 40.86746800021501,
+          "p75_ms": 44.58678300215979,
+          "speedup_over_eager": 1.0
+        },
+        "full": {
+          "median_ms": 55.532739501359174,
+          "p25_ms": 53.55890300052124,
+          "p75_ms": 58.50949900195701,
+          "speedup_over_eager": 0.7586481664299914
+        },
+        "query_128": {
+          "median_ms": 32.98620299938193,
+          "p25_ms": 31.55934099777369,
+          "p75_ms": 35.09177700107102,
+          "speedup_over_eager": 1.2771949229903754
+        }
+      }
+    },
+    "4": {
+      "forward": {
+        "torch_eager": {
+          "median_ms": 6.673912499536527,
+          "p25_ms": 6.384607997460989,
+          "p75_ms": 7.364306002273224,
+          "speedup_over_eager": 1.0
+        },
+        "full": {
+          "median_ms": 7.159271001000889,
+          "p25_ms": 6.273335999139817,
+          "p75_ms": 8.484958001645282,
+          "speedup_over_eager": 0.9322055972742885
+        },
+        "query_128": {
+          "median_ms": 4.620331499609165,
+          "p25_ms": 4.345807999925455,
+          "p75_ms": 5.700311001419323,
+          "speedup_over_eager": 1.444466160079872
+        }
+      },
+      "forward_backward": {
+        "torch_eager": {
+          "median_ms": 21.944816000541323,
+          "p25_ms": 20.287383998947917,
+          "p75_ms": 24.994256000354653,
+          "speedup_over_eager": 1.0
+        },
+        "full": {
+          "median_ms": 31.86578650092997,
+          "p25_ms": 29.74866799922893,
+          "p75_ms": 35.889486000087345,
+          "speedup_over_eager": 0.6886638746512936
+        },
+        "query_128": {
+          "median_ms": 16.609660500762402,
+          "p25_ms": 15.8731359988451,
+          "p75_ms": 19.87342799839098,
+          "speedup_over_eager": 1.321207980110974
+        }
+      }
+    }
+  },
+  "cpu_model": "11th Gen Intel Core i7-1165G7 @ 2.80GHz",
+  "torch_version": "2.10.0+cu128",
+  "aten_cpu_capability": "AVX512",
+  "date": "2026-11-19"
+}

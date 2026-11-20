@@ -215,7 +215,26 @@ def _substitute(value, values):
     if isinstance(value, Variable):
         return values.get(value.name, value)
     if isinstance(value, Polynomial):
-        return value.subs(values)
+        # A logical extent can be bound to a tile expression such as min(N,T).
+        # Polynomial.subs handles constants/renaming; composite replacements
+        # require rebuilding the expression rather than silently retaining N.
+        composite = any(
+            name in values and not isinstance(values[name], (int, float, Fraction, Variable, np.number))
+            for name in value.variables
+        )
+        if not composite:
+            return value.subs(values)
+        terms = []
+        for monomial in value.monomials:
+            factors = [monomial.coefficient]
+            for name, exponent in monomial.exponents.mapping:
+                replacement = values.get(name, Variable(name))
+                if exponent == 1:
+                    factors.append(replacement)
+                else:
+                    factors.append(Node("pow", (replacement, exponent)))
+            terms.append(_combine("mul", *factors))
+        return _combine("add", *terms) if terms else Polynomial.zero()
     if isinstance(value, Node):
         return Node(value.op, tuple(_substitute(a, values) for a in value.args))
     return value

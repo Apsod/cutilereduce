@@ -161,6 +161,8 @@ def _initial_state_lines(
 
 def emit_cutile_source(
     specialized: SpecializedSchedule,
+    *,
+    save_execution: bool = False,
 ) -> str:
     """Emit cuTile source from a self-contained specialized schedule."""
     if getattr(specialized.target, "name", specialized.target) != "cutile":
@@ -213,7 +215,9 @@ def emit_cutile_source(
             "project output requires an execution field not produced by identity"
         ) from error
     parameters = ", ".join(
-        (*buffers, *(f"out_{name.replace('.', '_')}" for name in destinations))
+        (*buffers, *(f"out_{name.replace('.', '_')}" for name in destinations),
+         *(f"saved_{name.replace('.', '_')}" for name, _ in problem.map_fold.results
+           if save_execution))
     )
     grid = stage.grid_partitions
     loop_partition = next(
@@ -323,6 +327,15 @@ def emit_cutile_source(
             f"{_tuple(indices or owner_indices)}, "
             f"ct.reshape(visible[{index}], {_tuple(shape)}))"
         )
+    if save_execution:
+        for name, node_id in problem.map_fold.results:
+            node = problem.map_fold.nodes[node_id]
+            indices = tuple(coordinates.get(axis, "0") for axis in node.axes)
+            shape = _shape(node.axes, sizes, tiles)
+            lines.append(
+                f"    ct.store(saved_{name.replace('.', '_')}, {_tuple(indices)}, "
+                f"ct.reshape(state[{identity_positions[name]}], {_tuple(shape)}))"
+            )
     source = "\n\n".join(
         (
             "import cuda.tile as ct",

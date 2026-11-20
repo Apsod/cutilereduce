@@ -101,17 +101,27 @@ def _emit_scheduled_backward(
         f"const torch::Tensor& {_cpp_name(name)}" for name, _ in region.arguments
     )
     lines = [f"std::vector<torch::Tensor> scheduled_backward({parameters}) {{"]
+    if (program.loop_programs == 1 and program.loop_axis.count == 1
+            and all(axis.count == 1 for axis in program.program_axes)
+            and len(local_sizes) == 1):
+        # One complete region already owns every returned gradient. Forward its
+        # results directly instead of allocating/copying destination buffers.
+        arguments = ", ".join(_cpp_name(name) for name, _ in region.arguments)
+        lines.append(f"  auto partial = {variant_names[0]}({arguments});")
+        results = ", ".join(f"partial[{result_indices[g.result_name]}]" for g in program.gradients)
+        lines.extend((f"  return {{{results}}};", "}"))
+        return variants, "\n".join(lines)
     for gradient in program.gradients:
         node = region.nodes[dict(region.results)[gradient.result_name]]
+        factory = "empty" if gradient.commit_mode is CommitMode.STORE else "zeros"
         lines.append(
-            f"  auto grad_{_cpp_name(gradient.input_name)} = at::zeros("
+            f"  auto grad_{_cpp_name(gradient.input_name)} = at::{factory}("
             f"{_axes_literal(gradient.axes, sizes)}, "
             f"at::TensorOptions().dtype({_CPP_DTYPE[node.dtype]}));"
         )
     program_count = math.prod(axis.count for axis in program.program_axes)
-    lines.append(
-        f"  at::parallel_for(0, {program_count}, 1, [&](int64_t begin, int64_t end) {{"
-    )
+    lines.append("  auto run_programs = [&](int64_t begin, int64_t end) {")
+    lines.append("    at::NoGradGuard no_grad;")
     lines.append(
         "    for (int64_t program_id = begin; program_id < end; ++program_id) {"
     )
@@ -189,12 +199,14 @@ def _emit_scheduled_backward(
             source = f"partial[{result_index}]"
             local = f"local_{_cpp_name(gradient.input_name)}"
             if gradient.lifetime is LocalLifetime.PERSISTENT:
-                lines.extend(
-                    (
-                        f"          if (!{local}.defined()) {local} = at::zeros_like({source});",
-                        f"          {local}.add_({source});",
-                    )
-                )
+                if loop.count == 1:
+                    # No later update: borrowing the partial until its commit is safe.
+                    lines.append(f"          {local} = {source};")
+                else:
+                    # Region results can alias borrowed arguments; establish a
+                    # private accumulator before subsequent in-place additions.
+                    lines.append(f"          if (!{local}.defined()) {local} = {source}.clone();")
+                    lines.append(f"          else {local}.add_({source});")
             else:
                 lines.extend(destination_lines(gradient, source, "          "))
         lines.append("        }")
@@ -211,7 +223,13 @@ def _emit_scheduled_backward(
                     "      ",
                 )
             )
-    lines.extend(("    }", "  });"))
+    lines.extend(("    }", "  };"))
+    if program_count == 1:
+        # A serial owner can still use intra-op parallelism inside its GEMMs
+        # and fused regions. parallel_for's serial fallback installs a guard.
+        lines.append("  run_programs(0, 1);")
+    else:
+        lines.append(f"  at::parallel_for(0, {program_count}, 1, run_programs);")
     results = ", ".join(
         f"grad_{_cpp_name(gradient.input_name)}" for gradient in program.gradients
     )
@@ -497,6 +515,7 @@ def _emit_scheduled_forward_tile(
             tree = "true" if expression.topology is FoldTopology.TREE else "false"
             body = [
                 f"    const int64_t count = (extent + {grain} - 1) / {grain};",
+                f"    if (count == 1) return {child}(start, extent);",
                 "    std::vector<std::vector<torch::Tensor>> values(count);",
             ]
             loop_body = [
@@ -508,6 +527,7 @@ def _emit_scheduled_forward_tile(
                 body.extend(
                     [
                         "    at::parallel_for(0, count, 1, [&](int64_t begin, int64_t end) {",
+                        "      at::NoGradGuard no_grad;",
                         "      for (int64_t index = begin; index < end; ++index) {",
                         *(f"        {line}" for line in loop_body),
                         "      }",
@@ -555,6 +575,7 @@ def _emit_scheduled_forward_tile(
             lines.extend(
                 (
                     "  at::parallel_for(0, partition_count, 1, [&](int64_t begin, int64_t end) {",
+                    "    at::NoGradGuard no_grad;",
                     "    for (int64_t index = begin; index < end; ++index) {",
                     *(f"      {line}" for line in map_body),
                     "    }",
@@ -714,6 +735,10 @@ def _emit_scheduled_forward(
         f"const torch::Tensor& {_cpp_name(name)}" for name in problem.spec.inputs
     )
     lines = [f"std::vector<torch::Tensor> scheduled_forward({parameters}) {{"]
+    if all(tile_sizes[axis] == sizes[axis] for axis in owner_axes):
+        arguments = ", ".join(_cpp_name(name) for name in problem.spec.inputs)
+        lines.extend((f"  return {tile_functions[owner_shapes[0]]}({arguments});", "}"))
+        return functions, "\n".join(lines)
     output_nodes = [
         problem.project_output.nodes[node_id]
         for _, node_id in problem.project_output.results
@@ -744,6 +769,7 @@ def _emit_scheduled_forward(
     lines.extend(
         (
             f"  at::parallel_for(0, {owner_count}, 1, [&](int64_t begin, int64_t end) {{",
+            "    at::NoGradGuard no_grad;",
             "    for (int64_t owner = begin; owner < end; ++owner) {",
             "      int64_t owner_remainder = owner;",
         )
@@ -962,6 +988,7 @@ void atomic_add_relaxed(torch::Tensor destination, torch::Tensor source) {
 """
     return f"""#include <torch/extension.h>
 #include <ATen/Parallel.h>
+#include <ATen/core/grad_mode.h>
 #include <algorithm>
 #include <atomic>
 #include <cmath>

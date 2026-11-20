@@ -15,7 +15,7 @@ from cutilereduce.experimental.backends.cpu.schedule import (
     CpuTarget,
     schedule_cpu,
 )
-from cutilereduce.experimental.ir.core import ContractionAxes, TensorRegion
+from cutilereduce.experimental.ir.core import TensorRegion
 from cutilereduce.experimental.compiler.operator import FoldProgram
 from cutilereduce.experimental.planning.templates import (
     MapFoldRegion,
@@ -66,45 +66,9 @@ def _elements(axes: tuple[str, ...], sizes: dict[str, int]) -> int:
 
 def estimate_region_work(region: TensorRegion, sizes: dict[str, int]) -> int:
     """Count scalar operations represented by one region invocation."""
-    work = 0
-    for node in region.nodes:
-        elements = _elements(node.axes, sizes)
-        if node.op in {"argument", "constant", "zero", "full", "cast", "stop_gradient"}:
-            continue
-        if node.op in {"contract", "contract_accumulate"}:
-            partition = node.attribute("contraction_axes")
-            if not isinstance(partition, ContractionAxes):
-                raise TypeError("contract node has invalid axis metadata")
-            reduction = _elements(partition.reduce, sizes)
-            work += 2 * elements * reduction
-        elif node.op.startswith("reduce_"):
-            over = node.attribute("over")
-            work += elements * _elements(over, sizes)
-        elif node.op in {
-            "exp",
-            "log",
-            "log1p",
-            "expm1",
-            "sin",
-            "cos",
-            "tanh",
-            "sigmoid",
-            "sqrt",
-            "rsqrt",
-        }:
-            work += 4 * elements
-        elif node.op == "powi":
-            from cutilereduce.experimental.ir.ops import multiplication_chain
+    from cutilereduce.experimental.ir.cost import analyze_region
 
-            exponent = node.attribute("exponent")
-            work += elements * (
-                len(multiplication_chain(abs(exponent))) + (exponent < 0)
-                if exponent
-                else 0
-            )
-        else:
-            work += elements
-    return work
+    return int(analyze_region(region, sizes).work.total)
 
 
 def _region(problem: FoldProgram, leaf: CpuLeaf) -> TensorRegion | None:
@@ -221,13 +185,21 @@ def select_cpu_plan(
                 )
                 cost = estimate_cpu_plan(problem, scheduled)
                 choices.append(CpuPlanChoice(plan, config, scheduled, cost))
-    return min(
-        choices,
-        key=lambda choice: choice.cost.score(
-            workers=target.worker_count,
-            vector_bytes=target.vector_bytes,
-        ),
-    )
+    from cutilereduce.experimental.backends.cpu.tuning import cpu_analytical_target
+    from cutilereduce.experimental.planning.analysis import PlanningProblem
+
+    analytical = PlanningProblem(problem, cpu_analytical_target(target), sizes)
+
+    def score(choice):
+        parameters = {
+            f"tile.{a}": min(sizes[a], 64)
+            for a in (*problem.spec.batch_axes, axis)
+        }
+        parameters[f"tile.{axis}"] = dict(choice.config.chunk_sizes)[axis]
+        parameters["partition_count"] = choice.config.partition_count or 1
+        return float(analytical.estimate(choice.plan.name, parameters=parameters).estimated_seconds)
+
+    return min(choices, key=score)
 
 
 __all__ = [

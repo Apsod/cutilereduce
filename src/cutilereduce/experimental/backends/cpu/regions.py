@@ -1,4 +1,4 @@
-"""Lower tensor regions to ATen C++ operations, independently of schedules."""
+"""Lower regions to native fused CPU loops and ATen GEMMs."""
 
 from __future__ import annotations
 
@@ -175,19 +175,35 @@ def _emit_region(
     sizes: dict[str, int],
     *,
     nested_names: dict[int, str] | None = None,
+    fuse: bool = True,
 ) -> str:
+    from .fusion import HEADERS, RegionFusion
+
+    fusion = RegionFusion(region) if fuse else None
+    owned: set[int] = set()
     function = _cpp_name(name)
     argument_names = {node_id: _cpp_name(arg) for arg, node_id in region.arguments}
     parameters = ", ".join(
         f"const torch::Tensor& {argument_names[node_id]}"
         for _, node_id in region.arguments
     )
-    lines = [f"std::vector<torch::Tensor> {function}({parameters}) {{"]
+    lines = [f"std::vector<torch::Tensor> {function}({parameters}) {{",
+             "  at::NoGradGuard no_grad;"]
     values: dict[int, str] = dict(argument_names)
     for node in region.nodes:
+        if fusion is not None and node.id not in fusion.required:
+            continue
         if node.id in argument_names:
             continue
         if node.id in values:
+            continue
+        if fusion is not None and node.id in fusion.groups:
+            lines.extend(fusion.emit(node.id, values, sizes, owned))
+            values[node.id] = f"v{node.id}"
+            if node.id in fusion.combined_reductions:
+                combined = fusion.combined_reductions[node.id]
+                values[combined] = f"v{combined}"
+                owned.add(combined)
             continue
         if node.op.startswith("associative_scan_"):
             combine = _attr(node, "combine_region")
@@ -421,7 +437,10 @@ def _emit_region(
                 )
         lines.append(f"  auto {variable} = {expression};")
         values[node.id] = variable
+        if node.op not in {"stop_gradient", "cast"}:
+            owned.add(node.id)
     results = ", ".join(values[node_id] for _, node_id in region.results)
     lines.append(f"  return {{{results}}};")
     lines.append("}")
-    return "\n".join(lines)
+    body = "\n".join(lines)
+    return HEADERS + "\n" + body if fusion is not None and fusion.groups else body

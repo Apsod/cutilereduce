@@ -13,6 +13,7 @@ from enum import Enum
 import math
 
 from cutilereduce.experimental.compiler.operator import FoldProgram
+from cutilereduce.experimental.planning.accounting import contribution_ownership
 
 
 class LocalLifetime(Enum):
@@ -171,6 +172,14 @@ class ScheduledBackwardProgram:
             raise ValueError("loop program count must be positive")
 
     @property
+    def contributions(self):
+        """Required reductions before choosing stores, atomics or another implementation."""
+        owners = {axis.axis: axis.count for axis in self.program_axes}
+        owners[self.loop_axis.axis] = self.loop_programs
+        return {g.input_name: contribution_ownership(g.axes, owners, loop_axes=(self.loop_axis.axis,))
+                for g in self.gradients}
+
+    @property
     def body(self) -> Parallel:
         """Materialize the declarative schedule as visitable operations."""
         if any(
@@ -287,8 +296,10 @@ def build_backward_program(
         node_id = results.get(result_name)
         if node_id is None:
             continue
-        axes = region.nodes[node_id].axes
-        streamed = loop_axis in axes
+        region_name = "map_finalize_map_vjp_accumulate" if problem.requires_prefix else "map_finalize_map_vjp"
+        value = problem.region_facts[region_name].result(result_name)
+        axes = value.axes
+        streamed = value.depends_on((loop_axis,))
         gradients.append(
             ScheduledGradient(
                 name,
@@ -327,23 +338,24 @@ def build_backward_program(
     )
 
 
-def resolve_writes(program: ScheduledBackwardProgram) -> ScheduledBackwardProgram:
+def resolve_writes(
+    program: ScheduledBackwardProgram, *, shared_commit: CommitMode | None = CommitMode.ATOMIC_ADD_RELAXED,
+) -> ScheduledBackwardProgram:
     """Resolve shared commits from program-axis writer multiplicity.
 
     A program partition contributes to a result without owning a distinct
     destination whenever that program axis is absent from the result axes.
-    Only axes with more than one program participate in contention.
+    Only axes with more than one program participate in contention. Pass
+    shared_commit=None to retain the reduction requirement without choosing an
+    implementation. The existing executors select relaxed atomics explicitly.
     """
     gradients = []
     for gradient in program.gradients:
-        contention = tuple(
-            axis.axis
-            for axis in program.program_axes
-            if axis.count > 1 and axis.axis not in gradient.axes
-        )
-        if program.loop_programs > 1 and program.loop_axis.axis not in gradient.axes:
-            contention = (*contention, program.loop_axis.axis)
-        mode = CommitMode.ATOMIC_ADD_RELAXED if contention else CommitMode.STORE
+        ownership = program.contributions[gradient.input_name]
+        contention = ownership.owner_axes
+        if contention and shared_commit is CommitMode.STORE:
+            raise ValueError("shared contributions require a reduction; a plain store would lose contributions")
+        mode = (shared_commit or CommitMode.UNRESOLVED) if contention else CommitMode.STORE
         gradients.append(
             replace(
                 gradient,
