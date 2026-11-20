@@ -16,10 +16,9 @@ import time
 
 import torch
 
-from cutilereduce.experimental import (
-    CpuTarget, PlanningProblem, ScheduleCandidate, compile_cpu_candidate,
-    cpu_analytical_target,
-)
+from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
+from cutilereduce.experimental.planning.analysis import PlanningProblem, ScheduleCandidate
+from cutilereduce.experimental.backends.cpu.tuning import compile_cpu_candidate, cpu_analytical_target
 from examples.experimental_cpu_single_tile import attention_operator, reference
 
 

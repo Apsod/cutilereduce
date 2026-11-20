@@ -5,26 +5,16 @@ from __future__ import annotations
 from dataclasses import asdict, dataclass, replace
 
 from cutilereduce.core import symbolic as sym
-from cutilereduce.experimental.ir.core import TensorNode, TensorRegion
+from cutilereduce.experimental.ir.core import TensorRegion
 from cutilereduce.experimental.ir.cost import (
     KernelCost, OperationCost, RegionCost, RegionRealizationCost,
-    analyze_region, elements,
+    analyze_operation, elements,
 )
 from cutilereduce.experimental.ir.facts import analyze_region_facts
-from .fusion import RegionFusion
+from .realization import realize_cpu_region
 
 
-def _node_work(node, nodes, sizes):
-    # Analyze an isolated operation without traversing its original producers.
-    leaves = tuple(TensorNode(i, "argument", (), nodes[n].axes, nodes[n].dtype)
-                   for i, n in enumerate(node.inputs))
-    operation = replace(node, id=len(leaves), inputs=tuple(range(len(leaves))))
-    region = TensorRegion(tuple(sizes), (*leaves, operation),
-                          tuple((str(i), i) for i in range(len(leaves))), (("result", operation.id),))
-    return analyze_region(region, sizes).work
-
-
-def analyze_cpu_region(region: TensorRegion, extents=None) -> RegionCost:
+def analyze_cpu_region(region: TensorRegion, extents=None, *, implementation=None) -> RegionCost:
     """Symbolic CPU kernel work, traffic, allocations and retained storage.
 
     Native groups count inlined operations at their actual loop domain, including
@@ -36,7 +26,10 @@ def analyze_cpu_region(region: TensorRegion, extents=None) -> RegionCost:
     facts = analyze_region_facts(region)
     logical = facts.cost.subs(sizes)
     contraction_facts = {c.node_id: c for c in facts.contractions}
-    fusion = RegionFusion(region)
+    implementation = implementation or realize_cpu_region(region)
+    if implementation.region is not region:
+        raise ValueError("CPU realization belongs to another region")
+    fusion = implementation.fusion
     nodes = region.nodes
     storage = {i: i for _, i in region.arguments}
     retained = {}
@@ -56,7 +49,7 @@ def analyze_cpu_region(region: TensorRegion, extents=None) -> RegionCost:
                 inline = nodes[i]
                 if inline.op in {"constant", "full", "zero", "domain_valid", "stop_gradient"}:
                     continue
-                work += _node_work(replace(inline, axes=group.axes), nodes, sizes)
+                work += analyze_operation(replace(inline, axes=group.axes), nodes, sizes)
             if group.dot:
                 work += OperationCost(arithmetic=count)
             if group.reduction:
@@ -67,7 +60,7 @@ def analyze_cpu_region(region: TensorRegion, extents=None) -> RegionCost:
                 work += OperationCost(reduction_ops=elements(reduction.axes, sizes) *
                                       sym.SaturateSub(elements(reduction.attribute("over"), sizes), 1))
         else:
-            work = _node_work(node, nodes, sizes)
+            work = analyze_operation(node, nodes, sizes)
         reads = sum(size(i) for i in dict.fromkeys(step.inputs))
         writes = sum(size(i) for i in step.outputs) if step.kind != "alias" else 0
         allocated = 0

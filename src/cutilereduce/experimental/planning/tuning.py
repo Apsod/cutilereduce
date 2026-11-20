@@ -24,6 +24,21 @@ def program_fingerprint(program):
     return hashlib.sha256(text.encode()).hexdigest()
 
 
+def target_fingerprint(target):
+    """Persist hardware/model identity without serializing executable callbacks."""
+    identity = {
+        "backend": target.backend, "hardware": dict(target.hardware_identity),
+        "model": dict(target.model_metadata),
+        "rules": {name: str(getattr(target, name)) for name in (
+            "workers", "tile_choices", "contraction_flops_per_second", "scalar_ops_per_second",
+            "transcendental_ops_per_second", "bytes_per_second", "launch_seconds", "atomic_weight",
+            "supported_forward_families", "power_of_two_tiles", "supports_prefix",
+            "fuse_online_projection", "embed_full_extent", "max_partitions",
+            "max_resident_bytes", "max_auxiliary_bytes", "extra_parameter_domains")},
+    }
+    return hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+
+
 @dataclass(frozen=True)
 class TuningMeasurement:
     candidate: ScheduleCandidate
@@ -41,7 +56,8 @@ class TuningResult:
     def save(self, path):
         """Save concrete decisions, not generated code or pickled callables."""
         Path(path).write_text(json.dumps({
-            "version": 1, "backend": self.problem.target.backend,
+            "version": 2, "backend": self.problem.target.backend,
+            "target_fingerprint": target_fingerprint(self.problem.target),
             "fingerprint": program_fingerprint(self.problem.program),
             "sizes": dict(self.problem.sizes),
             "selected": self.selected.to_dict(),
@@ -52,8 +68,10 @@ class TuningResult:
 
 def load_candidate(problem: PlanningProblem, path) -> ScheduleCandidate:
     value = json.loads(Path(path).read_text())
-    if value.get("version") != 1 or value.get("backend") != problem.target.backend:
+    if value.get("version") != 2 or value.get("backend") != problem.target.backend:
         raise ValueError("saved plan version or backend mismatch")
+    if value.get("target_fingerprint") != target_fingerprint(problem.target):
+        raise ValueError("saved plan hardware or cost model mismatch; select/tune again")
     if value["sizes"] != dict(problem.sizes) or value["fingerprint"] != program_fingerprint(problem.program):
         raise ValueError("saved plan does not match program and sizes")
     candidate = ScheduleCandidate.from_dict(value["selected"])
@@ -68,6 +86,7 @@ def tune_candidates(
     *,
     compile_candidate: Callable[[ScheduleCandidate], Any],
     validate: Callable[[Any], None],
+    compile_implementation: Callable[[Any], Any] | None = None,
     measure: Callable[[Any], float],
     sweep: AnalyticalSweep | None = None,
     backward: bool = False,
@@ -91,7 +110,9 @@ def tune_candidates(
             legal = problem.evaluate(candidate)
             if not legal.accepted:
                 raise ValueError(str(legal.rejection_reasons))
-            executable = compile_candidate(candidate)
+            executable = (compile_implementation(estimate.implementation)
+                          if compile_implementation is not None and estimate.implementation is not None
+                          else compile_candidate(candidate))
             validate(executable)
             seconds = float(measure(executable))
             if not math.isfinite(seconds) or seconds <= 0:

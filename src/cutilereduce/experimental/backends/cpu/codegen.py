@@ -26,7 +26,32 @@ from cutilereduce.experimental.planning.scheduled import (
 from cutilereduce.experimental.planning.ssa import liveness, scheduled_to_ssa
 
 
-from .regions import _CPP_DTYPE, _attr, _cpp_name, _axes_literal, _align, _emit_region
+from .regions import _CPP_DTYPE, _attr, _cpp_name, _axes_literal, _align, _emit_region as _emit_region_raw
+
+
+from contextvars import ContextVar
+from functools import wraps
+from .realization import CpuRegionRealizations
+
+_realizations: ContextVar[CpuRegionRealizations | None] = ContextVar("cpu_region_realizations", default=None)
+
+
+def _emit_region(name, region, sizes, **kwargs):
+    realizations = _realizations.get()
+    if realizations is not None:
+        kwargs["implementation"] = realizations.realize(region)
+    return _emit_region_raw(name, region, sizes, **kwargs)
+
+
+def _with_realizations(function):
+    @wraps(function)
+    def emit(*args, region_realizations=None, **kwargs):
+        token = _realizations.set(region_realizations or CpuRegionRealizations())
+        try:
+            return function(*args, **kwargs)
+        finally:
+            _realizations.reset(token)
+    return emit
 
 
 def _scheduled_local_sizes(
@@ -865,6 +890,7 @@ def _emit_scheduled_forward(
     return functions, "\n".join(lines)
 
 
+@_with_realizations
 def emit_cpp_source(
     problem: FoldProgram,
     sizes: dict[str, int],

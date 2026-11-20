@@ -137,44 +137,67 @@ def _autograd_function():
     return FoldFunction
 
 
-def compile_cutile_candidate(operator, problem, candidate):
-    """Specialize and load generated Python; actual GPU compilation is lazy."""
+def realize_cutile_candidate(problem, candidate):
+    """Bind concrete schedules without emitting source or loading executable code."""
     from dataclasses import replace
     if problem.target.backend != "cutile":
         raise ValueError("cuTile compilation requires a cuTile planning problem")
-    estimate = problem.evaluate(candidate)
-    if not estimate.accepted:
-        raise ValueError(str(estimate.rejection_reasons))
+    candidate = problem.validate_candidate(candidate)
     p = dict(candidate.parameters)
     sizes = dict(problem.sizes)
     space = build_schedule_space(problem.program)
     template = next(plan for plan in space.forward if plan.name == candidate.family)
-    tiles = {a: p[f"tile.{a}"] for a in (*operator.spec.batch_axes, *operator.spec.fold_axes)}
+    tiles = {a: p[f"tile.{a}"] for a in (*problem.program.spec.batch_axes, *problem.program.spec.fold_axes)}
     forward = specialize_cutile_schedule(problem.program, template, sizes, tiles=tiles)
     backward = None
-    backward_source = None
     if candidate.backward:
         btiles = {a: p.get(f"backward_tile.{a}", t) for a, t in tiles.items()}
         backward = specialize_cutile_backward_schedule(
-            problem.program, space.backward[0], sizes, loop_axis=candidate.loop_axis or operator.spec.fold_axes[0],
+            problem.program, space.backward[0], sizes, loop_axis=candidate.loop_axis or problem.program.spec.fold_axes[0],
             tiles=btiles, loop_programs=p.get("loop_programs", 1),
         )
         # Embed has its own batch tiling; it does not traverse the fold axis.
         embed, finalize = backward.implementation.stages
         from cutilereduce.experimental.planning.scheduled import ScheduledAxis
         from cutilereduce.experimental.planning.ssa import AxisPartition
-        etiles = {a: p.get(f"embed_tile.{a}", tiles[a]) for a in operator.spec.batch_axes}
+        etiles = {a: p.get(f"embed_tile.{a}", tiles[a]) for a in problem.program.spec.batch_axes}
         embed = replace(embed,
                         parallel_axes=tuple(ScheduledAxis(a, t, sizes[a]) for a, t in etiles.items()),
                         partitions=tuple(AxisPartition(a, sizes[a], t, math.ceil(sizes[a] / t)) for a, t in etiles.items()))
         backward = replace(backward, implementation=replace(backward.implementation, stages=(embed, finalize)))
-        backward_source = emit_cutile_backward_source(backward)
+    if candidate.backward:
+        from cutilereduce.experimental.planning.ssa import TiledBuffer
+        from cutilereduce.experimental.ir.core import TensorSignature
+        saved = TiledBuffer("saved_execution", tuple(
+            (name, TensorSignature(problem.program.map_fold.nodes[node].axes,
+                                   problem.program.map_fold.nodes[node].dtype))
+            for name, node in problem.program.map_fold.results))
+        forward = replace(forward, implementation=replace(forward.implementation, buffers=(saved,)))
+    return forward, backward
+
+
+def compile_cutile_candidate(operator, problem, candidate):
+    """Compile the concrete schedules; GPU compilation remains lazy."""
+    from .backend import CuTileBackend
+    from .target import CuTileTarget
+    backend = CuTileBackend(analytical_target=problem.target)
+    hardware = CuTileTarget(**dict(problem.target.hardware_identity))
+    prepared = backend.specialize(problem.program, hardware, sizes=dict(problem.sizes))
+    return backend.compile(backend.realize(prepared, candidate))
+
+
+def compile_cutile_realization(program, sizes, forward, backward=None):
+    """Emit and load previously realized schedules, without selecting again."""
+    backward_source = emit_cutile_backward_source(backward) if backward is not None else None
     directory = tempfile.TemporaryDirectory(prefix="cutilereduce-tuned-")
-    source = emit_cutile_source(forward, save_execution=candidate.backward)
+    save_execution = any(buffer.name == "saved_execution" for buffer in forward.implementation.buffers)
+    if save_execution != (backward is not None):
+        raise ValueError("saved execution buffers do not match backward realization")
+    source = emit_cutile_source(forward, save_execution=save_execution)
     fmodule = _load_source(source, directory.name, "_forward")
     bmodule = _load_source(backward_source, directory.name, "_backward") if backward_source else None
     # cuTile may inspect source lazily; cached modules must retain their files.
     for module in (fmodule, bmodule):
         if module is not None and not hasattr(module, "_generated_directory"):
             module._generated_directory = directory
-    return CompiledCuTileFold(problem.program, sizes, forward, fmodule, backward, bmodule, directory)
+    return CompiledCuTileFold(program, sizes, forward, fmodule, backward, bmodule, directory)

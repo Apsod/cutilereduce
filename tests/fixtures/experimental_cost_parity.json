@@ -1,0 +1,296 @@
+{
+  "online": {
+    "saved": 20.0,
+    "auxiliary": 40.0,
+    "stages": [
+      {
+        "name": "map_fold",
+        "read_bytes": 288.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 3.0,
+        "serial_steps": 3.0,
+        "resident_bytes_upper_bound": 56.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 5.630117500000001e-06,
+        "work": 144.0
+      },
+      {
+        "name": "project_output",
+        "read_bytes": 20.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 3.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 8.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 3.751e-07,
+        "work": 0.0
+      },
+      {
+        "name": "embed_output_vjp",
+        "read_bytes": 20.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 1.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 20.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 2.502e-07,
+        "work": 0.0
+      },
+      {
+        "name": "map_finalize_map_vjp",
+        "read_bytes": 120.0,
+        "write_bytes": 240.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 5.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 36.0,
+        "allocated_bytes": 180.0,
+        "estimated_seconds": 5.0030749999999995e-06,
+        "work": 60.0
+      }
+    ]
+  },
+  "fused_tree": {
+    "saved": 20.0,
+    "auxiliary": 80.0,
+    "stages": [
+      {
+        "name": "map_fold",
+        "read_bytes": 288.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 9.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 56.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 7.502620000000001e-06,
+        "work": 66.0
+      },
+      {
+        "name": "project_output",
+        "read_bytes": 20.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 3.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 8.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 3.751e-07,
+        "work": 0.0
+      },
+      {
+        "name": "embed_output_vjp",
+        "read_bytes": 20.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 1.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 20.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 2.502e-07,
+        "work": 0.0
+      },
+      {
+        "name": "map_finalize_map_vjp",
+        "read_bytes": 120.0,
+        "write_bytes": 240.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 5.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 36.0,
+        "allocated_bytes": 180.0,
+        "estimated_seconds": 5.0030749999999995e-06,
+        "work": 60.0
+      }
+    ]
+  },
+  "partial_fold": {
+    "saved": 20.0,
+    "auxiliary": 60.0,
+    "stages": [
+      {
+        "name": "map_fold",
+        "read_bytes": 384.0,
+        "write_bytes": 40.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 6.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 56.0,
+        "allocated_bytes": 40.0,
+        "estimated_seconds": 7.506889999999999e-06,
+        "work": 192.0
+      },
+      {
+        "name": "combine_partials",
+        "read_bytes": 40.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 3.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 24.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 5.004e-07,
+        "work": 5.0
+      },
+      {
+        "name": "project_output",
+        "read_bytes": 20.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 3.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 8.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 3.751e-07,
+        "work": 0.0
+      },
+      {
+        "name": "embed_output_vjp",
+        "read_bytes": 20.0,
+        "write_bytes": 20.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 1.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 20.0,
+        "allocated_bytes": 20.0,
+        "estimated_seconds": 2.502e-07,
+        "work": 0.0
+      },
+      {
+        "name": "map_finalize_map_vjp",
+        "read_bytes": 120.0,
+        "write_bytes": 240.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 5.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 36.0,
+        "allocated_bytes": 180.0,
+        "estimated_seconds": 5.0030749999999995e-06,
+        "work": 60.0
+      }
+    ]
+  },
+  "attention": {
+    "saved": 2304.0,
+    "auxiliary": 4608.0,
+    "stages": [
+      {
+        "name": "map_fold",
+        "read_bytes": 5664.0,
+        "write_bytes": 2304.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 6.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 2576.0,
+        "allocated_bytes": 2304.0,
+        "estimated_seconds": 2.864952e-05,
+        "work": 26496.0
+      },
+      {
+        "name": "project_output",
+        "read_bytes": 2304.0,
+        "write_bytes": 1728.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 6.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 672.0,
+        "allocated_bytes": 1728.0,
+        "estimated_seconds": 3.0761400000000003e-06,
+        "work": 2160.0
+      },
+      {
+        "name": "embed_output_vjp",
+        "read_bytes": 4032.0,
+        "write_bytes": 2304.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 1.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 4608.0,
+        "allocated_bytes": 2304.0,
+        "estimated_seconds": 2.3797999999999996e-06,
+        "work": 3456.0
+      },
+      {
+        "name": "map_finalize_map_vjp",
+        "read_bytes": 5728.0,
+        "write_bytes": 3424.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 2.0,
+        "serial_steps": 5.0,
+        "resident_bytes_upper_bound": 6056.0,
+        "allocated_bytes": 3424.0,
+        "estimated_seconds": 0.00013722192,
+        "work": 59040.0
+      }
+    ]
+  },
+  "affine": {
+    "saved": 180.0,
+    "auxiliary": 300.0,
+    "stages": [
+      {
+        "name": "map_fold",
+        "read_bytes": 960.0,
+        "write_bytes": 120.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 4.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 438.0,
+        "allocated_bytes": 120.0,
+        "estimated_seconds": 7.464442e-05,
+        "work": 944.0
+      },
+      {
+        "name": "scan_partials",
+        "read_bytes": 120.0,
+        "write_bytes": 180.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 2.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 120.0,
+        "allocated_bytes": 180.0,
+        "estimated_seconds": 8.888299999999999e-07,
+        "work": 39.0
+      },
+      {
+        "name": "project_output",
+        "read_bytes": 60.0,
+        "write_bytes": 60.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 2.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 40.0,
+        "allocated_bytes": 60.0,
+        "estimated_seconds": 2.503e-07,
+        "work": 0.0
+      },
+      {
+        "name": "embed_output_vjp",
+        "read_bytes": 72.0,
+        "write_bytes": 72.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 1.0,
+        "serial_steps": 1.0,
+        "resident_bytes_upper_bound": 72.0,
+        "allocated_bytes": 72.0,
+        "estimated_seconds": 2.5072e-07,
+        "work": 0.0
+      },
+      {
+        "name": "map_finalize_map_vjp",
+        "read_bytes": 1312.0,
+        "write_bytes": 960.0,
+        "atomic_bytes": 0.0,
+        "parallel_tasks": 4.0,
+        "serial_steps": 2.0,
+        "resident_bytes_upper_bound": 608.0,
+        "allocated_bytes": 540.0,
+        "estimated_seconds": 5.489189999999999e-05,
+        "work": 4512.0
+      }
+    ]
+  }
+}

@@ -6,10 +6,8 @@ uv run -m examples.experimental_accounting
 import json
 
 from cutilereduce.core.measure import Measure
-from cutilereduce.experimental import (
-    ExecutionScope, FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, ScheduleDomain,
-    StructuredValue, TensorSpec,
-)
+from cutilereduce.experimental.planning.accounting import ExecutionScope, ScheduleDomain
+from cutilereduce.experimental import FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec
 
 
 def main():

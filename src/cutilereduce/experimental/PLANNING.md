@@ -1,17 +1,18 @@
 # Analytical planning and tuning
 
 `PlanningProblem` combines a lowered `FoldProgram`, an explicit
-`AnalyticalTarget`, and optional logical-size bindings. Construction, region
+`BackendModel`, and optional logical-size bindings. Construction, region
 analysis, schedule costing, and candidate sweeps require no device discovery,
 compilation, or kernel execution. The legacy callback path remains unchanged.
 
 ```python
-from cutilereduce.experimental import AnalyticalTarget, PlanningProblem
+from cutilereduce.experimental.planning.analysis import PlanningProblem
+from cutilereduce.experimental.backends.cutile.analysis import cutile_analytical_target
 from examples.experimental_attention import operator
 
 program = operator().lower()
-target = AnalyticalTarget(
-    "cutile", workers=16,
+target = cutile_analytical_target(
+    workers=16,
     contraction_flops_per_second=1e12,
     scalar_ops_per_second=1e11,
     transcendental_ops_per_second=1e10,
@@ -124,7 +125,8 @@ uses synchronized CUDA events. Training calls use fresh autograd executions and
 fresh gradient accumulation buffers rather than accumulating `.grad` across runs.
 
 ```python
-from cutilereduce.experimental import tune_cpu, compile_cpu_candidate, load_candidate
+from cutilereduce.experimental.backends.cpu.tuning import tune_cpu, compile_cpu_candidate
+from cutilereduce.experimental.planning.tuning import load_candidate
 
 # op is a FoldOperator and inputs follow its declared input order.
 result = tune_cpu(op, sizes, inputs, reference=reference, backward=True,
@@ -229,3 +231,72 @@ model assumptions and selections alongside correctness checks and measurements.
 With singleton head/group axes, five query and five fold choices per stage,
 one-thread training has 7,500 candidates (the former coupled grid had 300).
 This is the full coarse grid, not every legal integer tile or schedule.
+
+## Backend and sweep contracts
+
+The user-facing pipeline is:
+
+```python
+from cutilereduce.experimental import analyze, compile, tune, CpuBackend, CpuTarget
+hardware = CpuTarget.detect()
+backend = CpuBackend()
+report = analyze(op, sizes, backend=backend, hardware=hardware, backward=True)
+f = compile(op, sizes, backend=backend, hardware=hardware, backward=True)
+result = tune(op, sizes, inputs, backend=backend, hardware=hardware,
+              reference=reference, backward=True, candidate_count=20)
+```
+
+`analyze` performs no discovery, compilation or execution. `compile` selects the
+analytical winner, or accepts an explicit candidate. `tune` analytically prunes,
+retains the top-k (20 by default, including one per forward family), validates
+outputs/random-cotangent gradients against the reference, measures complete
+workloads and selects the fastest valid candidate. Failed candidates are recorded.
+For custom shortlists, `report.shortlist(...)`, `planning.driver.compile_report`
+and `tune_report` operate on the same retained implementations. Timing does not
+implicitly calibrate the analytical model.
+
+Backends implement `specialize`, `realize`, `compile` and `execution_adapter`:
+
+- Specialization returns a `BackendProgram`: lowered program, hardware, shape,
+  schedule space and `BackendModel` (rates, capabilities and physical rules).
+- The space supplies templates; the model supplies domains and legality flags.
+  Backend-specific integer domains use `extra_parameter_domains`. Shared search
+  contains no CPU/cuTile-name dispatch.
+- Realization fixes a candidate into an `Implementation` with `BoundExecution`
+  (recursive bound loops) or `TiledExecution` (tiled SSA). More execution IR kinds
+  require shared visitors; missing rules are explicit errors.
+- Shared analysis derives logical work, padded repetition, traffic, storage and
+  commit costs from that IR, applying specialized physical region/stage rules.
+- Compilation consumes the retained realization. The execution adapter owns
+  synchronization and timing, not scheduling or winner selection.
+
+CPU emission and costing consume the same bound forward/backward choices and
+region fusion/reuse registry. cuTile costs its fused online stage, saved execution
+buffers, embed stage and finalize SSA without requiring a GPU. Both concrete
+sweeps use this path, including `PlanningProblem.sweep` when supplied a model from
+`cpu_analytical_target` or `cutile_analytical_target`.
+
+`PlanningProblem.estimate` also supports partially bound, template-level symbolic
+estimates. Fully bound backend estimates and sweeps realize concrete IR. Generic
+models without a realizer provide coarse template estimates; they do not claim
+physical implementation fidelity. Frozen fixtures verify numerical parity for
+ragged Add, partial folds, asymmetric attention and ordered checkpoints.
+
+Hardware, binding and modeling have distinct roles: CPU/GPU target records
+provide resources; low-level `ExecutionTarget` binds legal tiles; `BackendModel`
+supplies cost assumptions and scheduling capabilities. GPU peaks may remain
+symbolic; ranking requires bound rates. Multi-GPU targets explicitly reject
+executable distributed specialization in this milestone. Scope labels remain
+available for future hierarchy without promising placement control not offered
+by ATen or a GPU runtime.
+
+Saved tuning plans use format version 2 and include program, sizes, backend,
+hardware and cost-model identity. Older plans and changed hardware/models must be
+selected/tuned again. They contain concrete decisions rather than pickled code.
+The removed CPU selector and `ScheduleSpace` cost-hook selectors are not parallel
+fallback paths.
+
+The low-level CPU compiler preserves an explicitly supplied backward program
+when it selects forward decisions. This is an inspection/debugging override,
+not a search conditioned on that backward implementation. Optimizing the
+remaining schedule choices around a fixed stage is deferred.

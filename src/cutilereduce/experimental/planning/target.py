@@ -3,19 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Callable
-
-
-CostHook = Callable[[object, object, dict[str, int]], float]
 
 
 @dataclass(frozen=True)
-class TargetModel:
-    """Target identity and optional legality/cost hooks for schedule selection."""
+class ExecutionTarget:
+    """Execution capabilities and physical tile binding; no costing or selection."""
 
     name: str
     capabilities: frozenset[str]
-    cost_hook: CostHook | None = None
     default_tile_size: int = 64
     supported_schedules: frozenset[str] = frozenset()
 
@@ -34,13 +29,6 @@ class TargetModel:
 
     def supports_schedule(self, name: str) -> bool:
         return not self.supported_schedules or name in self.supported_schedules
-
-    def estimate(
-        self, program: object, schedule: object, shape: dict[str, int]
-    ) -> float | None:
-        if self.cost_hook is None:
-            return None
-        return float(self.cost_hook(program, schedule, shape))
 
     def tile_domain(self, axis: str, shape: dict[str, int]) -> range:
         if axis not in shape or type(shape[axis]) is not int or shape[axis] <= 0:

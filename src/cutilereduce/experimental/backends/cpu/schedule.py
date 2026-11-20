@@ -5,7 +5,6 @@ from __future__ import annotations
 import os
 import platform
 from dataclasses import dataclass
-from enum import Enum
 from pathlib import Path
 
 from cutilereduce.experimental.compiler.operator import FoldProgram
@@ -27,16 +26,17 @@ from cutilereduce.experimental.planning.templates import (
 )
 
 
-class CpuLoopKind(Enum):
-    SERIAL = "serial"
-    PARALLEL = "parallel"
-    VECTORIZED = "vectorized"
-
-
-class CpuStorage(Enum):
-    PRIVATE = "private"
-    THREAD_LOCAL = "thread_local"
-    MATERIALIZED = "materialized"
+from cutilereduce.experimental.planning.bound import (
+    BoundLoopKind as CpuLoopKind,
+    BoundStorage as CpuStorage,
+    BoundIteration as CpuIteration,
+    BoundExpr as CpuExpr,
+    BoundLeaf as CpuLeaf,
+    BoundLoop as CpuLoop,
+    BoundBinding as CpuBinding,
+    BoundStage as CpuStage,
+    BoundPlan as CpuScheduledPlan,
+)
 
 
 def _cache_size(path: str) -> int | None:
@@ -142,58 +142,6 @@ class CpuScheduleConfig:
     def stage(self, name: str) -> CpuStageConfig | None:
         return next((stage for stage in self.stages if stage.name == name), None)
 
-
-@dataclass(frozen=True)
-class CpuIteration:
-    logical: Iteration
-    extent: int
-    grain: int
-    count: int
-    loop: CpuLoopKind
-
-
-class CpuExpr:
-    pass
-
-
-@dataclass(frozen=True)
-class CpuLeaf(CpuExpr):
-    expression: MapFoldRegion | RegionCall | Reference
-
-
-@dataclass(frozen=True)
-class CpuLoop(CpuExpr):
-    iteration: CpuIteration
-    body: CpuExpr
-    operation: str
-    topology: FoldTopology | None = None
-    reorder: bool = False
-
-
-@dataclass(frozen=True)
-class CpuBinding:
-    name: str
-    expression: CpuExpr
-    storage: CpuStorage
-
-
-@dataclass(frozen=True)
-class CpuStage:
-    name: str
-    bindings: tuple[CpuBinding, ...]
-    tile_sizes: tuple[tuple[str, int], ...] = ()
-    scratch_bytes: int = 0
-
-
-@dataclass(frozen=True)
-class CpuScheduledPlan:
-    source: (
-        ForwardScheduleTemplate | BackwardScheduleTemplate | TrainingScheduleTemplate
-    )
-    sizes: tuple[tuple[str, int], ...]
-    target: CpuTarget
-    forward: tuple[CpuStage, ...]
-    backward: tuple[CpuStage, ...]
 
 
 def _iteration(

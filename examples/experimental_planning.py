@@ -6,7 +6,7 @@ No kernels are compiled and no hardware is detected.
 
 import argparse
 
-from cutilereduce.experimental import AnalyticalTarget, PlanningProblem
+from cutilereduce.experimental.planning.analysis import BackendModel, PlanningProblem
 from examples.experimental_attention import operator
 
 
@@ -19,8 +19,9 @@ def main(argv=None):
     parser.add_argument("--json")
     args = parser.parse_args(argv)
     # Illustrative rates supplied by the caller, not detected/measured peaks.
-    target = AnalyticalTarget(
-        args.backend, workers=16, contraction_flops_per_second=1e12,
+    from cutilereduce.experimental.backends.cutile.analysis import cutile_analytical_target
+    constructor = cutile_analytical_target if args.backend == "cutile" else lambda **kw: BackendModel("cpu", **kw)
+    target = constructor( workers=16, contraction_flops_per_second=1e12,
         scalar_ops_per_second=1e11, transcendental_ops_per_second=1e10,
         bytes_per_second=1e11, launch_seconds=5e-6,
         tile_choices=(1, 16, 32, 64),

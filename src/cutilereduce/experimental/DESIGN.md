@@ -44,10 +44,12 @@ scheduled SSA without owning CuTile specialization.
 
 Backend region emitters interpret tensor operations; scheduled emitters own
 loops, loads, stores, and gradient commits. CPU runtime execution is separate
-from source generation. CuTile currently provides specialization and source
-generation, not an end-to-end launch runtime.
+from source generation. CuTile provides specialization, source generation and an online/prefix-free
+launch runtime; device execution remains unverified for this refactor.
 
-The existing public imports from `cutilereduce.experimental` remain available.
+The top-level public surface is restricted to authoring, backend/hardware
+description and shared analyze/compile/tune entry points. Advanced imports live
+in their owning packages; see README.md and PLANNING.md for current contracts.
 Backend entry points are also available from `experimental.backends.cpu` and
 `experimental.backends.cutile`. Internal imports should use the canonical
 subpackages above; the former flat implementation module paths are removed.
@@ -267,8 +269,8 @@ law, these regions define the logical contract. `build_schedule_space(program)`
 constructs hardware-independent forward and backward schedule templates.
 Templates are alternatives, not executable programs; their symbolic iteration
 parameters have shape-bounded domains. `ScheduleSpace.analyze_shape` exposes
-those domains without choosing a target, while `select_forward` and
-`select_backward` may use target support and an optional target cost hook.
+those domains without choosing a target. The shared analytical sweep realizes,
+costs and ranks candidates; target cost-hook selectors have been removed.
 
 Semantic and execution commutativity are recorded separately. Commutativity
 of `S` guarantees that backward finalization is prefix-free; the operator
@@ -284,9 +286,9 @@ entry points for lowering standalone programs.
 
 The `FoldProgram` and its schedule space are independent of problem extents and
 target. A target may analyze shape-bounded choices, reject unsupported
-templates, or provide a cost hook. The initial implementation uses
-deterministic policies and explicit overrides; it does not run a general
-constraint solver.
+templates and specialize physical costing rules. Shared analytical selection
+and optional empirical top-k tuning replace backend-specific selectors. This
+is enumeration with explicit constraints, not a general constraint solver.
 
 CuTile currently implements the online forward template. Specialization binds
 shape and tile overrides, creates a self-contained `SpecializedSchedule`, and
@@ -294,21 +296,19 @@ emission consumes that object rather than separately supplied program, stage,
 and sizes:
 
 ```python
-from cutilereduce.experimental import (
-    TargetModel,
-    build_schedule_space,
-    emit_cutile_source,
-    specialize_cutile_schedule,
-)
+from cutilereduce.experimental.planning.target import ExecutionTarget
+from cutilereduce.experimental.planning.templates import build_schedule_space
+from cutilereduce.experimental.backends.cutile.codegen import emit_cutile_source
+from cutilereduce.experimental.backends.cutile.schedule import specialize_cutile_schedule
 
 program = operator.lower()
 space = build_schedule_space(program)
-cutile = TargetModel(
+cutile = ExecutionTarget(
     "cutile",
     frozenset({"tensor_regions", "tiled_loops", "multi_stage"}),
     supported_schedules=frozenset({"online", "independent", "prefix"}),
 )
-forward = space.select_forward(sizes, cutile)
+forward = next(plan for plan in space.forward if plan.name == "online")
 specialized = specialize_cutile_schedule(
     program, forward, sizes, tiles={"l": 32, "r": 64}, target=cutile
 )
@@ -464,12 +464,11 @@ fold axis is traversed locally, uniquely owned gradients use direct stores,
 and multiply-owned gradients commit completed local tiles with relaxed atomic
 adds. Prefix-dependent schedules continue to use the existing executor.
 
-`estimate_cpu_plan` counts region operations, materialized carrier/output
-bytes, exposed parallel tasks, and serial steps. `select_cpu_plan` evaluates a
-small deterministic set of chunk and partition configurations against the
-detected worker/vector width and supplies the default plan used by
-`compile_cpu`. This is an analytical first model; benchmark calibration and
-cache-aware traffic tiers remain future refinements.
+`estimate_cpu_plan` is now a benchmark summary derived from the shared bound-IR
+visitor. Automatic CPU compilation uses the shared analytical sweep; empirical
+tuning compiles and measures its shortlisted realizations. CPU region fusion,
+GEMM efficiency, cache penalties and dispatch priors specialize the common
+accounting. See PLANNING.md for the current contracts and assumptions.
 
 ### Scheduled programs and shared gradient writes
 
@@ -829,7 +828,7 @@ The prototype can already lower the unfused local backward composition as an
 independent program:
 
 ```python
-from cutilereduce.experimental import compile_map_finalize_vjp_region
+from cutilereduce.experimental.compiler.fold import compile_map_finalize_vjp_region
 
 local_backward = compile_map_finalize_vjp_region(
     spec,
@@ -1074,7 +1073,8 @@ without changing the user map or its correctness contract.
 ## Compiling and inspecting a program
 
 ```python
-from cutilereduce.experimental import LogWeightedSum, compile_fold
+from cutilereduce.experimental import LogWeightedSum
+from cutilereduce.experimental.compiler.fold import compile_fold
 
 program = compile_fold(
     spec,

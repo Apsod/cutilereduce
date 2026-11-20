@@ -27,7 +27,7 @@ from cutilereduce.experimental.planning.accounting import ExecutionScope, Schedu
 
 
 @dataclass(frozen=True)
-class AnalyticalTarget:
+class BackendModel:
     """Explicit backend limits and rates; rates default to named symbols.
 
     Resident bytes are a conservative SSA capacity proxy, not a prediction of
@@ -48,10 +48,20 @@ class AnalyticalTarget:
     region_analyzer: Callable | None = field(default=None, repr=False, compare=False)
     stage_estimator: Callable | None = field(default=None, repr=False, compare=False)
     model_metadata: Mapping[str, Any] = field(default_factory=dict)
+    hardware_identity: Mapping[str, Any] = field(default_factory=dict)
+    supported_forward_families: tuple[str, ...] = ("online", "fused_tree", "partial_fold", "partial_scan_checkpoints")
+    power_of_two_tiles: bool = False
+    supports_prefix: bool = True
+    fuse_online_projection: bool = False
+    embed_full_extent: bool = True
+    max_partitions: int | None = None
+    region_transform: Callable | None = field(default=None, repr=False, compare=False)
+    realization_factory: Callable | None = field(default=None, repr=False, compare=False)
+    extra_parameter_domains: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
 
     def __post_init__(self):
-        if self.backend not in {"cpu", "cutile"}:
-            raise ValueError("analytical backend must be 'cpu' or 'cutile'")
+        if not self.backend:
+            raise ValueError("analytical backend identity must be nonempty")
         if type(self.workers) is not int or self.workers <= 0:
             raise ValueError("workers must be a positive integer")
         if not self.tile_choices or any(type(t) is not int or t <= 0 for t in self.tile_choices):
@@ -74,8 +84,7 @@ class AnalyticalTarget:
 
     @property
     def forward_families(self):
-        return (("online",) if self.backend == "cutile" else
-                ("online", "fused_tree", "partial_fold", "partial_scan_checkpoints"))
+        return self.supported_forward_families
 
 
 @dataclass(frozen=True)
@@ -188,6 +197,7 @@ class CandidateEstimate:
     candidate: ScheduleCandidate
     cost: ScheduleCost | None
     rejection_reasons: tuple[str, ...] = ()
+    implementation: Any = field(default=None, repr=False, compare=False)
 
     @property
     def accepted(self):
@@ -253,11 +263,30 @@ class AnalyticalSweep:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n")
 
 
+def estimate_execution_stage(target, name, direction, work, reads=0, writes=0, atomics=0,
+                             resident=0, allocated=0, tasks=1, steps=1,
+                             invocations=(), domain=None):
+    """Apply shared throughput rules and optional physical-stage refinements."""
+    scalar = work.arithmetic + work.comparisons + work.conversions + work.reduction_ops + work.scan_ops
+    utilization = sym.Min(1, sym.sympify(tasks) / target.workers)
+    compute = (work.contraction_flops / target.contraction_flops_per_second
+               + scalar / target.scalar_ops_per_second
+               + work.transcendentals / target.transcendental_ops_per_second)
+    memory = (reads + writes + atomics * target.atomic_weight) / target.bytes_per_second
+    time = sym.Max(compute, memory) / utilization + target.launch_seconds
+    stage = StageCost(name, direction, work, reads, writes, atomics,
+                      resident, allocated, tasks, steps, time, invocations=invocations, accounting_domain=domain)
+    if target.stage_estimator is not None:
+        stage = target.stage_estimator(stage)
+    return stage
+
+
 @dataclass(frozen=True)
 class PlanningProblem:
     program: FoldProgram
-    target: AnalyticalTarget
+    target: BackendModel
     sizes: Mapping[str, int] = field(default_factory=dict)
+    schedule_space_override: Any = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if len(self.program.spec.fold_axes) != 1:
@@ -274,14 +303,17 @@ class PlanningProblem:
         return self.program.region_facts
 
     @cached_property
+    def schedule_space(self):
+        return self.schedule_space_override or build_schedule_space(self.program)
+
+    @cached_property
     def regions(self) -> dict[str, RegionCost]:
         from cutilereduce.experimental.ir.core import TensorRegion
-        from cutilereduce.experimental.ir.passes import realize_contraction_precision
-        if self.target.region_analyzer is None and self.target.backend != "cutile":
+        if self.target.region_analyzer is None and self.target.region_transform is None:
             return {name: facts.cost for name, facts in self.facts.items()}
         analyzer = self.target.region_analyzer or analyze_region
-        return {f.name: analyzer(realize_contraction_precision(value)
-                                if self.target.backend == "cutile" else value)
+        return {f.name: analyzer(self.target.region_transform(value)
+                                if self.target.region_transform is not None else value)
                 for f in fields(self.program)
                 if isinstance(value := getattr(self.program, f.name), TensorRegion)}
 
@@ -297,9 +329,14 @@ class PlanningProblem:
             return self._region_bindings[key]
         return self.regions[name].subs(dimensions)
 
-    def estimate(self, family="online", *, parameters=None, backward=False, loop_axis=None):
-        """Return symbolic costs, accepting partial shape and parameter bindings."""
-        space = build_schedule_space(self.program)
+    def validate_candidate(self, candidate):
+        candidate = self.canonical_candidate(candidate)
+        self._validate_schedule(candidate.family, dict(candidate.parameters),
+                                candidate.backward, candidate.loop_axis)
+        return candidate
+
+    def _validate_schedule(self, family, parameters, backward, loop_axis):
+        space = self.schedule_space
         available = {p.name: p for p in space.forward}
         if family not in available or family not in self.target.forward_families:
             raise NotImplementedError(f"{self.target.backend} does not support {family!r}")
@@ -307,8 +344,8 @@ class PlanningProblem:
             if not space.backward:
                 raise ValueError("program has no backward regions")
             space.compose(available[family], space.backward[0])
-            if self.target.backend == "cutile" and self.program.requires_prefix:
-                raise NotImplementedError("cuTile backward does not support ordered prefixes")
+            if not self.target.supports_prefix and self.program.requires_prefix:
+                raise NotImplementedError("backend does not support ordered prefixes")
         axis = self.program.spec.fold_axes[0]
         loop_axis = loop_axis or axis
         if loop_axis not in (*self.program.spec.batch_axes, axis):
@@ -319,27 +356,43 @@ class PlanningProblem:
         allowed = ({"partition_count", "loop_programs"}
                    | {f"{prefix}.{a}" for prefix in ("tile", "backward_tile")
                       for a in (*self.program.spec.batch_axes, axis)}
-                   | {f"embed_tile.{a}" for a in self.program.spec.batch_axes})
+                   | {f"embed_tile.{a}" for a in self.program.spec.batch_axes}
+                   | set(self.target.extra_parameter_domains))
         if set(p) - allowed:
             raise ValueError(f"unknown schedule parameters: {sorted(set(p) - allowed)}")
         if any(isinstance(v, (int, float)) and (v <= 0 or not math.isfinite(v)) for v in p.values()):
             raise ValueError("schedule parameters must be positive")
-        if self.target.backend == "cutile":
+        if self.target.power_of_two_tiles:
             for name, value in p.items():
                 if name.startswith(("tile.", "backward_tile.", "embed_tile.")) and isinstance(value, int):
                     if value & (value - 1):
-                        raise ValueError("cuTile physical tiles must be powers of two")
+                        raise ValueError("physical tiles must be powers of two")
                     logical = name.split(".", 1)[1]
                     if logical in self.sizes and value > self.sizes[logical]:
-                        raise ValueError("cuTile tile exceeds logical extent")
-        if self.target.backend == "cutile" and p.get("partition_count", 1) != 1:
-            raise ValueError("online cuTile forward requires one fold partition")
+                        raise ValueError("physical tile exceeds logical extent")
+        if self.target.max_partitions is not None and p.get("partition_count", 1) > self.target.max_partitions:
+            raise ValueError("fold partition count exceeds backend capability")
         if self.program.requires_prefix and "loop_programs" in p:
             raise ValueError("prefix backward loop programs are determined by checkpoint partitions")
         for name in ("partition_count", "loop_programs"):
             logical = axis if name == "partition_count" else loop_axis
             if logical in self.sizes and isinstance(p.get(name), int) and p[name] > self.sizes[logical]:
                 raise ValueError(f"{name} exceeds the logical extent")
+        return axis, loop_axis, p
+
+    def estimate(self, family="online", *, parameters=None, backward=False, loop_axis=None, _template=False):
+        """Return symbolic costs, accepting partial shape and parameter bindings."""
+        axis, loop_axis, p = self._validate_schedule(family, parameters, backward, loop_axis)
+        required = {f"tile.{a}" for a in (*self.program.spec.batch_axes, axis)}
+        if family.startswith("partial"):
+            required.add("partition_count")
+        if (not _template and self.target.realization_factory is not None
+                and set(self.sizes) == set(self.program.spec.axes)
+                and required <= set(p) and all(type(v) is int for v in p.values())):
+            result = self.evaluate(ScheduleCandidate(family, tuple(sorted(p.items())), backward, loop_axis))
+            if result.cost is None:
+                raise NotImplementedError("; ".join(result.rejection_reasons))
+            return result.cost
         n = {a: sym.Symbol(a) for a in self.program.spec.axes}
         n.update(self.sizes)
         tiles = {a: sym.Min(n[a], p.get(f"tile.{a}", sym.Symbol(f"tile.{a}")))
@@ -354,17 +407,8 @@ class PlanningProblem:
 
         def timed(name, direction, work, reads=0, writes=0, atomics=0,
                   resident=0, allocated=0, tasks=1, steps=1, invocations=(), domain=None):
-            scalar = work.arithmetic + work.comparisons + work.conversions + work.reduction_ops + work.scan_ops
-            utilization = sym.Min(1, sym.sympify(tasks) / target.workers)
-            compute = (work.contraction_flops / target.contraction_flops_per_second
-                       + scalar / target.scalar_ops_per_second
-                       + work.transcendentals / target.transcendental_ops_per_second)
-            memory = (reads + writes + atomics * target.atomic_weight) / target.bytes_per_second
-            time = sym.Max(compute, memory) / utilization + target.launch_seconds
-            stage = StageCost(name, direction, work, reads, writes, atomics,
-                              resident, allocated, tasks, steps, time, invocations=invocations, accounting_domain=domain)
-            if target.stage_estimator is not None:
-                stage = target.stage_estimator(stage)
+            stage = estimate_execution_stage(target, name, direction, work, reads, writes, atomics,
+                                             resident, allocated, tasks, steps, invocations, domain)
             stages.append(stage)
             return stage
 
@@ -426,7 +470,7 @@ class PlanningProblem:
         saved = global_carrier + checkpoints if backward else 0
         auxiliary = sym.Max(partials + global_carrier + checkpoints,
                             tree_scratch + global_carrier)
-        if target.backend == "cutile":
+        if target.fuse_online_projection:
             # The online emitter fuses projection and keeps E in registers.
             # Only training stores a global carrier for the later embed launch.
             first, projection = stages
@@ -440,9 +484,9 @@ class PlanningProblem:
             auxiliary = saved
         if backward:
             bextent = n | {a: sym.Min(n[a], p.get(f"backward_tile.{a}", tiles[a])) for a in tiles}
-            eextent = (n if target.backend == "cpu" else
+            eextent = (n if target.embed_full_extent else
                        n | {a: sym.Min(n[a], p.get(f"embed_tile.{a}", tiles[a])) for a in self.program.spec.batch_axes})
-            embed_tasks = 1 if target.backend == "cpu" else product(ceildiv(n[a], eextent[a]) for a in self.program.spec.batch_axes)
+            embed_tasks = 1 if target.embed_full_extent else product(ceildiv(n[a], eextent[a]) for a in self.program.spec.batch_axes)
             embed = region("embed_output_vjp", eextent)
             accumulator = bytes_of("embed_output_vjp", n)
             timed("embed_output_vjp", "backward", embed.work.scale(embed_tasks),
@@ -516,12 +560,19 @@ class PlanningProblem:
         loop = (candidate.loop_axis or self.program.spec.fold_axes[0]) if candidate.backward else None
         return ScheduleCandidate(candidate.family, tuple(sorted(p.items())), candidate.backward, loop)
 
-    def evaluate(self, candidate: ScheduleCandidate) -> CandidateEstimate:
+    def evaluate(self, candidate: ScheduleCandidate, *, realize=True) -> CandidateEstimate:
         candidate = self.canonical_candidate(candidate)
         reasons = []
+        implementation = None
         try:
-            cost = self.estimate(candidate.family, parameters=dict(candidate.parameters),
-                                 backward=candidate.backward, loop_axis=candidate.loop_axis)
+            self.validate_candidate(candidate)
+            if realize and self.target.realization_factory is not None:
+                implementation = self.target.realization_factory(self, candidate)
+                from .execution_cost import analyze_implementation
+                cost = analyze_implementation(self, implementation, None)
+            else:
+                cost = self.estimate(candidate.family, parameters=dict(candidate.parameters),
+                                     backward=candidate.backward, loop_axis=candidate.loop_axis, _template=True)
         except (ValueError, NotImplementedError) as error:
             return CandidateEstimate(candidate, None, (str(error),))
         for metric, limit in ((cost.resident_bytes_upper_bound, self.target.max_resident_bytes),
@@ -531,7 +582,7 @@ class PlanningProblem:
                     raise ValueError("resource pruning requires bound sizes and schedule parameters")
                 if float(metric) > limit:
                     reasons.append(f"resource estimate {float(metric):g} exceeds limit {limit:g}")
-        return CandidateEstimate(candidate, cost, tuple(reasons))
+        return CandidateEstimate(candidate, cost, tuple(reasons), implementation)
 
     def tile_domain_bounds(self):
         """Necessary polynomial input-residency bounds for initial domain pruning.
@@ -571,7 +622,7 @@ class PlanningProblem:
             raise ValueError("candidate enumeration requires every problem size")
         if max_candidates <= 0:
             raise ValueError("max_candidates must be positive")
-        parameter_domains = dict(parameter_domains or {})
+        parameter_domains = dict(self.target.extra_parameter_domains) | dict(parameter_domains or {})
         if any(not values or any(type(v) is not int or v <= 0 for v in values)
                for values in parameter_domains.values()):
             raise ValueError("parameter domains must contain positive integers")
@@ -580,19 +631,20 @@ class PlanningProblem:
         bounds = self.tile_domain_bounds()
         for axis in axes:
             size = self.sizes[axis]
-            if self.target.backend == "cutile":
+            if self.target.power_of_two_tiles:
                 values = tuple(t for t in self.target.tile_choices if t & (t - 1) == 0)
                 values = tuple(sorted({1} | {t for t in values if t <= size}))
             else:
                 values = tuple(sorted({min(size, t) for t in self.target.tile_choices} | {size}))
             values = parameter_domains.pop(f"tile.{axis}", values)
             domains.append(tuple(v for v in values if v <= bounds[axis]))
-        families = [f for f in build_schedule_space(self.program).forward
+        families = [f for f in self.schedule_space.forward
                     if f.name in self.target.forward_families
                     and (not backward or not self.program.requires_prefix or f.name == "partial_scan_checkpoints")]
         allowed_domains = ({"partition_count", "loop_programs"}
                            | {f"backward_tile.{a}" for a in axes}
-                           | {f"embed_tile.{a}" for a in self.program.spec.batch_axes})
+                           | {f"embed_tile.{a}" for a in self.program.spec.batch_axes}
+                           | set(self.target.extra_parameter_domains))
         if set(parameter_domains) - allowed_domains:
             raise ValueError(f"unknown parameter domains: {sorted(set(parameter_domains) - allowed_domains)}")
         backward_domains = []

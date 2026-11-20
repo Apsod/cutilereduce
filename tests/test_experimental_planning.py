@@ -1,39 +1,14 @@
 import pytest
 
-from cutilereduce.experimental import (
-    Add,
-    AtomicAdd,
-    Affine,
-    ArtifactKind,
-    CommitMode,
-    CpuLoopKind,
-    CpuScheduleConfig,
-    CpuStageConfig,
-    CpuTarget,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    LocalLifetime,
-    LogWeightedSum,
-    Parallel,
-    StructuredValue,
-    TensorSpec,
-    SerialLoop,
-    Store,
-    TiledStage,
-    build_schedule_space,
-    emit_cpp_source,
-    estimate_cpu_plan,
-    format_plan,
-    format_cpu_schedule,
-    schedule_cpu,
-    schedule_backward_program,
-    specialize_cutile_backward_schedule,
-    lower_backward_stage,
-    select_cpu_plan,
-    format_scheduled_program,
-    TargetModel,
-)
+from cutilereduce.experimental import Add, Affine, FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec
+from cutilereduce.experimental.planning.scheduled import AtomicAdd, CommitMode, LocalLifetime, Parallel, SerialLoop, Store, schedule_backward_program, format_scheduled_program
+from cutilereduce.experimental.planning.templates import ArtifactKind, build_schedule_space, format_plan
+from cutilereduce.experimental.backends.cpu.schedule import CpuLoopKind, CpuScheduleConfig, CpuStageConfig, CpuTarget, format_cpu_schedule, schedule_cpu
+from cutilereduce.experimental.planning.ssa import TiledStage, lower_backward_stage
+from cutilereduce.experimental.backends.cpu.codegen import emit_cpp_source
+from cutilereduce.experimental.backends.cpu.cost import estimate_cpu_plan
+from cutilereduce.experimental.backends.cutile.schedule import specialize_cutile_backward_schedule
+from cutilereduce.experimental.planning.target import ExecutionTarget
 
 
 def _add_problem():
@@ -372,14 +347,10 @@ def test_cpu_cost_accounts_for_partial_materialization_and_parallelism():
     assert partial_cost.materialized_bytes > online_cost.materialized_bytes
     assert online_cost.operations > 0
 
-    choice = select_cpu_plan(
-        problem,
-        schedules,
-        {"b": 3, "f": 128},
-        target=target,
-    )
-    assert choice.plan in schedules
-    assert choice.cost.operations > 0
+    from cutilereduce.experimental.planning.analysis import PlanningProblem
+    from cutilereduce.experimental.backends.cpu.tuning import cpu_analytical_target
+    sweep = PlanningProblem(problem, cpu_analytical_target(target), {"b": 3, "f": 128}).sweep()
+    assert sweep.shortlist(1)[0].cost.work.total > 0
 
 
 def test_schedule_space_separates_shape_domains_and_target_selection():
@@ -390,16 +361,7 @@ def test_schedule_space_separates_shape_domains_and_target_selection():
     domains = space.analyze_shape(online, shape)
     assert domains["f_chunk"] == range(1, 129)
 
-    target = TargetModel(
-        "test",
-        frozenset({"tensor_regions"}),
-        cost_hook=lambda _program, schedule, _shape: {
-            "online": 5.0,
-            "fused_tree": 4.0,
-            "partial_fold": 1.0,
-        }[schedule.name],
-    )
-    assert space.select_forward(shape, target).name == "partial_fold"
+    target = ExecutionTarget("test", frozenset({"tensor_regions"}))
     assert target.tile_domain("f", shape) == range(1, 129)
     assert target.bind_tiles(shape, ("b", "f"), {"f": 32}) == {
         "b": 8,
@@ -408,9 +370,10 @@ def test_schedule_space_separates_shape_domains_and_target_selection():
     with pytest.raises(ValueError, match="legal domain"):
         target.bind_tiles(shape, ("f",), {"f": 129})
 
-    restricted = TargetModel(
+    restricted = ExecutionTarget(
         "online-only",
         frozenset({"tensor_regions"}),
         supported_schedules=frozenset({"online"}),
     )
-    assert space.select_forward(shape, restricted) == online
+    assert restricted.supports_schedule(online.name)
+    assert not restricted.supports_schedule("partial_fold")

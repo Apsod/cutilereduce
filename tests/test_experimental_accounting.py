@@ -6,12 +6,13 @@ import pytest
 
 from cutilereduce.core import symbolic as sym
 from cutilereduce.core.measure import Measure
-from cutilereduce.experimental import (
-    AxisDomain, CommitMode, CpuTarget, ExecutionScope, FoldMaps, FoldOperator, FoldSpec,
-    LogWeightedSum, PlanningProblem, ScheduleCandidate, ScheduleDomain, StructuredValue, TensorSpec, ValueFacts,
-    build_backward_program, contribution_ownership, cpu_analytical_target, resolve_writes,
-    schedule_backward_program,
-)
+from cutilereduce.experimental.planning.accounting import AxisDomain, ExecutionScope, ScheduleDomain, contribution_ownership
+from cutilereduce.experimental.planning.scheduled import CommitMode, build_backward_program, resolve_writes, schedule_backward_program
+from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
+from cutilereduce.experimental import FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec
+from cutilereduce.experimental.planning.analysis import PlanningProblem, ScheduleCandidate
+from cutilereduce.experimental.ir.facts import ValueFacts
+from cutilereduce.experimental.backends.cpu.tuning import cpu_analytical_target
 
 
 SIZES = {"h": 4, "l": 12, "g": 3, "r": 10, "dqk": 8, "dv": 6}

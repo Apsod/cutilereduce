@@ -113,7 +113,7 @@ def benchmark_cpu(
         median,
         minimum,
         iterations,
-        estimate_cpu_plan(compiled.problem, compiled.scheduled),
+        estimate_cpu_plan(compiled.problem, compiled.scheduled, backward_program=compiled.backward_program),
         reference_median,
     )
 

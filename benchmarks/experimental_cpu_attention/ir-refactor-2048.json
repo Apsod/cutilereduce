@@ -1,0 +1,285 @@
+{
+  "sizes": {
+    "h": 1,
+    "l": 2048,
+    "g": 1,
+    "r": 2048,
+    "dqk": 32,
+    "dv": 32
+  },
+  "dtype": "float32",
+  "iterations": 60,
+  "validation": "outputs and random-cotangent input VJPs",
+  "hardware": {
+    "architecture": "x86_64",
+    "worker_count": 8,
+    "vector_bytes": 64,
+    "cache_line_bytes": 64,
+    "l1_data_bytes": 49152,
+    "l2_bytes": 1310720,
+    "l3_bytes": 12582912
+  },
+  "torch_version": "2.10.0+cu128",
+  "aten_cpu_capability": "AVX512",
+  "candidates": {
+    "query_128": {
+      "candidate": {
+        "family": "fused_tree",
+        "parameters": {
+          "backward_tile.l": 128,
+          "backward_tile.r": 2048,
+          "tile.g": 1,
+          "tile.h": 1,
+          "tile.l": 128,
+          "tile.r": 2048
+        },
+        "backward": true,
+        "loop_axis": "l"
+      },
+      "compile_seconds": 20.89624518599885,
+      "gradient_commits": {
+        "query": "store",
+        "key": "store",
+        "value": "store"
+      }
+    },
+    "analytical_t1_1": {
+      "candidate": {
+        "family": "fused_tree",
+        "parameters": {
+          "backward_tile.l": 2048,
+          "backward_tile.r": 128,
+          "tile.g": 1,
+          "tile.h": 1,
+          "tile.l": 128,
+          "tile.r": 2048
+        },
+        "backward": true,
+        "loop_axis": "r"
+      },
+      "compile_seconds": 42.32790453099733,
+      "gradient_commits": {
+        "query": "store",
+        "key": "store",
+        "value": "store"
+      }
+    },
+    "analytical_t4_1": {
+      "candidate": {
+        "family": "fused_tree",
+        "parameters": {
+          "backward_tile.l": 2048,
+          "backward_tile.r": 128,
+          "tile.g": 1,
+          "tile.h": 1,
+          "tile.l": 128,
+          "tile.r": 2048
+        },
+        "backward": true,
+        "loop_axis": "r"
+      },
+      "compile_seconds": 0.03759082599935937,
+      "gradient_commits": {
+        "query": "store",
+        "key": "store",
+        "value": "store"
+      }
+    }
+  },
+  "analytical_searches": {
+    "1": {
+      "candidate_count": 7500,
+      "truncated": false,
+      "model": {
+        "name": "cpu_realization_v1",
+        "assumptions": {
+          "workers": 1,
+          "vector_lanes": 16,
+          "l2_bytes": 1310720,
+          "l3_bytes": 12582912,
+          "gemm_flops_per_second": 128000000000.0,
+          "scalar_ops_per_second": 32000000000.0,
+          "transcendental_ops_per_second": 500000000.0,
+          "l2_bytes_per_second": 100000000000.0,
+          "l3_bytes_per_second": 40000000000.0,
+          "memory_bytes_per_second": 20000000000.0,
+          "native_call_seconds": 2.5e-07,
+          "aten_call_seconds": 2e-06,
+          "gemm_call_seconds": 3e-06,
+          "allocation_seconds": 5e-07,
+          "region_call_seconds": 2.5e-07,
+          "atomic_updates_per_second": 50000000.0,
+          "l2_slowdown": 0.5,
+          "l3_slowdown": 0.75
+        }
+      },
+      "selected": [
+        {
+          "family": "fused_tree",
+          "parameters": {
+            "backward_tile.l": 2048,
+            "backward_tile.r": 128,
+            "tile.g": 1,
+            "tile.h": 1,
+            "tile.l": 128,
+            "tile.r": 2048
+          },
+          "backward": true,
+          "loop_axis": "r"
+        }
+      ]
+    },
+    "4": {
+      "candidate_count": 15000,
+      "truncated": false,
+      "model": {
+        "name": "cpu_realization_v1",
+        "assumptions": {
+          "workers": 4,
+          "vector_lanes": 16,
+          "l2_bytes": 1310720,
+          "l3_bytes": 12582912,
+          "gemm_flops_per_second": 128000000000.0,
+          "scalar_ops_per_second": 32000000000.0,
+          "transcendental_ops_per_second": 500000000.0,
+          "l2_bytes_per_second": 100000000000.0,
+          "l3_bytes_per_second": 40000000000.0,
+          "memory_bytes_per_second": 20000000000.0,
+          "native_call_seconds": 2.5e-07,
+          "aten_call_seconds": 2e-06,
+          "gemm_call_seconds": 3e-06,
+          "allocation_seconds": 5e-07,
+          "region_call_seconds": 2.5e-07,
+          "atomic_updates_per_second": 50000000.0,
+          "l2_slowdown": 0.5,
+          "l3_slowdown": 0.75
+        }
+      },
+      "selected": [
+        {
+          "family": "fused_tree",
+          "parameters": {
+            "backward_tile.l": 2048,
+            "backward_tile.r": 128,
+            "tile.g": 1,
+            "tile.h": 1,
+            "tile.l": 128,
+            "tile.r": 2048
+          },
+          "backward": true,
+          "loop_axis": "r"
+        }
+      ]
+    }
+  },
+  "results": {
+    "1": {
+      "forward": {
+        "torch_eager": {
+          "median_ms": 19.50216650038783,
+          "p25_ms": 18.483947998902295,
+          "p75_ms": 20.197031000861898,
+          "speedup_over_eager": 1.0
+        },
+        "query_128": {
+          "median_ms": 9.875710002233973,
+          "p25_ms": 9.440986999834422,
+          "p75_ms": 10.545179997279774,
+          "speedup_over_eager": 1.9747609534885358
+        },
+        "analytical_t1_1": {
+          "median_ms": 9.860389000095893,
+          "p25_ms": 9.529871000268031,
+          "p75_ms": 10.460770998179214,
+          "speedup_over_eager": 1.9778293229808854
+        },
+        "analytical_t4_1": {
+          "median_ms": 9.867916500297724,
+          "p25_ms": 9.460527002374874,
+          "p75_ms": 10.398636000900296,
+          "speedup_over_eager": 1.9763205839651594
+        }
+      },
+      "forward_backward": {
+        "torch_eager": {
+          "median_ms": 42.65254799975082,
+          "p25_ms": 41.05599499962409,
+          "p75_ms": 44.004471998050576,
+          "speedup_over_eager": 1.0
+        },
+        "query_128": {
+          "median_ms": 32.42637449875474,
+          "p25_ms": 31.657613999414025,
+          "p75_ms": 33.83095699973637,
+          "speedup_over_eager": 1.3153659223108274
+        },
+        "analytical_t1_1": {
+          "median_ms": 32.2732785007247,
+          "p25_ms": 31.39654500046163,
+          "p75_ms": 33.39922499799286,
+          "speedup_over_eager": 1.3216056744527227
+        },
+        "analytical_t4_1": {
+          "median_ms": 32.4192120006046,
+          "p25_ms": 31.478723998588976,
+          "p75_ms": 34.00140099984128,
+          "speedup_over_eager": 1.3156565310395383
+        }
+      }
+    },
+    "4": {
+      "forward": {
+        "torch_eager": {
+          "median_ms": 7.223410999358748,
+          "p25_ms": 6.886151997605339,
+          "p75_ms": 8.072360000369372,
+          "speedup_over_eager": 1.0
+        },
+        "query_128": {
+          "median_ms": 4.748261002532672,
+          "p25_ms": 4.257975000655279,
+          "p75_ms": 5.600452997896355,
+          "speedup_over_eager": 1.5212750511199484
+        },
+        "analytical_t1_1": {
+          "median_ms": 4.986453499441268,
+          "p25_ms": 4.235896998579847,
+          "p75_ms": 5.6002259989327285,
+          "speedup_over_eager": 1.4486069107368857
+        },
+        "analytical_t4_1": {
+          "median_ms": 4.909728999336949,
+          "p25_ms": 4.4131280010333285,
+          "p75_ms": 5.7164440004271455,
+          "speedup_over_eager": 1.4712443396232784
+        }
+      },
+      "forward_backward": {
+        "torch_eager": {
+          "median_ms": 25.78535500106227,
+          "p25_ms": 22.59989400045015,
+          "p75_ms": 29.635089998919284,
+          "speedup_over_eager": 1.0
+        },
+        "query_128": {
+          "median_ms": 20.14921000045433,
+          "p25_ms": 17.48109099935391,
+          "p75_ms": 24.065641999186482,
+          "speedup_over_eager": 1.279720396009613
+        },
+        "analytical_t1_1": {
+          "median_ms": 18.012880500464235,
+          "p25_ms": 16.33377200050745,
+          "p75_ms": 22.825674997875467,
+          "speedup_over_eager": 1.4314953680172209
+        },
+        "analytical_t4_1": {
+          "median_ms": 18.507454498831066,
+          "p25_ms": 16.074961000413168,
+          "p75_ms": 21.83884500118438,
+          "speedup_over_eager": 1.3932415720752347
+        }
+      }
+    }
+  }
+}

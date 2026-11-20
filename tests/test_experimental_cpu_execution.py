@@ -1,30 +1,13 @@
 import torch
 
-from cutilereduce.experimental import (
-    Add,
-    Affine,
-    AffineLWS,
-    CommitMode,
-    CpuScheduleConfig,
-    CpuStageConfig,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    LogSumExp,
-    LogWeightedSum,
-    Product,
-    StructuredValue,
-    TensorSpec,
-    compile_cpu,
-    benchmark_cpu,
-    benchmark_cpu_training,
-    emit_cpp_source,
-    build_schedule_space,
-    schedule_backward_program,
-    scheduled_memory_metrics,
-    scheduled_to_ssa,
-    liveness,
-)
+from cutilereduce.experimental import Add, Affine, AffineLWS, FoldMaps, FoldOperator, FoldSpec, LogSumExp, LogWeightedSum, Product, StructuredValue, TensorSpec
+from cutilereduce.experimental.planning.scheduled import CommitMode, schedule_backward_program
+from cutilereduce.experimental.backends.cpu.schedule import CpuScheduleConfig, CpuStageConfig
+from cutilereduce.experimental.backends.cpu.runtime import compile_cpu
+from cutilereduce.experimental.backends.cpu.benchmark import benchmark_cpu, benchmark_cpu_training, scheduled_memory_metrics
+from cutilereduce.experimental.backends.cpu.codegen import emit_cpp_source
+from cutilereduce.experimental.planning.templates import build_schedule_space
+from cutilereduce.experimental.planning.ssa import scheduled_to_ssa, liveness
 
 
 def test_generated_cpu_add_forward_and_backward():

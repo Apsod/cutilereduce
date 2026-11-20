@@ -2,11 +2,13 @@
 
 from dataclasses import replace
 
-from cutilereduce.experimental import (
-    CpuTarget, FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, PlanningProblem,
-    StructuredValue, TensorRegionBuilder, TensorSignature, TensorSpec,
-    analyze_cpu_region, analyze_region, cpu_analytical_target,
-)
+from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
+from cutilereduce.experimental import FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSignature, TensorSpec
+from cutilereduce.experimental.planning.analysis import PlanningProblem
+from cutilereduce.experimental.ir.core import TensorRegionBuilder
+from cutilereduce.experimental.backends.cpu.analysis import analyze_cpu_region
+from cutilereduce.experimental.ir.cost import analyze_region
+from cutilereduce.experimental.backends.cpu.tuning import cpu_analytical_target
 from cutilereduce.experimental.backends.cpu.fusion import RegionFusion
 
 
@@ -68,3 +70,57 @@ def test_cache_is_a_soft_ranking_signal_and_is_reported():
     unknown = PlanningProblem(program, cpu_analytical_target(replace(hardware, l2_bytes=None, l3_bytes=None)), sizes)
     no_cache = unknown.estimate("fused_tree", parameters={"tile.l": 2048, "tile.r": 2048})
     assert float(no_cache.stages[0].cache_penalty_seconds) == 0
+
+
+def test_explicit_realization_is_consumed_without_replanning(monkeypatch):
+    from cutilereduce.experimental.backends.cpu.realization import realize_cpu_region
+    from cutilereduce.experimental.backends.cpu import realization
+    ctx = TensorRegionBuilder(("m", "k", "n"))
+    a = ctx.expect("a", TensorSignature(("m", "k")))
+    b = ctx.expect("b", TensorSignature(("k", "n")))
+    product = ctx.contract(a, b, over=("k",))
+    ctx.yield_value("out", ctx.exp(product * 2.0 + 1.0))
+    region = ctx.finish_region()
+    sizes = {"m": 8, "k": 16, "n": 32}
+    implementation = realize_cpu_region(region)
+    expected = implementation.estimate(sizes)
+    source = implementation.emit("example", sizes)
+
+    def forbid(*args, **kwargs):
+        raise AssertionError("consumer attempted to redo realization")
+    monkeypatch.setattr(realization, "RegionFusion", forbid)
+    cost = implementation.estimate(sizes)
+    assert implementation.emit("example", sizes) == source
+    assert cost == expected
+    assert float(cost.work.contraction_flops) == 8192
+    assert float(cost.realization.allocated_bytes) == 1024
+    assert [k.kind for k in cost.realization.kernels] == [s.kind for s in implementation.fusion.steps]
+    # Estimation never mutates fusion/reuse choices, including symbolic binding.
+    assert implementation.estimate().subs(sizes) == cost
+
+
+def test_candidate_compilation_keeps_analyzed_program_and_realizations(monkeypatch):
+    from cutilereduce.experimental.planning.analysis import ScheduleCandidate
+    from cutilereduce.experimental.backends.cpu.tuning import compile_cpu_candidate
+    from cutilereduce.experimental.backends.cpu import runtime
+    from cutilereduce.experimental.backends.cpu.codegen import emit_cpp_source
+    program = _attention()
+    hardware = CpuTarget("explicit", 1, 32, 64)
+    problem = PlanningProblem(program, cpu_analytical_target(hardware),
+                              {"l": 8, "r": 8, "d": 4, "v": 4})
+    candidate = ScheduleCandidate("fused_tree", (("tile.l", 8), ("tile.r", 8)))
+    problem.evaluate(candidate)
+    registry = problem.target.region_analyzer.__self__
+    analyzed = registry.realize(program.map_fold)
+    received = {}
+
+    def compile_stub(operator, sizes, **kwargs):
+        received.update(kwargs)
+        return emit_cpp_source(kwargs["_program"], sizes, backward=False,
+                               region_realizations=kwargs["_region_realizations"])
+    monkeypatch.setattr(runtime, "compile_cpu", compile_stub)
+    source = compile_cpu_candidate(None, problem, candidate, target=hardware)
+    assert "PYBIND11_MODULE" in source
+    assert received["_program"] is program
+    assert received["_region_realizations"] is registry
+    assert registry.realize(program.map_fold) is analyzed

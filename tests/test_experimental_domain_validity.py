@@ -3,17 +3,7 @@
 import pytest
 import torch
 
-from cutilereduce.experimental import (
-    Add,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    LogSumExp,
-    LogWeightedSum,
-    Product,
-    StructuredValue,
-    TensorSpec,
-)
+from cutilereduce.experimental import Add, FoldMaps, FoldOperator, FoldSpec, LogSumExp, LogWeightedSum, Product, StructuredValue, TensorSpec
 from cutilereduce.experimental.backends.reference import _execute_region
 from cutilereduce.experimental.compiler.fold import compile_masked_map_fold_region
 from cutilereduce.experimental.ir.passes import program_to_region

@@ -179,6 +179,23 @@ def analyze_region(region: TensorRegion | TensorProgram, extents=None) -> Region
     return RegionCost(work, byte_sizes(arguments), byte_sizes(results), sym.Max(*peaks))
 
 
+def analyze_operation(node, nodes, extents):
+    """Count one operation without charging its producers.
+
+    Shares the region operation rules, including backend-independent BMNK work.
+    Input signatures are retained for rules that inspect operand dimensions.
+    """
+    from .core import TensorNode
+    leaves = tuple(TensorNode(i, "argument", (), nodes[n].axes, nodes[n].dtype)
+                   for i, n in enumerate(node.inputs))
+    from dataclasses import replace
+    operation = replace(node, id=len(leaves), inputs=tuple(range(len(leaves))))
+    region = TensorRegion(tuple(extents), (*leaves, operation),
+                          tuple((str(i), i) for i in range(len(leaves))),
+                          (("result", operation.id),))
+    return analyze_region(region, extents).work
+
+
 @dataclass(frozen=True)
 class KernelCost:
     """One realized execution boundary, with symbolic scalar counts and bytes.

@@ -1,34 +1,10 @@
 import pytest
 
-from cutilereduce.experimental import (
-    Add,
-    Affine,
-    AffineLWS,
-    ContractionAxes,
-    ContractionPrecision,
-    FinalizeContext,
-    FoldMaps,
-    FoldFactor,
-    FoldOperator,
-    FoldSpec,
-    LogSumExp,
-    LogWeightedSum,
-    Monoid,
-    Product,
-    StructuredValue,
-    TensorBuilder,
-    TensorField,
-    TensorSpec,
-    TensorStructure,
-    compile_fold,
-    compile_fold_backward,
-    compile_fold_forward,
-    compile_map_finalize_vjp_region,
-    discover_contractions,
-    lower_fold,
-    lower_scan,
-    optimize_program,
-)
+from cutilereduce.experimental import Add, Affine, AffineLWS, ContractionPrecision, FinalizeContext, FoldMaps, FoldFactor, FoldOperator, FoldSpec, LogSumExp, LogWeightedSum, Monoid, Product, StructuredValue, TensorBuilder, TensorField, TensorSpec, TensorStructure
+from cutilereduce.experimental.ir.core import ContractionAxes
+from cutilereduce.experimental.compiler.fold import compile_fold, compile_fold_backward, compile_fold_forward, compile_map_finalize_vjp_region
+from cutilereduce.experimental.ir.passes import discover_contractions, optimize_program
+from cutilereduce.experimental.algebra.lowering import lower_fold, lower_scan
 
 
 def attention_spec():

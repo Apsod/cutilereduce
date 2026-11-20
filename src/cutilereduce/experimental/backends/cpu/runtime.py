@@ -33,7 +33,7 @@ from cutilereduce.experimental.planning.scheduled import (
     schedule_backward_program,
 )
 from cutilereduce.experimental.planning.ssa import SpecializedSchedule
-from cutilereduce.experimental.planning.target import TargetModel
+from cutilereduce.experimental.planning.target import ExecutionTarget
 
 
 from .codegen import emit_cpp_source
@@ -75,7 +75,7 @@ def _bind_results(region: TensorRegion, tensors: list[Any]) -> dict[str, Any]:
 
 @dataclass
 class CompiledCpuFold:
-    operator: FoldOperator
+    operator: FoldOperator | None
     problem: FoldProgram
     scheduled: CpuScheduledPlan
     modules: dict[int, Any]
@@ -85,7 +85,7 @@ class CompiledCpuFold:
 
     @property
     def supports_backward(self) -> bool:
-        return self.problem.embed_output_vjp is not None
+        return bool(self.scheduled.backward) and self.problem.embed_output_vjp is not None
 
     @property
     def module(self):
@@ -610,7 +610,7 @@ class _CompiledFoldFunction:
 
 
 def compile_cpu(
-    operator: FoldOperator,
+    operator: FoldOperator | None,
     sizes: dict[str, int],
     *,
     plan: ForwardScheduleTemplate | None = None,
@@ -620,11 +620,20 @@ def compile_cpu(
     backward_schedule: CpuScheduleConfig | None = None,
     backward_program: ScheduledBackwardProgram | None = None,
     target: CpuTarget | None = None,
+    _region_realizations=None,
+    _program=None,
+    _forward_scheduled=None,
+    _backward_scheduled=None,
 ) -> CompiledCpuFold:
     """Compile size-specialized symbolic regions into a cached C++ extension."""
     from torch.utils.cpp_extension import load_inline
 
-    problem = operator.lower(backward=backward)
+    if _program is None:
+        if operator is None:
+            raise ValueError("compilation requires an operator or a lowered program")
+        problem = operator.lower(backward=backward)
+    else:
+        problem = _program
     schedule_space = build_schedule_space(problem)
     if backward_program is not None:
         if not backward:
@@ -639,18 +648,26 @@ def compile_cpu(
                     f"scheduled extent for {axis.axis!r} does not match sizes"
                 )
     if plan is None and schedule is None:
-        from cutilereduce.experimental.backends.cpu.cost import select_cpu_plan
-
-        candidates = schedule_space.forward
-        if backward and problem.requires_prefix:
-            candidates = tuple(
-                candidate
-                for candidate in candidates
-                if candidate.name == "partial_scan_checkpoints"
-            )
-        choice = select_cpu_plan(problem, candidates, sizes, target=target)
-        selected = choice.plan
-        schedule = choice.config
+        from cutilereduce.experimental.planning.analysis import PlanningProblem
+        from cutilereduce.experimental.backends.cpu.tuning import (
+            compile_cpu_candidate, cpu_analytical_target, candidate_cpu_configs,
+        )
+        target = target or CpuTarget.detect()
+        planning = PlanningProblem(problem, cpu_analytical_target(target), sizes)
+        finalists = planning.sweep(backward=backward).shortlist(1, per_family=0)
+        if not finalists:
+            raise ValueError("no legal CPU schedule for this program and hardware")
+        if backward_program is not None or backward_schedule is not None:
+            # An explicitly supplied backward implementation is authoritative.
+            # Select forward decisions without replacing that implementation.
+            selected, schedule, _ = candidate_cpu_configs(planning, finalists[0].candidate)
+            if finalists[0].implementation is not None:
+                _forward_scheduled = finalists[0].implementation.execution.forward
+        elif finalists[0].implementation is not None:
+            from .backend import CpuBackend
+            return CpuBackend().compile(finalists[0].implementation)
+        else:
+            return compile_cpu_candidate(operator, planning, finalists[0].candidate, target=target)
     else:
         selected = plan or schedule_space.forward[0]
     if (
@@ -663,7 +680,7 @@ def compile_cpu(
         )
     from cutilereduce.experimental.backends.cpu.schedule import schedule_cpu
 
-    forward_scheduled = schedule_cpu(
+    forward_scheduled = _forward_scheduled or schedule_cpu(
         problem,
         selected,
         sizes,
@@ -696,7 +713,7 @@ def compile_cpu(
                 scratch_bytes_per_worker=configured_scratch,
                 stages=configured_stages,
             )
-        backward_scheduled = schedule_cpu(
+        backward_scheduled = _backward_scheduled or schedule_cpu(
             problem,
             backward_plan,
             sizes,
@@ -786,6 +803,7 @@ def compile_cpu(
         source = emit_cpp_source(
             problem,
             local_sizes,
+            region_realizations=_region_realizations,
             backward=backward,
             scheduled_backward=(backward_program if extent == full_extent else None),
             scheduled_forward=(scheduled if extent == full_extent else None),
@@ -816,7 +834,7 @@ def compile_cpu(
     specialized = SpecializedSchedule(
         program=problem,
         template=specialization_template,
-        target=TargetModel(
+        target=ExecutionTarget(
             "cpu",
             frozenset(
                 {"tensor_regions", "tiled_loops", "multi_stage", "relaxed_atomic_add"}

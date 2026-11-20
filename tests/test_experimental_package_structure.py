@@ -13,9 +13,10 @@ def test_public_entry_points_are_preserved():
     from cutilereduce.experimental.compiler.operator import FoldOperator
     from cutilereduce.experimental.ir import TensorBuilder
 
-    assert exp.compile_cpu is compile_cpu
-    assert exp.emit_cpp_source is emit_cpp_source
-    assert exp.emit_cutile_source is emit_cutile_source
+    from cutilereduce.experimental.api import compile
+    assert exp.compile is compile
+    assert callable(compile_cpu) and callable(emit_cpp_source) and callable(emit_cutile_source)
+    assert not hasattr(exp, "emit_cpp_source")
     assert exp.FoldOperator is FoldOperator
     assert exp.TensorBuilder is TensorBuilder
     assert len(exp.__all__) == len(set(exp.__all__))

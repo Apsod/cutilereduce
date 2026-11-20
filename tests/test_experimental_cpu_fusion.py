@@ -5,7 +5,8 @@ import hashlib
 import pytest
 import torch
 
-from cutilereduce.experimental import TensorRegionBuilder, TensorSignature
+from cutilereduce.experimental.ir.core import TensorRegionBuilder
+from cutilereduce.experimental import TensorSignature
 from cutilereduce.experimental.backends.cpu.regions import _emit_region
 from cutilereduce.experimental.backends.reference import _execute_region
 
@@ -169,10 +170,10 @@ torch::Tensor worker_ids() {
 
 
 def test_online_attention_parallel_workers_preserve_custom_autograd():
-    from cutilereduce.experimental import (
-        CpuTarget, PlanningProblem, ScheduleCandidate, compile_cpu_candidate, cpu_analytical_target,
-        FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec,
-    )
+    from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
+    from cutilereduce.experimental.planning.analysis import PlanningProblem, ScheduleCandidate
+    from cutilereduce.experimental.backends.cpu.tuning import compile_cpu_candidate, cpu_analytical_target
+    from cutilereduce.experimental import FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec
     sizes = {"h": 1, "l": 8, "g": 1, "r": 17, "dqk": 4, "dv": 5}
     spec = FoldSpec({
         "query": TensorSpec(("h", "l", "g", "dqk")),

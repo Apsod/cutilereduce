@@ -15,18 +15,10 @@ from pathlib import Path
 import cuda.tile as ct
 import torch
 
-from cutilereduce.experimental import (
-    ContractionPrecision,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    LogWeightedSum,
-    StructuredValue,
-    TensorSpec,
-    build_schedule_space,
-    emit_cutile_source,
-    specialize_cutile_schedule,
-)
+from cutilereduce.experimental import ContractionPrecision, FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec
+from cutilereduce.experimental.planning.templates import build_schedule_space
+from cutilereduce.experimental.backends.cutile.codegen import emit_cutile_source
+from cutilereduce.experimental.backends.cutile.schedule import specialize_cutile_schedule
 
 
 FIXED_TILES = {"h": 1, "l": 128, "g": 1, "r": 32}

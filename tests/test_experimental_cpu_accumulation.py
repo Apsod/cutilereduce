@@ -6,21 +6,11 @@ import hashlib
 import pytest
 import torch
 
-from cutilereduce.experimental import (
-    Add,
-    CpuScheduleConfig,
-    CpuStageConfig,
-    CpuTarget,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    StructuredValue,
-    TensorSpec,
-    build_schedule_space,
-    compile_cpu,
-    emit_cpp_source,
-    schedule_cpu,
-)
+from cutilereduce.experimental import Add, FoldMaps, FoldOperator, FoldSpec, StructuredValue, TensorSpec
+from cutilereduce.experimental.backends.cpu.schedule import CpuScheduleConfig, CpuStageConfig, CpuTarget, schedule_cpu
+from cutilereduce.experimental.planning.templates import build_schedule_space
+from cutilereduce.experimental.backends.cpu.runtime import compile_cpu
+from cutilereduce.experimental.backends.cpu.codegen import emit_cpp_source
 from cutilereduce.experimental.backends.cpu.regions import _emit_region
 from cutilereduce.experimental.ir.core import TensorBuilder
 from cutilereduce.experimental.ir.passes import program_to_region

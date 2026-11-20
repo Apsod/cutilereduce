@@ -1,16 +1,6 @@
 """A static student–teacher tower with branch-local teacher gradient cuts."""
 
-from cutilereduce.experimental import (
-    Add,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    LogSumExp,
-    LogWeightedSum,
-    Product,
-    StructuredValue,
-    TensorSpec,
-)
+from cutilereduce.experimental import Add, FoldMaps, FoldOperator, FoldSpec, LogSumExp, LogWeightedSum, Product, StructuredValue, TensorSpec
 
 
 def make_teacher_tower(num_predictors: int = 3) -> FoldOperator:

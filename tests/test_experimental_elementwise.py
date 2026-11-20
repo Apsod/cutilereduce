@@ -3,7 +3,8 @@ import ast
 import pytest
 import torch
 
-from cutilereduce.experimental import TensorRegionBuilder, TensorSignature
+from cutilereduce.experimental.ir.core import TensorRegionBuilder
+from cutilereduce.experimental import TensorSignature
 from cutilereduce.experimental.ir.autodiff import vjp
 from cutilereduce.experimental.backends.cutile.regions import _emit_region
 from cutilereduce.experimental.backends.reference import _execute_region
@@ -196,7 +197,7 @@ def test_native_elementwise_region():
 def test_teacher_tower_per_loss_gradients():
     import importlib.util
     from pathlib import Path
-    from cutilereduce.experimental import compile_cpu
+    from cutilereduce.experimental.backends.cpu.runtime import compile_cpu
 
     spec = importlib.util.spec_from_file_location(
         "teacher_tower",

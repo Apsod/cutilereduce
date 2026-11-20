@@ -4,31 +4,14 @@ import math
 import pytest
 import torch
 
-from cutilereduce.experimental import (
-    AxisPartition,
-    ContractionPrecision,
-    FoldMaps,
-    FoldFactor,
-    FoldOperator,
-    FoldSpec,
-    LogWeightedSum,
-    LogSumExp,
-    Add,
-    AffineLWS,
-    Product,
-    StructuredValue,
-    TensorSpec,
-    TiledStage,
-    execute_tiled_fold_cpu,
-    execute_tiled_backward_cpu,
-    emit_cutile_backward_source,
-    emit_cutile_source,
-    discover_tile_mask,
-    format_tiled_fold,
-    build_schedule_space,
-    specialize_cutile_schedule,
-    specialize_cutile_backward_schedule,
-)
+from cutilereduce.experimental.planning.ssa import AxisPartition, TiledStage
+from cutilereduce.experimental import ContractionPrecision, FoldMaps, FoldFactor, FoldOperator, FoldSpec, LogWeightedSum, LogSumExp, Add, AffineLWS, Product, StructuredValue, TensorSpec
+from cutilereduce.experimental.backends.reference import execute_tiled_fold_cpu, execute_tiled_backward_cpu
+from cutilereduce.experimental.backends.cutile.codegen import emit_cutile_backward_source, emit_cutile_source
+from cutilereduce.experimental.ir.passes import discover_tile_mask
+from cutilereduce.experimental.planning.tiled import format_tiled_fold
+from cutilereduce.experimental.planning.templates import build_schedule_space
+from cutilereduce.experimental.backends.cutile.schedule import specialize_cutile_schedule, specialize_cutile_backward_schedule
 
 
 def _specialize_forward(program, sizes, tiles):

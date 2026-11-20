@@ -176,10 +176,15 @@ def _emit_region(
     *,
     nested_names: dict[int, str] | None = None,
     fuse: bool = True,
+    implementation=None,
 ) -> str:
-    from .fusion import HEADERS, RegionFusion
+    from .fusion import HEADERS
+    from .realization import realize_cpu_region
 
-    fusion = RegionFusion(region) if fuse else None
+    if implementation is not None and (implementation.region is not region or not fuse):
+        raise ValueError("CPU realization does not match region or fusion mode")
+    implementation = implementation or (realize_cpu_region(region) if fuse else None)
+    fusion = implementation.fusion if implementation is not None else None
     owned: set[int] = set()
     function = _cpp_name(name)
     argument_names = {node_id: _cpp_name(arg) for arg, node_id in region.arguments}

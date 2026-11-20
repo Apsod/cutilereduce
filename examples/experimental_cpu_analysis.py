@@ -10,7 +10,9 @@ from dataclasses import replace
 import json
 from pathlib import Path
 
-from cutilereduce.experimental import CpuTarget, PlanningProblem, ScheduleCandidate, cpu_analytical_target
+from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
+from cutilereduce.experimental.planning.analysis import PlanningProblem, ScheduleCandidate
+from cutilereduce.experimental.backends.cpu.tuning import cpu_analytical_target
 from examples.experimental_cpu_single_tile import attention_operator
 
 

@@ -25,7 +25,13 @@ order-sensitive numerics are out of scope for now.
 
 ```python
 op = FoldOperator(spec, algebra, FoldMaps(to_factor=..., to_output=...))
-f = compile_cpu(op, sizes, backward=True)   # torch.autograd-compatible callable
+from cutilereduce.experimental import CpuBackend, CpuTarget, compile, analyze, tune
+hardware = CpuTarget.detect()  # explicit discovery at the application boundary
+backend = CpuBackend()
+f = compile(op, sizes, backend=backend, hardware=hardware, backward=True)
+# Optional: analytical pruning/top-k, correctness validation, empirical selection.
+result = tune(op, sizes, inputs, backend=backend, hardware=hardware,
+              reference=reference, backward=True, candidate_count=20)
 ```
 
 **You never write:** backward code, tile sizes, loops, kernels, layouts, or
@@ -90,16 +96,16 @@ every axis they do not eliminate and never see batch axes, tiles, or the map.
 
 ## Public surface
 
-The intended public surface is the table in *What you write* plus one compile
-entry point per target. Everything else exported today is an **inspection and
-override tier**, kept for convenience and without stability guarantees:
+The top-level module exports operator/algebra authoring, core tensor DSL types,
+`CpuBackend` / `CpuTarget`, `CuTileBackend` / `CuTileTarget`, and
+`analyze` / `compile` / `tune`. Compilation selects analytically; tuning is explicit.
+Both return autograd-compatible execution when backward is requested and supported.
 
-| Purpose | Entry points |
-|---|---|
-| Inspect lowered IR and contraction fusion | `operator.lower()`, `compile_fold(...).format()`, `TensorProgram.contractions` / `.reductions` / `.materializations`, `compile_*_region` |
-| Inspect or override schedules | `build_schedule_space`, `format_plan`, `schedule_backward_program`, `schedule_cpu`, `CpuScheduleConfig` |
-| Inspect generated code | `emit_cpp_source`, `specialize_cutile_schedule`, `emit_cutile_source`, `emit_cutile_backward_source` |
-| Reference execution | `execute_tiled_fold_cpu`, `execute_tiled_backward_cpu` |
+Inspection and overrides live in their owning packages: `planning.analysis` for
+candidates/reports, `planning.driver` for report selection/tuning,
+`planning.ssa` and `planning.bound` for scheduled IR, and each backend's emission
+modules for generated source. These APIs remain experimental. Former top-level
+reexports and competing target/CPU selection helpers have been removed.
 
 ## Analytical planning and tuning
 
@@ -122,18 +128,27 @@ Not yet supported: VJPs outside the current DSL subset; automatic derivation
 of fused fold-accumulate updates; numerical rewrite policies (strict order,
 compensated sums); a single target-generic compile entry point.
 
-### Planned changes
+### Extension contracts
 
-- **`batch_axes` become inferred.** Tracing already determines each carrier
-  field's actual dependencies; outer axes are those surviving into `E` minus
-  the algebra's declared inner axes. Explicit declaration is inherited from
-  the callback path, which cannot see through user code. The inner/outer
-  choice is a modeling decision expressed by the algebra (one `LWS(("dv",))`
-  vs `dv` independent `LWS(())` instances sharing a weighting), not by the
-  spec. Whether to split an inner axis across programs (recomputing the shared
-  fields) is then a planner cost decision rather than a hard restriction.
-- **The cost model moves toward the IR.** Work (contraction FLOPs from the
-  named-axis partition, reductions, transcendentals) is schedule-independent
-  and computed from IR regions; traffic and recomputation follow from the plan
-  (residency, partitions, recompute in backward); rates and weights come from
-  the target.
+Algebra authors supply carriers, identity/combine, execution conversions and
+embed/finalize using the tensor DSL. Backend authors supply specialization,
+legal schedule domains/constraints, realization into shared scheduled IR,
+physical region refinements, compilation and an execution/timing adapter.
+
+The shared planner enumerates choices. Shared cost visitors analyze bound loops
+and tiled SSA, combining region work/dependencies with repetition, storage and
+commits. Backends specialize physical cost rules without replacing the entire
+costing system. Analytical selection retains the implementations that empirical
+tuning later compiles; emission does not independently choose a new schedule.
+
+Hardware descriptions are separate from model policy. `CpuTarget` describes CPU
+resources; `CuTileTarget` describes a single GPU and optional throughput data.
+`BackendModel` in `planning.analysis` holds estimator assumptions and scheduling
+capabilities. `ExecutionTarget` in `planning.target` is a low-level tile-binding
+capability record, with no cost hooks or selection methods.
+
+Distributed execution and user-facing scans remain outside this milestone.
+Scope names and dependency/ownership accounting can support hierarchical
+placement later; they do not imply an implemented cluster/node/device scheduler.
+GPU runtime/source support is implemented, but this refactor's GPU execution
+remains unverified on device hardware.

@@ -8,7 +8,7 @@ from dataclasses import replace
 from cutilereduce.experimental.ir.core import TensorSignature
 from cutilereduce.experimental.compiler.operator import FoldProgram
 from cutilereduce.experimental.planning.templates import ForwardScheduleTemplate
-from cutilereduce.experimental.planning.target import TargetModel
+from cutilereduce.experimental.planning.target import ExecutionTarget
 from cutilereduce.experimental.planning.scheduled import (
     ScheduledAxis,
     TileBinding,
@@ -200,7 +200,7 @@ def specialize_cutile_schedule(
     sizes: dict[str, int],
     *,
     tiles: dict[str, int] | None = None,
-    target: TargetModel | None = None,
+    target: ExecutionTarget | None = None,
 ) -> SpecializedSchedule:
     """Bind an online schedule to CuTile tiles and build its executable DAG."""
     from cutilereduce.experimental.planning.templates import build_schedule_space
@@ -216,7 +216,7 @@ def specialize_cutile_schedule(
         raise ValueError("sizes must define every logical axis exactly once")
     if any(type(value) is not int or value <= 0 for value in sizes.values()):
         raise ValueError("all logical extents must be positive integers")
-    target = target or TargetModel(
+    target = target or ExecutionTarget(
         "cutile",
         frozenset(
             {"tensor_regions", "tiled_loops", "multi_stage", "relaxed_atomic_add"}
@@ -346,7 +346,7 @@ def specialize_cutile_backward_schedule(
     tiles: dict[str, int] | None = None,
     loop_programs: int = 1,
     program_axes: tuple[str, ...] | None = None,
-    target: TargetModel | None = None,
+    target: ExecutionTarget | None = None,
 ) -> SpecializedSchedule:
     """Bind a backward template to CuTile dimensions and a concrete stage DAG."""
     from cutilereduce.experimental.planning.templates import build_schedule_space
@@ -360,7 +360,7 @@ def specialize_cutile_backward_schedule(
         raise ValueError("sizes must define every logical axis exactly once")
     if any(type(value) is not int or value <= 0 for value in sizes.values()):
         raise ValueError("all logical extents must be positive integers")
-    target = target or TargetModel(
+    target = target or ExecutionTarget(
         "cutile",
         frozenset(
             {"tensor_regions", "tiled_loops", "multi_stage", "relaxed_atomic_add"}

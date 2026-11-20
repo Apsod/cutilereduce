@@ -99,3 +99,22 @@ randomized order; their differences give some indication of timing variability.
 These are complete forward-plus-backward measurements, not isolated backward
 latencies. Outputs and random-cotangent input gradients passed at both thread
 counts. Compilation and analytical search were completed before timing.
+
+## IR costing refactor confirmation
+
+[ir-refactor-2048.json](ir-refactor-2048.json) repeats the analytical selection
+and measurement after the backend-contract/IR-accounting refactor (60 rounds).
+Both complete grids were evaluated: 7,500 / 15,000 candidates for one / four
+threads, without truncation. Both selected the same schedule as before: tree
+forward with query tile 128/full fold, backward with full query/fold tile 128.
+Outputs and random-cotangent gradients passed at both thread counts.
+
+| Threads | Selected training ms | Previous coupled schedule ms | Eager ms | Speedup over eager |
+|---:|---:|---:|---:|---:|
+| 1 | 32.27 | 32.43 | 42.65 | 1.32x |
+| 4 | 18.51 | 20.15 | 25.79 | 1.39x |
+
+The selected one-thread and four-thread entries have identical decisions and
+are measured separately in randomized order. Timing variation remains visible;
+this confirms retained behavior rather than attributing a performance change to
+the refactor. Compilation and analytical search finished before timing.

@@ -11,20 +11,11 @@ from pathlib import Path
 
 import torch
 
-from cutilereduce.experimental import (
-    CommitMode,
-    CpuTarget,
-    FoldMaps,
-    FoldOperator,
-    FoldSpec,
-    LogWeightedSum,
-    PlanningProblem,
-    ScheduleCandidate,
-    StructuredValue,
-    TensorSpec,
-    compile_cpu_candidate,
-    cpu_analytical_target,
-)
+from cutilereduce.experimental.planning.scheduled import CommitMode
+from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
+from cutilereduce.experimental import FoldMaps, FoldOperator, FoldSpec, LogWeightedSum, StructuredValue, TensorSpec
+from cutilereduce.experimental.planning.analysis import PlanningProblem, ScheduleCandidate
+from cutilereduce.experimental.backends.cpu.tuning import compile_cpu_candidate, cpu_analytical_target
 
 
 def attention_operator():

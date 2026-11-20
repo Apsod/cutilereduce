@@ -8,12 +8,13 @@ import pytest
 import torch
 
 from cutilereduce.core.poly import Polynomial
-from cutilereduce.experimental import (
-    Add, Affine, FoldMaps, FoldOperator, FoldSpec, StructuredValue, TensorSpec,
-    AnalyticalTarget, PlanningProblem, ScheduleCandidate, analyze_region,
-    compile_cpu_candidate, compile_cutile_candidate, load_candidate,
-    tune_candidates, CpuTarget,
-)
+from cutilereduce.experimental import Add, Affine, FoldMaps, FoldOperator, FoldSpec, StructuredValue, TensorSpec
+from cutilereduce.experimental.planning.analysis import BackendModel, PlanningProblem, ScheduleCandidate
+from cutilereduce.experimental.ir.cost import analyze_region
+from cutilereduce.experimental.backends.cpu.tuning import compile_cpu_candidate
+from cutilereduce.experimental.backends.cutile.runtime import compile_cutile_candidate
+from cutilereduce.experimental.planning.tuning import load_candidate, tune_candidates
+from cutilereduce.experimental.backends.cpu.schedule import CpuTarget
 
 
 def add_operator():
@@ -24,15 +25,18 @@ def add_operator():
 
 
 def target(backend="cpu", **kwargs):
-    return AnalyticalTarget(
-        backend, workers=4, contraction_flops_per_second=1e12,
+    from cutilereduce.experimental.backends.cutile.analysis import cutile_analytical_target
+    constructor = cutile_analytical_target if backend == "cutile" else lambda **kw: BackendModel(backend, **kw)
+    return constructor(
+        workers=4, contraction_flops_per_second=1e12,
         scalar_ops_per_second=1e10, transcendental_ops_per_second=1e9,
         bytes_per_second=1e10, **kwargs,
     )
 
 
 def test_symbolic_contractions_are_polynomial_and_count_shared_producers_once():
-    from cutilereduce.experimental import TensorRegionBuilder, TensorSignature
+    from cutilereduce.experimental.ir.core import TensorRegionBuilder
+    from cutilereduce.experimental import TensorSignature
     ctx = TensorRegionBuilder(("b", "m", "n", "k"))
     lhs = ctx.expect("lhs", TensorSignature(("b", "m", "k")))
     rhs = ctx.expect("rhs", TensorSignature(("b", "k", "n")))
@@ -161,7 +165,7 @@ def test_cpu_candidate_training_matches_torch():
 
 def test_nonfinite_rates_and_invalid_sizes_rejected():
     with pytest.raises(ValueError):
-        AnalyticalTarget("cpu", bytes_per_second=float('nan'))
+        BackendModel("cpu", bytes_per_second=float('nan'))
     with pytest.raises(ValueError):
         PlanningProblem(add_operator().lower(), target(), {"b": 0})
     with pytest.raises(ValueError):
@@ -212,7 +216,7 @@ def test_polynomial_residency_bounds_narrow_the_tile_domain():
 
 
 def test_cpu_empirical_adapter_roundtrip(tmp_path):
-    from cutilereduce.experimental import tune_cpu
+    from cutilereduce.experimental.backends.cpu.tuning import tune_cpu
     op = add_operator()
     p = PlanningProblem(op.lower(), target(), {"b": 3, "r": 9})
     candidate = ScheduleCandidate("online", (("tile.b", 2), ("tile.r", 4)), True, "b")
@@ -263,3 +267,19 @@ def test_independent_tiles_change_only_backward_cost_and_lowering():
     _, forward, backward = candidate_cpu_configs(p, c)
     assert dict(forward.chunk_sizes) == {"r": 9}
     assert dict(backward.chunk_sizes) == {"r": 3}
+
+
+def test_cutile_realization_does_not_emit_or_compile(monkeypatch):
+    from cutilereduce.experimental.backends.cutile import runtime
+    op = add_operator()
+    problem = PlanningProblem(op.lower(), target("cutile"), {"b": 4, "r": 8})
+    candidate = ScheduleCandidate("online", (("tile.b", 2), ("tile.r", 4)), True, "b")
+    def forbid(*args, **kwargs):
+        raise AssertionError("realization must not emit or load source")
+    monkeypatch.setattr(runtime, "emit_cutile_source", forbid)
+    monkeypatch.setattr(runtime, "emit_cutile_backward_source", forbid)
+    monkeypatch.setattr(runtime, "_load_source", forbid)
+    forward, backward = runtime.realize_cutile_candidate(problem, candidate)
+    assert forward.program is problem.program
+    assert backward.program is problem.program
+    assert dict(forward.shape) == dict(problem.sizes)

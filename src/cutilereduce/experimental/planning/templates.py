@@ -222,48 +222,6 @@ class ScheduleSpace:
             parameter.name: parameter.domain(shape) for parameter in schedule.parameters
         }
 
-    def select_forward(self, shape: dict[str, int], target) -> ForwardScheduleTemplate:
-        """Select a legal template using a target cost hook when supplied."""
-        candidates = tuple(
-            schedule
-            for schedule in self.forward
-            if target.supports_schedule(schedule.name)
-        )
-        if not candidates:
-            raise NotImplementedError(
-                f"target {target.name!r} supports no forward schedule"
-            )
-        for schedule in candidates:
-            self.analyze_shape(schedule, shape)
-        if target.cost_hook is None:
-            return candidates[0]
-        return min(
-            candidates,
-            key=lambda schedule: target.estimate(self.program, schedule, shape),
-        )
-
-    def select_backward(
-        self, shape: dict[str, int], target
-    ) -> BackwardScheduleTemplate:
-        """Select a backward template independently of the forward topology."""
-        candidates = tuple(
-            schedule
-            for schedule in self.backward
-            if target.supports_schedule(schedule.name)
-        )
-        if not candidates:
-            raise NotImplementedError(
-                f"target {target.name!r} supports no backward schedule"
-            )
-        for schedule in candidates:
-            self.analyze_shape(schedule, shape)
-        if target.cost_hook is None:
-            return candidates[0]
-        return min(
-            candidates,
-            key=lambda schedule: target.estimate(self.program, schedule, shape),
-        )
-
 
 def _parameters_for(stages: tuple[PlanStage, ...]) -> tuple[ScheduleParameter, ...]:
     found: dict[str, ScheduleParameter] = {}
