@@ -20,7 +20,7 @@ def tune(operator, sizes, inputs, *, backend, hardware, reference, backward=Fals
     """Analytical pruning/top-k followed by validation and empirical selection."""
     report = analyze(operator, sizes, backend=backend, hardware=hardware,
         backward=backward, max_candidates=max_candidates, parameter_domains=parameter_domains,
-        candidates=candidates)
+        candidates=candidates, stagewise=True)
     return tune_report(report, inputs, reference=reference, execution=backend.execution_adapter(),
         backward=backward, candidate_count=candidate_count, per_family=per_family,
         warmup=warmup, iterations=iterations, rtol=rtol, atol=atol)

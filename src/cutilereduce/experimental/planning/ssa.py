@@ -2,11 +2,11 @@
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Any
 
 from cutilereduce.experimental.ir.core import TensorSignature
+from .accounting import _positive, ceildiv
 from cutilereduce.experimental.planning.scheduled import (
     CommitMode,
     LocalLifetime,
@@ -58,12 +58,12 @@ class AxisPartition:
     def __post_init__(self) -> None:
         if not self.axis:
             raise ValueError("partition axis name must be non-empty")
-        if min(self.extent, self.tile, self.programs) <= 0:
-            raise ValueError("partition extent, tile, and programs must be positive")
+        for value in (self.extent, self.tile, self.programs):
+            _positive(value, "partition extent/tile/programs")
 
     @property
     def tile_count(self) -> int:
-        return math.ceil(self.extent / self.tile)
+        return ceildiv(self.extent, self.tile)
 
     def tile_span(self, program: int) -> tuple[int, int]:
         """Return the balanced half-open tile-index span owned by a program."""

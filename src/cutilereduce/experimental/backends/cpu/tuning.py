@@ -18,6 +18,7 @@ def cpu_analytical_target(target: CpuTarget, **model_overrides) -> BackendModel:
     Per-core rates and cache slowdown coefficients are generic uncalibrated
     defaults; callers can override CpuCostModel fields and inspect the metadata.
     """
+    from cutilereduce.experimental.planning.parametric import schedule_class
     from dataclasses import asdict
 
     lanes = max(1, target.vector_bytes // 4)
@@ -40,7 +41,7 @@ def cpu_analytical_target(target: CpuTarget, **model_overrides) -> BackendModel:
         transcendental_ops_per_second=model.transcendental_ops_per_second * model.workers,
         bytes_per_second=model.memory_bytes_per_second,
         region_analyzer=CpuRegionRealizations().analyze, stage_estimator=model.estimate_stage,
-        realization_factory=realize,
+        realization_factory=realize, batch_key=schedule_class,
         model_metadata={"name": "cpu_realization_v1", "assumptions": asdict(model)},
     )
 
@@ -104,7 +105,9 @@ def tune_cpu(operator, sizes, inputs, *, reference, target=None, analytical_targ
     backend = CpuBackend()
     prepared = BackendProgram(problem.program, target, problem.target,
         build_schedule_space(problem.program), tuple(sorted(sizes.items())))
-    sweep = problem.sweep(backward=backward) if sweep is None else sweep
+    if sweep is None:
+        from cutilereduce.experimental.planning.stages import stage_candidates
+        sweep = problem.sweep(stage_candidates(problem) if backward else None, backward=backward)
     report = AnalysisReport(backend, prepared, problem, sweep)
     return tune_report(report, inputs, reference=reference, execution=backend.execution_adapter(),
                        backward=backward, candidate_count=candidate_count,

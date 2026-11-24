@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import cached_property
 import math
 from collections.abc import Mapping
 
@@ -63,6 +64,16 @@ class Monomial:
 @dataclass(frozen=True, order=True)
 class Polynomial:
     monomials: tuple[Monomial, ...] = ()
+
+    @cached_property
+    def _hash(self):
+        return hash(self.monomials)
+
+    def __hash__(self):
+        return self._hash
+
+    def __reduce__(self):
+        return type(self), (self.monomials,)
 
     @classmethod
     def from_monomials(cls, monomials):

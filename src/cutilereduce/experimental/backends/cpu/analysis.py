@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, replace
+from functools import lru_cache
 
 from cutilereduce.core import symbolic as sym
 from cutilereduce.experimental.ir.core import TensorRegion
@@ -131,6 +132,7 @@ class CpuCostModel:
             if name.endswith("per_second") and value <= 0:
                 raise ValueError(f"{name} must be positive")
 
+    @lru_cache(maxsize=2048)
     def estimate_stage(self, stage):
         compute = memory = dispatch = penalty = calls = allocated = reads = writes = 0
         execution = 0

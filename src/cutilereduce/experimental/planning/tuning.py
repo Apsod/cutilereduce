@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import hashlib
 import json
 import math
@@ -18,8 +18,8 @@ def program_fingerprint(program):
     from dataclasses import fields
     from cutilereduce.experimental.ir.core import TensorRegion
     text = repr(program.spec) + repr(program.execution_structure)
-    for field in fields(program):
-        value = getattr(program, field.name)
+    for descriptor in fields(program):
+        value = getattr(program, descriptor.name)
         text += value.format() if isinstance(value, TensorRegion) else repr(value)
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -53,17 +53,33 @@ class TuningResult:
     measurements: tuple[TuningMeasurement, ...]
     problem: PlanningProblem
 
-    def save(self, path):
-        """Save concrete decisions, not generated code or pickled callables."""
-        Path(path).write_text(json.dumps({
+    stage_measurements: tuple = ()
+    selected_stages: tuple = ()
+    mode: str = "whole_plan"
+    tuning_metadata: dict = field(default_factory=dict)
+
+    def to_dict(self):
+        """Describe decisions and measurements without generated code or callables."""
+        return {
             "version": 2, "backend": self.problem.target.backend,
             "target_fingerprint": target_fingerprint(self.problem.target),
             "fingerprint": program_fingerprint(self.problem.program),
             "sizes": dict(self.problem.sizes),
             "selected": self.selected.to_dict(),
+            "mode": self.mode, "tuning_metadata": self.tuning_metadata,
+            "selected_stages": [{"key": s.key, "slot": s.slot,
+                "parameters": dict(s.parameters), "requires": [repr(a) for a in s.requires],
+                "produces": [repr(a) for a in s.produces]} for s in self.selected_stages],
+            "stage_measurements": [{"key": m.key, "slot": m.slot,
+                "candidate": m.candidate.to_dict(), "estimated_seconds": m.estimated_seconds,
+                "seconds": m.seconds, "failure": m.failure} for m in self.stage_measurements],
             "measurements": [{"candidate": m.candidate.to_dict(), "seconds": m.seconds,
                               "failure": m.failure} for m in self.measurements],
-        }, indent=2) + "\n")
+        }
+
+    def save(self, path):
+        """Save concrete decisions, not generated code or pickled callables."""
+        Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n")
 
 
 def load_candidate(problem: PlanningProblem, path) -> ScheduleCandidate:
@@ -99,6 +115,7 @@ def tune_candidates(
     reset, since those are execution-target responsibilities. Stage winners are
     never composed without measuring their actual complete execution.
     """
+    from .batched import resolve_implementation
     sweep = problem.sweep(backward=backward) if sweep is None else sweep
     finalists = sweep.shortlist(candidate_count, per_family=per_family)
     measurements = []
@@ -110,7 +127,7 @@ def tune_candidates(
             legal = problem.evaluate(candidate)
             if not legal.accepted:
                 raise ValueError(str(legal.rejection_reasons))
-            executable = (compile_implementation(estimate.implementation)
+            executable = (compile_implementation(resolve_implementation(estimate.implementation))
                           if compile_implementation is not None and estimate.implementation is not None
                           else compile_candidate(candidate))
             validate(executable)

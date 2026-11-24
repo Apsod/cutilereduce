@@ -78,3 +78,24 @@ class CpuBackend:
     def execution_adapter(self):
         from .execution import CpuExecution
         return CpuExecution()
+
+    def stage_plan(self, program, candidate):
+        from .stages import stage_plan
+        return stage_plan(program, candidate)
+
+    def compile_stage(self, program, stage):
+        from .stages import compile_stage
+        return compile_stage(self, program, stage)
+
+    def stage_fixture(self, program, inputs, reference, **kwargs):
+        from .stages import fixture
+        return fixture(program, inputs, reference, **kwargs)
+
+    def assemble(self, program, stages):
+        from .stages import assemble
+        return assemble(program, stages)
+
+    def stage_candidates(self, program, problem, parameter_domains=None):
+        # These backends expose the standard forward/embed/finalize split.
+        from cutilereduce.experimental.planning.stages import stage_candidates
+        return stage_candidates(problem, parameter_domains)

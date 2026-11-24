@@ -15,7 +15,9 @@ def tune_cutile(operator, sizes, inputs, *, reference, analytical_target,
     hardware = CuTileTarget(**dict(analytical_target.hardware_identity))
     prepared = backend.specialize(operator.lower(backward=backward), hardware, sizes=sizes)
     problem = PlanningProblem(prepared.program, prepared.analytical_target, sizes)
-    sweep = problem.sweep(backward=backward) if sweep is None else sweep
+    if sweep is None:
+        from cutilereduce.experimental.planning.stages import stage_candidates
+        sweep = problem.sweep(stage_candidates(problem) if backward else None, backward=backward)
     return tune_report(AnalysisReport(backend, prepared, problem, sweep), inputs,
         reference=reference, execution=backend.execution_adapter(), backward=backward,
         candidate_count=candidate_count, warmup=warmup, iterations=iterations, rtol=rtol, atol=atol)

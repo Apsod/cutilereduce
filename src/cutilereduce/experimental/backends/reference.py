@@ -205,6 +205,14 @@ def _execute_region(
                 "compare_ge": torch.ge,
                 "compare_greater_equal": torch.ge,
             }[node.op](left, right)
+        elif node.op == "scan_sum":
+            dimension = input_nodes[0].axes.index(attrs["over"])
+            source = inputs[0].flip((dimension,)) if attrs.get("reverse", False) else inputs[0]
+            value = source.cumsum(dimension)
+            if attrs.get("exclusive", False):
+                value = value - source
+            if attrs.get("reverse", False):
+                value = value.flip((dimension,))
         elif node.op.startswith("reduce_"):
             dims = tuple(input_nodes[0].axes.index(axis) for axis in attrs["over"])
             value = (

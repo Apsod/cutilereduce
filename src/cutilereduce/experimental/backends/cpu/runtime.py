@@ -345,12 +345,12 @@ class CompiledCpuFold:
             offset += local_extent
         return result
 
-    def backward_values(
+    def _backward_values_context(
         self,
         inputs: tuple[Any, ...],
         execution: dict[str, Any],
         output_cotangents: tuple[Any, ...],
-    ) -> tuple[Any | None, ...]:
+    ) -> dict[str, Any]:
         if self.problem.embed_output_vjp is None:
             raise ValueError("CPU fold was compiled without backward regions")
         backward_region = (
@@ -369,6 +369,11 @@ class CompiledCpuFold:
             strict=True,
         ):
             values[f"grad_output.{name}"] = cotangent.contiguous()
+        return values
+
+    def embed_values(self, inputs, execution, output_cotangents):
+        values = self._backward_values_context(inputs, execution, output_cotangents)
+        assert self.problem.embed_output_vjp is not None
         accumulator = _bind_results(
             self.problem.embed_output_vjp,
             list(
@@ -377,6 +382,16 @@ class CompiledCpuFold:
                 )
             ),
         )
+        return accumulator
+
+    def backward_values(self, inputs, execution, output_cotangents):
+        accumulator = self.embed_values(inputs, execution, output_cotangents)
+        return self.finalize_values(inputs, execution, output_cotangents, accumulator)
+
+    def finalize_values(self, inputs, execution, output_cotangents, accumulator):
+        values = self._backward_values_context(inputs, execution, output_cotangents)
+        backward_region = self.problem.map_finalize_map_vjp or self.problem.map_finalize_map_vjp_accumulate
+        assert backward_region is not None
         values.update(accumulator)
         if self.backward_program is not None:
             tensors = list(
@@ -624,6 +639,7 @@ def compile_cpu(
     _program=None,
     _forward_scheduled=None,
     _backward_scheduled=None,
+    _emit_forward=True,
 ) -> CompiledCpuFold:
     """Compile size-specialized symbolic regions into a cached C++ extension."""
     from torch.utils.cpp_extension import load_inline
@@ -653,6 +669,7 @@ def compile_cpu(
             compile_cpu_candidate, cpu_analytical_target, candidate_cpu_configs,
         )
         target = target or CpuTarget.detect()
+        from cutilereduce.experimental.planning.batched import resolve_implementation
         planning = PlanningProblem(problem, cpu_analytical_target(target), sizes)
         finalists = planning.sweep(backward=backward).shortlist(1, per_family=0)
         if not finalists:
@@ -662,10 +679,10 @@ def compile_cpu(
             # Select forward decisions without replacing that implementation.
             selected, schedule, _ = candidate_cpu_configs(planning, finalists[0].candidate)
             if finalists[0].implementation is not None:
-                _forward_scheduled = finalists[0].implementation.execution.forward
+                _forward_scheduled = resolve_implementation(finalists[0].implementation).execution.forward
         elif finalists[0].implementation is not None:
             from .backend import CpuBackend
-            return CpuBackend().compile(finalists[0].implementation)
+            return CpuBackend().compile(resolve_implementation(finalists[0].implementation))
         else:
             return compile_cpu_candidate(operator, planning, finalists[0].candidate, target=target)
     else:
@@ -792,7 +809,7 @@ def compile_cpu(
         return result
 
     extents = {full_extent}
-    for stage in (*scheduled.forward, *scheduled.backward):
+    for stage in ((*scheduled.forward, *scheduled.backward) if _emit_forward else scheduled.backward):
         for binding in stage.bindings:
             extents.update(required_extents(binding.expression, full_extent))
     modules = {}
@@ -806,7 +823,7 @@ def compile_cpu(
             region_realizations=_region_realizations,
             backward=backward,
             scheduled_backward=(backward_program if extent == full_extent else None),
-            scheduled_forward=(scheduled if extent == full_extent else None),
+            scheduled_forward=(scheduled if extent == full_extent and _emit_forward else None),
             forward_extents=(tuple(sorted(extents)) if extent == full_extent else ()),
         )
         extra_cflags, extra_ldflags = _cpu_build_flags(scheduled_backward=backward_program is not None)

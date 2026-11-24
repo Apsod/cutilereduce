@@ -14,7 +14,7 @@ from functools import cached_property
 import json
 import math
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
 
 from cutilereduce.core import symbolic as sym
 from cutilereduce.experimental.compiler.operator import FoldProgram
@@ -24,6 +24,9 @@ from cutilereduce.experimental.ir.cost import (
 from cutilereduce.experimental.planning.templates import build_schedule_space
 from cutilereduce.experimental.planning.accounting import ExecutionScope, ScheduleDomain, ceildiv
 
+
+if TYPE_CHECKING:
+    from .batched import CostView
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,7 @@ class BackendModel:
     region_transform: Callable | None = field(default=None, repr=False, compare=False)
     realization_factory: Callable | None = field(default=None, repr=False, compare=False)
     extra_parameter_domains: Mapping[str, tuple[int, ...]] = field(default_factory=dict)
+    batch_key: Callable | None = field(default=None, repr=False, compare=False)
 
     def __post_init__(self):
         if not self.backend:
@@ -195,7 +199,7 @@ class ScheduleCandidate:
 @dataclass(frozen=True)
 class CandidateEstimate:
     candidate: ScheduleCandidate
-    cost: ScheduleCost | None
+    cost: ScheduleCost | CostView | None
     rejection_reasons: tuple[str, ...] = ()
     implementation: Any = field(default=None, repr=False, compare=False)
 
@@ -209,6 +213,7 @@ class AnalyticalSweep:
     estimates: tuple[CandidateEstimate, ...]
     truncated: bool = False
     model_metadata: Mapping[str, Any] = field(default_factory=dict)
+    evaluation_metadata: Mapping[str, Any] = field(default_factory=dict)
 
     def shortlist(self, count: int = 20, *, per_family: int = 1):
         if count <= 0 or per_family < 0:
@@ -238,7 +243,7 @@ class AnalyticalSweep:
             if isinstance(value, sym.Expr):
                 return str(value)
             return float(value)
-        return {"version": 1, "truncated": self.truncated, "model": dict(self.model_metadata), "estimates": [
+        return {"version": 1, "truncated": self.truncated, "model": dict(self.model_metadata), "evaluation": dict(self.evaluation_metadata), "estimates": [
             {"candidate": e.candidate.to_dict(), "rejection_reasons": list(e.rejection_reasons),
              "metrics": None if e.cost is None else {
                  "estimated_seconds": scalar(e.cost.estimated_seconds),
@@ -323,11 +328,13 @@ class PlanningProblem:
 
     def bound_region(self, name, dimensions):
         key = (name, tuple((a, dimensions[a]) for a in self.program.spec.axes))
-        if all(isinstance(value, int) for _, value in key[1]):
-            if key not in self._region_bindings:
-                self._region_bindings[key] = self.regions[name].subs(dimensions)
-            return self._region_bindings[key]
-        return self.regions[name].subs(dimensions)
+        try:
+            hash(key)
+        except TypeError:
+            return self.regions[name].subs(dimensions)
+        if key not in self._region_bindings:
+            self._region_bindings[key] = self.regions[name].subs(dimensions)
+        return self._region_bindings[key]
 
     def validate_candidate(self, candidate):
         candidate = self.canonical_candidate(candidate)
@@ -694,18 +701,42 @@ class PlanningProblem:
                             count += 1
                             yield candidate
 
-    def sweep(self, candidates=None, *, backward=False, max_candidates=1_000_000, parameter_domains=None):
+    @cached_property
+    def _prepared_batches(self):
+        return {}
+
+    def sweep(self, candidates=None, *, backward=False, max_candidates=1_000_000, parameter_domains=None,
+              batched=True, batch_size=4096):
+        if max_candidates <= 0:
+            raise ValueError("max_candidates must be positive")
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive")
         source = self.candidates(backward=backward, max_candidates=max_candidates + 1,
                                  parameter_domains=parameter_domains) if candidates is None else candidates
         seen = set()
         estimates = []
         truncated = False
+        pending, prepared = [], self._prepared_batches
+        stats = {"scalar_fallback_candidates": 0, "groups": set()}
+        use_batch = (batched and self.target.batch_key is not None and self.target.realization_factory is not None
+                     and set(self.sizes) == set(self.program.spec.axes))
+        from .batched import evaluate_candidates
         for candidate in source:
             candidate = self.canonical_candidate(candidate)
-            if candidates is None and len(estimates) >= max_candidates:
+            if candidate.key not in seen and (len(estimates) + len(pending)) >= max_candidates:
                 truncated = True
                 break
             if candidate.key not in seen:
                 seen.add(candidate.key)
-                estimates.append(self.evaluate(candidate))
-        return AnalyticalSweep(tuple(estimates), truncated, self.target.model_metadata)
+                if use_batch:
+                    pending.append(candidate)
+                    if len(pending) >= batch_size:
+                        estimates.extend(evaluate_candidates(self, pending, prepared, stats))
+                        pending.clear()
+                else:
+                    estimates.append(self.evaluate(candidate))
+        if pending:
+            estimates.extend(evaluate_candidates(self, pending, prepared, stats))
+        return AnalyticalSweep(tuple(estimates), truncated, self.target.model_metadata,
+            {"mode": "batched" if use_batch else "scalar", "structural_groups": len(stats["groups"]),
+             "batch_size": batch_size, "scalar_fallback_candidates": stats["scalar_fallback_candidates"]})

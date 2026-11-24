@@ -6,11 +6,14 @@ import math
 from collections import Counter
 from dataclasses import dataclass
 from fractions import Fraction
+from functools import cached_property, lru_cache
 from typing import Any, Mapping
 
 import numpy as np
 
 from .poly import Polynomial, mono
+
+_NUMERIC_BATCH = object()
 
 
 @dataclass(frozen=True)
@@ -25,6 +28,20 @@ class Variable:
 class Node:
     op: str
     args: tuple[Any, ...]
+
+    @cached_property
+    def _hash(self):
+        return hash((self.op, self.args))
+
+    def __hash__(self):
+        return self._hash
+
+    def __reduce__(self):
+        return type(self), (self.op, self.args)
+
+    @cached_property
+    def variables(self):
+        return frozenset(v for arg in self.args for v in _walk(arg))
 
     def __str__(self):
         if self.op in {"min", "max"}:
@@ -116,14 +133,20 @@ class Expr:
         left, right = _raw(self), _raw(other)
         lp, rp = _poly(left), _poly(right)
         if lp is not None and rp is not None:
-            return _expr(lp / rp)
+            try:
+                return _expr(lp / rp)
+            except ValueError:
+                pass  # Non-monomial denominators remain rational expression nodes.
         return _expr(Node("div", (left, right)))
 
     def __rtruediv__(self, other):
         left, right = _raw(other), _raw(self)
         lp, rp = _poly(left), _poly(right)
         if lp is not None and rp is not None:
-            return _expr(lp / rp)
+            try:
+                return _expr(lp / rp)
+            except ValueError:
+                pass  # Non-monomial denominators remain rational expression nodes.
         return _expr(Node("div", (left, right)))
 
     def __floordiv__(self, other):
@@ -199,10 +222,7 @@ def _walk(value):
     if isinstance(value, Polynomial):
         return {Variable(n) for n in value.variables}
     if isinstance(value, Node):
-        result = set()
-        for arg in value.args:
-            result |= _walk(arg)
-        return result
+        return value.variables
     return set()
 
 
@@ -341,7 +361,7 @@ def _evaluate(value, values):
     if isinstance(value, Polynomial):
         result = 0
         for m in value.monomials:
-            term = m.coefficient
+            term = float(m.coefficient) if values.get(_NUMERIC_BATCH, False) else m.coefficient
             for name, exponent in m.exponents.mapping:
                 term *= np.asarray(values[name]) ** float(exponent)
             result += term
@@ -349,9 +369,11 @@ def _evaluate(value, values):
     if isinstance(value, Variable):
         return values[value.name]
     if isinstance(value, (int, float, Fraction, np.number)):
-        return value
+        return float(value) if isinstance(value, Fraction) and values.get(_NUMERIC_BATCH, False) else value
     if isinstance(value, Node):
         args = [_evaluate(a, values) for a in value.args]
+        if value.op == "tuple":
+            return tuple(args)
         if value.op == "add":
             return sum(args)
         if value.op == "mul":
@@ -413,6 +435,7 @@ def evaluate_batch(expression, values):
     # Broadcast once up front so mismatched row batches fail clearly.
     if arrays:
         np.broadcast_arrays(*arrays.values())
+    arrays[_NUMERIC_BATCH] = True
     return _evaluate(expression, arrays)
 
 
@@ -439,6 +462,8 @@ class CSEProgram:
             (_raw(key).name if isinstance(_raw(key), Variable) else str(key)): value
             for key, value in values.items()
         }
+        if any(isinstance(v, np.ndarray) and v.ndim > 0 for v in context.values()):
+            context[_NUMERIC_BATCH] = True
         for symbol, expression in self.bindings:
             context[symbol.name] = _evaluate(_raw(expression), context)
         return _evaluate(_raw(self.result), context)
@@ -468,6 +493,7 @@ def _expression_children(value):
     return ()
 
 
+@lru_cache(maxsize=8192)
 def _expression_complexity(value):
     value = _raw(value)
     if isinstance(value, Node):
@@ -717,8 +743,14 @@ __all__ = [
     "evaluate_batch",
     "CSEProgram",
     "cse",
+    "cse_many",
     "dependencies",
     "is_expr",
     "is_symbol",
     "lambdify",
 ]
+
+
+def cse_many(expressions):
+    """Prepare a shared expression DAG for vectorized multi-metric evaluation."""
+    return cse(Expr(Node("tuple", tuple(_raw(e) for e in expressions))))

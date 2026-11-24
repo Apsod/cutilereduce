@@ -10,10 +10,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass, replace
 from enum import Enum
-import math
 
 from cutilereduce.experimental.compiler.operator import FoldProgram
-from cutilereduce.experimental.planning.accounting import contribution_ownership
+from cutilereduce.experimental.planning.accounting import contribution_ownership, _positive, ceildiv
 
 
 class LocalLifetime(Enum):
@@ -95,12 +94,12 @@ class ScheduledAxis:
     def __post_init__(self) -> None:
         if not self.axis:
             raise ValueError("scheduled axis name must be non-empty")
-        if self.extent <= 0 or self.tile <= 0:
-            raise ValueError("scheduled axis extent and tile must be positive")
+        _positive(self.extent, "scheduled extent")
+        _positive(self.tile, "scheduled tile")
 
     @property
     def count(self) -> int:
-        return math.ceil(self.extent / self.tile)
+        return ceildiv(self.extent, self.tile)
 
 
 @dataclass(frozen=True)

@@ -81,21 +81,39 @@ class CompiledCuTileFold:
         self._launch(stage, self.forward_module, args, torch.cuda.current_stream(device))
         return tuple(outputs.values()), saved
 
-    def backward_values(self, inputs, saved, cotangents):
-        import torch
+    def _backward_values_context(self, inputs, saved, cotangents):
         if self.backward_schedule is None:
             raise ValueError("fold was compiled without backward")
-        device = inputs[0].device
-        stream = torch.cuda.current_stream(device)
         values = dict(zip(self.problem.spec.inputs, inputs, strict=True))
         values.update({name.replace("execution.", "saved_execution.", 1): tensor for name, tensor in saved.items()})
         for (name, _), cotangent in zip(self.problem.project_output.results, cotangents, strict=True):
             values[f"grad_output.{name.removeprefix('output.')}"] = cotangent.contiguous()
-        embed, finalize = self.backward_schedule.implementation.stages
+        return values
+
+    def embed_values(self, inputs, saved, cotangents):
+        import torch
+        values = self._backward_values_context(inputs, saved, cotangents)
+        device = inputs[0].device
+        stream = torch.cuda.current_stream(device)
+        assert self.backward_schedule is not None
+        embed, _ = self.backward_schedule.implementation.stages
         assert self.problem.embed_output_vjp is not None
         accumulator = self._allocate(self.problem.embed_output_vjp, self.problem.embed_output_vjp.results, device)
         args = tuple(values[b.name] for b in embed.bindings) + tuple(accumulator.values())
         self._launch(embed, self.backward_module, args, stream)
+        return accumulator
+
+    def backward_values(self, inputs, saved, cotangents):
+        accumulator = self.embed_values(inputs, saved, cotangents)
+        return self.finalize_values(inputs, saved, cotangents, accumulator)
+
+    def finalize_values(self, inputs, saved, cotangents, accumulator):
+        import torch
+        values = self._backward_values_context(inputs, saved, cotangents)
+        device = inputs[0].device
+        stream = torch.cuda.current_stream(device)
+        assert self.backward_schedule is not None
+        _, finalize = self.backward_schedule.implementation.stages
         values.update(accumulator)
         region = self.problem.map_finalize_map_vjp
         assert region is not None

@@ -136,6 +136,36 @@ before launching embed, leaving the two launches adjacent on the stream.
 
 ## Early Benchmarks
 
+### Run CPU attention benchmarks
+
+```sh
+make bench_cpu
+# Short run without empirical tuning:
+make bench_cpu BENCH_CPU_LENGTH=64 BENCH_CPU_SHORTLIST=0 BENCH_CPU_ITERATIONS=5
+```
+
+The default compares a full-tile baseline and an independently tuned composition
+against eager PyTorch and CPU SDPA, for forward and forward+backward. It uses FP32,
+one head, length 4096, dimension 32, and 1/2/4 threads. At each thread count it
+analytically prunes forward and finalize choices separately, then empirically
+times up to three candidates per stage/interface and composes compatible winners.
+CPU embed currently has one implementation, which is validated and timed once.
+Each tuned winner is compared at the thread count used to select it.
+
+Outputs and random-cotangent gradients are checked before timing; comparison
+order is randomized. SDPA uses automatic PyTorch dispatch, with the same attention
+scaling and no dropout or causal mask. Compilation, search and tuning are excluded
+from final comparison measurements.
+
+The console reports detected hardware, stage winners, medians and speedups against
+both baselines. Full results, stage candidates, failures and timings are saved to
+`results/bench_cpu.json` (ignored by Git). First-use compilation can take a few
+minutes. `BENCH_CPU_SHORTLIST` controls choices per stage/interface (0 disables
+tuning); `BENCH_CPU_TUNE_ITERATIONS` controls tuning repetitions independently of
+`BENCH_CPU_ITERATIONS`, which controls final comparison repetitions. Override
+`BENCH_CPU_LENGTH`, `BENCH_CPU_DIMENSION`, `BENCH_CPU_THREADS`, `BENCH_CPU_JSON`,
+or pass extra CLI options through `BENCH_CPU_ARGS`.
+
 ### Scaling results
 
 #### Experimental fixed-tile attention (forward only)

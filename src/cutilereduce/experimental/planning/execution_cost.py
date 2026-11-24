@@ -142,9 +142,9 @@ def analyze_bound_plan(problem, forward, *, backward=None, gradient_stage=None):
     local_carrier = outputs("map_fold")
     partials = carrier * partitions if partition is not None else 0
     scratch = carrier * chunks if not online else 0
-    emit("map_fold", work, sum(v.padded_accessed_bytes for v in inputs), partials or carrier,
+    emit("map_fold", work, sum(v.padded_accessed_bytes for v in inputs), partials if partition is not None else carrier,
          local.live_bytes_upper_bound + sum(v.tile_bytes for v in inputs) + 2 * local_carrier,
-         partials or carrier, tasks, chunks if online else 1, tuple(calls), domain)
+         partials if partition is not None else carrier, tasks, chunks if online else 1, tuple(calls), domain)
     checkpoints = 0
     for stage in forward.forward[1:]:
         expressions = tuple(binding.expression for binding in stage.bindings)
@@ -164,7 +164,7 @@ def analyze_bound_plan(problem, forward, *, backward=None, gradient_stage=None):
                  outputs("project_output", sizes), project.live_bytes_upper_bound + outputs("map_fold", local_dims),
                  outputs("project_output", sizes), project_owners,
                  calls=(RegionInvocation("project_output", project, project_owners, project_owners),), accounting=project_domain)
-        elif partials and (scans or any(isinstance(e, BoundLoop) and e.operation == "carrier_fold"
+        elif partition is not None and (scans or any(isinstance(e, BoundLoop) and e.operation == "carrier_fold"
              and isinstance(e.body, BoundLeaf) and isinstance(e.body.expression, Reference) for e in expressions)):
             checkpoints = carrier * partitions if scans and backward is not None else 0
             combine = region("execution_combine", sizes)

@@ -126,7 +126,7 @@ def test_report_compiles_retained_implementation_without_realizing_again(monkeyp
     backend = CpuBackend()
     report = analyze(operator(), {"b": 4, "r": 8}, backend=backend,
                      hardware=CpuTarget("test", 1, 32, 64))
-    expected = report.shortlist(1, per_family=0)[0].implementation
+    expected = report.realize(report.shortlist(1, per_family=0)[0].candidate)
     def forbid(*args, **kwargs):
         raise AssertionError("selection must not rerun realization")
     monkeypatch.setattr(backend, "realize", forbid)

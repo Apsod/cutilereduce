@@ -15,6 +15,12 @@ class CuTileExecution:
                 differentiable = tuple(x for x in inputs if x.requires_grad)
                 torch.autograd.grad(outputs, differentiable,
                                     tuple(torch.ones_like(x) for x in outputs), allow_unused=True)
+        return self.measure_stage(run, inputs, warmup=warmup, iterations=iterations)
+
+    def measure_stage(self, run, inputs, *, warmup, iterations):
+        import torch
+        if warmup < 0 or iterations <= 0:
+            raise ValueError("invalid benchmark iteration counts")
         device = inputs[0].device
         with torch.cuda.device(device):
             for _ in range(warmup):

@@ -117,12 +117,29 @@ The current search does not invent precision permissions or carrier layouts.
 
 ## Empirical tuning and reuse
 
-`tune_cpu` and `tune_cutile` consume the same analytical candidates. Both require
-inputs and a reference callable, validate outputs and (for training) input VJPs,
-and benchmark complete compatible executions. Validation uses all-ones output
-cotangents. Set tolerances appropriate for the declared precision. cuTile timing
-uses synchronized CUDA events. Training calls use fresh autograd executions and
-fresh gradient accumulation buffers rather than accumulating `.grad` across runs.
+`api.tune`, `tune_cpu` and `tune_cutile` use stage-wise search by default.
+Training enumerates a union of forward, finalize and (where separately tiled)
+embed choices, rather than the Cartesian product of their grids. Analytical
+estimates still come from the batched scheduled-IR cost model. Explicit `analyze`
+retains whole-plan enumeration; `analyze(..., stagewise=True)` requests the union.
+An explicit candidate list or sweep is honored and its executable stages deduplicated.
+Optional `StageSearchBackend.stage_candidates` enables factorized analytical
+enumeration. Other staged backends retain full analytical enumeration until they
+provide a generator covering their own executable units and coupled choices.
+
+Each unique executable stage is compiled, validated against reference artifacts,
+and timed once. `candidate_count` limits the shortlist **per stage and interface
+class**, with forward-family diversity, rather than limiting whole training
+plans. The planner finds the compatible composition with minimum summed measured
+stage latency, validates its complete forward/VJP, and measures its complete
+execution. A failed composition is recorded and the next compatible path tried;
+individually valid stages remain reusable. `stage_measurements`, `selected_stages`,
+`mode` and `tuning_metadata` expose what was actually searched and measured.
+Stage tests use random cotangents and check upstream artifacts for mutation;
+complete-execution validation also checks output/VJP correctness. Set tolerances
+appropriate for declared precision. CPU timing uses wall time; cuTile uses
+synchronized CUDA events. Gradient accumulation buffers are freshly allocated
+and initialized for each call, and `.grad` is not accumulated across iterations.
 
 ```python
 from cutilereduce.experimental.backends.cpu.tuning import tune_cpu, compile_cpu_candidate
@@ -144,9 +161,10 @@ binding. Ordered cuTile backward and partial/tree cuTile forward still require
 new backend implementations and are rejected. GPU compilation is lazy at first
 launch, before steady-state timing.
 
-`tune_candidates` is the common compile/validate/measure driver for custom
-adapters. It deduplicates analytical candidates, retains a configurable minimum
-per family, records failures, and saves the best valid measured executable.
+`tune_report` orchestrates staged tuning for a `StagedBackend` and a timing adapter
+with `measure_stage`. `tune_report(..., stagewise=False)` explicitly requests
+whole-plan tuning. Backends/adapters without staging support retain whole-plan
+`tune_candidates` behavior and report `mode="whole_plan"`.
 Selected-plan files check the program fingerprint, shape and backend on reload;
 recompilation uses the current backend. Hardware rates/limits should be supplied
 again when reusing a decision on a different machine. Sweep JSON is an inspection
@@ -217,14 +235,22 @@ stages expose their accounting domains, and scheduled gradient ownership uses
 the same absent-axis contribution rules. These quantities are separate from
 CPU cache assumptions and GPU occupancy/communication implementations.
 
-The benchmark can select independent training schedules directly from the
-analytical search before compiling or measuring them:
+`make bench_cpu` tunes forward and finalize independently at each thread count,
+validates/times the single CPU embed implementation, and benchmarks the compatible
+composition against eager PyTorch and SDPA. The per-stage shortlist is controlled
+by `BENCH_CPU_SHORTLIST` (default 3); tuning repetitions use
+`BENCH_CPU_TUNE_ITERATIONS` (default 10). The report's `tuning_searches` contains
+analytical search metadata, stage measurements/failures and the selected stages.
+The direct CLI equivalent is:
 
 ```bash
 uv run -m examples.experimental_cpu_tiles --length 512 --threads 1 4 \
-  --only full query_128 full_forward_backward_query_128 \
-  --analytical-shortlist 1 --json /tmp/cpu-independent.json
+  --only full --tune-shortlist 3 --tune-iterations 10 \
+  --json /tmp/cpu-independent.json
 ```
+
+The optional `--analytical-shortlist` retains whole-plan analytical finalist
+comparisons without empirical stage selection. For that older inspection path:
 
 The report records each thread count's analytical candidate count, truncation,
 model assumptions and selections alongside correctness checks and measurements.
@@ -300,3 +326,76 @@ The low-level CPU compiler preserves an explicitly supplied backward program
 when it selects forward decisions. This is an inspection/debugging override,
 not a search conditioned on that backward implementation. Optimizing the
 remaining schedule choices around a fixed stage is deferred.
+
+## Batched analytical evaluation
+
+CPU and cuTile models classify candidates by topology, backward loop axis and
+resolved commit pattern. One representative per class is lifted to parameterized
+shared execution IR. The same cost visitors build its symbolic metric DAG, then
+multi-output CSE and NumPy evaluate candidate columns in bounded batches (4096
+rows by default). Numeric rows retain cheap lazy cost views; inspecting detailed
+stages materializes their scalar description on demand. Regions and physical
+stage estimates are cached, as are prepared class evaluators on a problem.
+
+Concrete implementations are materialized when selected for compilation/tuning,
+not for every analytical row. A finalist is retained after realization. The
+`batched=False` sweep option preserves scalar evaluation for parity checks.
+`evaluation_metadata` reports mode, structural groups and scalar fallback count.
+Custom backends opt in through `BackendModel.batch_key`: its classes must preserve
+operation structure and physical decisions when geometry is parameterized.
+Models without this hook, and models whose hardware rates remain symbolic, keep
+the scalar path rather than substituting an approximate cost model.
+
+For the 2048-token CPU attention grid, measured searches after this change took
+approximately 2.8 s cold / 0.7 s warm for 7,500 candidates and 4.4 s cold / 1.6 s
+warm for 15,000 candidates on the existing i7-1165G7 benchmark host. The classes
+numbered 36 / 48 and selected the same independent forward/backward tiles. These
+timings include candidate enumeration and symbolic preparation, not compilation.
+The benchmark now prints and records analytical search elapsed time separately.
+
+
+## Executable stage contracts and independence
+
+The backend returns a `StagedPlan` for a concrete schedule, through the optional
+`StagedBackend` protocol in `planning/backend.py`. This describes executable
+boundaries, not one stage per semantic tensor region. CPU currently exposes its
+fused forward driver, embed, and finalize; cuTile exposes the corresponding three
+kernel launches. Map/fold/scan/projection inside a fused driver cannot be timed or
+selected independently through this interface. A backend exposing separate
+callable units can return finer stages without changing shared selection logic.
+
+A stage declares immutable `requires` artifacts, fresh `produces` artifacts,
+implementation identity, its own schedule parameters, analytical cost selectors,
+and any shared-resource `couplings`. Artifact representations include shape,
+dtype, layout and schedule-dependent saved-state geometry. Data dependence does
+not imply tuning dependence: embed can be tuned using a reference carrier if the
+carrier interface is fixed. Ordered finalize requires matching forward checkpoint
+partitioning, so winners with different checkpoint contracts cannot compose.
+Embed consumes only the final carrier and therefore does not multiply with the
+number of checkpoint layouts.
+
+Responsibility is split explicitly:
+
+- The backend declares fusion, callable boundaries, layouts/placement, resource
+  coupling and stage-specific parameter influence; compiles stage runners;
+  supplies reference fixtures; and assembles the selected runners.
+- Shared planning checks artifact availability, compatible representations,
+  unique output versions, execution order and coupling bindings. It deduplicates
+  stage identities, ranks/prunes stage choices and composes measured winners with
+  dynamic programming over interface states. It validates complete optima rather
+  than every Cartesian combination.
+- The execution adapter times isolated stages and complete executions, including
+  target-specific synchronization. The backend runner owns fresh/reset scratch
+  and accumulation state.
+
+The contract is a backend assertion checked structurally and by reference tests,
+not a general proof that arbitrary native code is separable. Undeclared mutation,
+aliased outputs and overlapping resource usage invalidate independent timing;
+these units must be fused or jointly tuned. Future cluster/node/device/CTA-level
+backends can encode placement, communication buffers and collective topology in
+artifact representations and couplings. Concurrent stages need a joint timing
+unit; current composition deliberately supports sequential execution only.
+
+Saved version-2 plans additionally record selected stage keys, interfaces,
+parameters, individual measurements and tuning mode. The combined concrete
+candidate remains available for existing reload/compilation APIs.
